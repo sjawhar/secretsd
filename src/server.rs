@@ -6,7 +6,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, mpsc};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use nix::errno::Errno;
 use nix::sys::signal::{Signal, killpg};
@@ -17,9 +17,10 @@ use nix::unistd::{Pid, geteuid};
 
 use crate::Config;
 use crate::decrypt::Decryptor;
-use crate::grants::{GrantTable, Registry};
+use crate::grants::{GrantTable, Registry, Scope, SessionToken};
 use crate::proto::{ErrCode, MAX_FRAME_BYTES, Request, Response, format_response, parse_request};
 use crate::requests::{Queue, QueueLimits, RequestId};
+use crate::secret::SecretName;
 use crate::store::HumanStore;
 
 mod dispatch;
@@ -40,6 +41,7 @@ const CONTROL_CONNECTION_QUEUE_DEPTH: usize = 8;
 const CONNECTION_CAPACITY: usize = CONNECTION_WORKERS + CONNECTION_QUEUE_DEPTH;
 const CONNECTION_READ_TIMEOUT: Duration = Duration::from_millis(250);
 const CONNECTION_CAPACITY_RESPONSE: &[u8] = b"ERR\tINTERNAL\tconnection capacity reached\n";
+const MAX_AUDIT_VALUE_BYTES: usize = 256;
 
 #[derive(Debug)]
 struct State {
@@ -127,6 +129,101 @@ const fn peer_uid_is_authorized(peer_uid: u32, daemon_uid: u32) -> bool {
     peer_uid == daemon_uid
 }
 
+fn append_audit_piece(rendered: &mut String, piece: &str) -> bool {
+    if rendered.len().saturating_add(piece.len()) > MAX_AUDIT_VALUE_BYTES {
+        while rendered.len() > MAX_AUDIT_VALUE_BYTES.saturating_sub('…'.len_utf8()) {
+            rendered.pop();
+        }
+        rendered.push('…');
+        return false;
+    }
+    rendered.push_str(piece);
+    true
+}
+
+fn sanitize_audit_value(value: &str) -> String {
+    let mut rendered = String::with_capacity(value.len().min(MAX_AUDIT_VALUE_BYTES));
+    for character in value.chars() {
+        let appended = match character {
+            '\r' => append_audit_piece(&mut rendered, r"\r"),
+            '\n' => append_audit_piece(&mut rendered, r"\n"),
+            '\t' => append_audit_piece(&mut rendered, r"\t"),
+            '\0' => append_audit_piece(&mut rendered, r"\0"),
+            control if control.is_control() => {
+                let escaped = format!(r"\u{{{:04X}}}", u32::from(control));
+                append_audit_piece(&mut rendered, &escaped)
+            }
+            printable => {
+                let mut encoded = [0; 4];
+                append_audit_piece(&mut rendered, printable.encode_utf8(&mut encoded))
+            }
+        };
+        if !appended {
+            return rendered;
+        }
+    }
+    rendered
+}
+
+#[derive(Debug)]
+struct AuditContext {
+    key: String,
+    untrusted_registered_session: Option<String>,
+    untrusted_registered_pid: Option<i32>,
+    request_id: Option<RequestId>,
+}
+
+fn audit_context(request: &Request, shared: &Shared) -> AuditContext {
+    let mut audit = AuditContext {
+        key: request_key(request).map_or_else(|| "-".to_owned(), sanitize_audit_value),
+        untrusted_registered_session: None,
+        untrusted_registered_pid: None,
+        request_id: None,
+    };
+    let (raw_key, token_hex) = match request {
+        Request::Get { key, token_hex, .. } | Request::RequestGrant { key, token_hex, .. } => {
+            (key, token_hex)
+        }
+        Request::Register { session, pid, .. } => {
+            audit.untrusted_registered_session = Some(sanitize_audit_value(session));
+            audit.untrusted_registered_pid = Some(*pid);
+            return audit;
+        }
+        Request::Hello { .. }
+        | Request::Unregister { .. }
+        | Request::Grants
+        | Request::Deny { .. }
+        | Request::Lock => return audit,
+    };
+    let Some(token) = token_hex
+        .as_deref()
+        .and_then(|token_hex| SessionToken::parse_hex(token_hex).ok())
+    else {
+        return audit;
+    };
+    let (mutex, condvar) = &**shared;
+    let mut state = lock_state(mutex);
+    let Some(registration) = state.registry.registration(&token) else {
+        return audit;
+    };
+    audit.untrusted_registered_session = Some(sanitize_audit_value(&registration.session));
+    audit.untrusted_registered_pid = Some(registration.pid);
+    audit.request_id = SecretName::parse(raw_key).ok().and_then(|secret_name| {
+        let scope = Scope::Session(token);
+        if state.grants.lookup(&scope, &secret_name).is_none() && state.store.contains(&secret_name)
+        {
+            state.queue.enqueue(scope, secret_name, Instant::now()).ok()
+        } else {
+            None
+        }
+    });
+    drop(state);
+    if audit.request_id.is_some() {
+        condvar.notify_all();
+    }
+    audit
+}
+
 fn validate_activated_listener(fd: BorrowedFd<'_>) -> std::io::Result<()> {
     let stat = fstat(fd.as_raw_fd()).map_err(std::io::Error::other)?;
     if !SFlag::from_bits_truncate(stat.st_mode).contains(SFlag::S_IFSOCK) {
@@ -177,7 +274,7 @@ fn handle(stream: UnixStream, shared: &Shared) -> std::io::Result<()> {
         tracing::warn!(peer_uid = peer.uid(), "connection rejected for foreign uid");
         return Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
     }
-    let peer_pid = Some(peer.pid());
+    let peer_pid = peer.pid();
     let mut reader = BufReader::new(stream);
     let mut frame = Vec::new();
     {
@@ -198,17 +295,26 @@ fn handle(stream: UnixStream, shared: &Shared) -> std::io::Result<()> {
         tests::delay_register_handler(request);
     }
     let decision = request.map_or_else(
-            |_| dispatch::Decision {
-                outcome: Outcome::Failed(ErrCode::BadRequest, "invalid request frame"),
-                scope_kind: None,
-            },
-            |request| {
-                let key = request_key(&request).unwrap_or("-").to_owned();
-                let decision = dispatch(request, shared);
-                tracing::info!(%key, ?peer_pid, ?decision.scope_kind, decision = decision.outcome.decision(), "request handled");
-                decision
-            },
-        );
+        |_| dispatch::Decision {
+            outcome: Outcome::Failed(ErrCode::BadRequest, "invalid request frame"),
+            scope_kind: None,
+        },
+        |request| {
+            let audit = audit_context(&request, shared);
+            let decision = dispatch(request, shared);
+            tracing::info!(
+                key = %audit.key,
+            peer_pid = ?peer_pid,
+                scope_kind = ?decision.scope_kind,
+                untrusted_registered_session = ?audit.untrusted_registered_session,
+                untrusted_registered_pid = ?audit.untrusted_registered_pid,
+                request_id = ?audit.request_id,
+                decision = decision.outcome.decision(),
+                "request handled"
+            );
+            decision
+        },
+    );
     match decision.outcome {
         Outcome::Ok => stream.write_all(format_response(&Response::Ok).as_bytes()),
         Outcome::Fields(fields) => {
@@ -373,10 +479,32 @@ mod tests {
     use std::path::Path;
 
     use super::*;
+    use crate::grants::{Registration, SessionToken};
 
     static REGISTER_HANDLER_DELAY: Mutex<Option<Duration>> = Mutex::new(None);
 
     struct RegisterHandlerDelay;
+
+    #[derive(Clone)]
+    struct TestLogWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for TestLogWriter {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().write(buffer)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'writer> tracing_subscriber::fmt::MakeWriter<'writer> for TestLogWriter {
+        type Writer = Self;
+
+        fn make_writer(&'writer self) -> Self::Writer {
+            self.clone()
+        }
+    }
 
     impl Drop for RegisterHandlerDelay {
         fn drop(&mut self) {
@@ -507,5 +635,105 @@ mod tests {
         let mut rejection = String::new();
         rejected.read_to_string(&mut rejection).unwrap();
         assert_eq!(rejection, "ERR\tINTERNAL\tconnection capacity reached\n");
+    }
+
+    #[test]
+    fn audit_value_escapes_controls_and_caps_untrusted_metadata() {
+        // Given untrusted metadata containing every frame-corrupting control class.
+        let input = "safe\rline\nwith\ttab\0and\u{001b}escape";
+
+        // When it is rendered for the audit log.
+        let rendered = sanitize_audit_value(input);
+
+        // Then controls are visible escapes, not bytes emitted to journald.
+        assert_eq!(rendered, "safe\\rline\\nwith\\ttab\\0and\\u{001B}escape");
+        let capped = sanitize_audit_value(&"x".repeat(MAX_AUDIT_VALUE_BYTES + 1));
+        assert!(capped.len() <= MAX_AUDIT_VALUE_BYTES);
+        assert!(capped.ends_with('…'));
+    }
+
+    #[test]
+    fn audit_log_records_registered_untrusted_metadata_and_queue_request_id() {
+        // Given a registered session and a human-tier key that needs a grant.
+        let directory = tempfile::tempdir().unwrap();
+        let human_dir = directory.path().join("human");
+        std::fs::create_dir(&human_dir).unwrap();
+        std::fs::write(human_dir.join("DEEL_API_KEY.env"), b"ciphertext").unwrap();
+        let mut config = test_config(directory.path());
+        config.human_dir = human_dir;
+        let shared = Arc::new((Mutex::new(State::new(config).unwrap()), Condvar::new()));
+        let token_hex = "ab".repeat(32);
+        let token = SessionToken::parse_hex(&token_hex).unwrap();
+        lock_state(&shared.0).registry.register(Registration {
+            token,
+            session: "opencode-session".to_owned(),
+            pid: 12_345,
+        });
+        let worker_shared = Arc::clone(&shared);
+        let _worker = thread::spawn(move || worker(&worker_shared));
+        let (mut client, server) = UnixStream::pair().unwrap();
+        client
+            .write_all(format!("REQUEST\tkey=DEEL_API_KEY\ttoken={token_hex}\n").as_bytes())
+            .unwrap();
+        let logs = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_target(false)
+            .with_writer(TestLogWriter(Arc::clone(&logs)))
+            .finish();
+
+        // When the daemon handles the request.
+        tracing::subscriber::with_default(subscriber, || handle(server, &shared).unwrap());
+
+        // Then the audit event identifies the request without disclosing its token.
+        let output = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
+        assert!(output.contains("key=DEEL_API_KEY"));
+        assert!(output.contains("scope_kind=Some(VerifiedSession)"));
+        assert!(output.contains("peer_pid="));
+        assert!(output.contains("untrusted_registered_session=Some(\"opencode-session\")"));
+        assert!(output.contains("untrusted_registered_pid=Some(12345)"));
+        assert!(output.contains("request_id=Some(RequestId(1))"));
+        assert!(output.contains("decision="));
+        assert!(!output.contains(&token_hex));
+    }
+
+    #[test]
+    fn audit_log_escapes_control_bytes_from_a_frame_key() {
+        // Given a frame with a control-byte key and a verified session token.
+        let directory = tempfile::tempdir().unwrap();
+        let shared = Arc::new((
+            Mutex::new(State::new(test_config(directory.path())).unwrap()),
+            Condvar::new(),
+        ));
+        let token_hex = "cd".repeat(32);
+        let token = SessionToken::parse_hex(&token_hex).unwrap();
+        lock_state(&shared.0).registry.register(Registration {
+            token,
+            session: "opencode-session".to_owned(),
+            pid: 12_345,
+        });
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let key = format!("KEY\rINJECT\0{}", "X".repeat(MAX_AUDIT_VALUE_BYTES + 1));
+        client
+            .write_all(format!("GET\tkey={key}\ttoken={token_hex}\n").as_bytes())
+            .unwrap();
+        let logs = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_target(false)
+            .with_writer(TestLogWriter(Arc::clone(&logs)))
+            .finish();
+
+        // When the daemon logs the rejected request.
+        tracing::subscriber::with_default(subscriber, || handle(server, &shared).unwrap());
+
+        // Then the audit value exposes escapes instead of emitting control bytes.
+        let output = logs.lock().unwrap().clone();
+        assert!(String::from_utf8_lossy(&output).contains(r"key=KEY\rINJECT\0"));
+        assert!(String::from_utf8_lossy(&output).contains('…'));
+        assert!(!output.contains(&b'\r'));
+        assert!(!output.contains(&b'\0'));
     }
 }

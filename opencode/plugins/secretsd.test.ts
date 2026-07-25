@@ -2,7 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import type { ToolContext, ToolResult } from "@opencode-ai/plugin";
 import { existsSync, mkdtempSync, readFileSync, rmSync, statSync } from "fs";
 import { join } from "path";
-import { REQUEST_TIMEOUT_MS, createSecretsdPlugin, issueTokenFile } from "./secretsd";
+import secretsdPlugin, { REQUEST_TIMEOUT_MS, createSecretsdPlugin, issueTokenFile } from "./secretsd";
 
 // allow: SIZE_OK — the plan requires all fake-broker protocol scenarios in this single test file.
 const roots: string[] = [];
@@ -36,18 +36,21 @@ afterEach(() => {
   }
 });
 
+test("exports a V1 server plugin despite its testable named helpers", () => {
+  expect(secretsdPlugin).toHaveProperty("id", "secretsd");
+  expect(secretsdPlugin).toHaveProperty("server");
+});
+
 describe("secretsd token issuance", () => {
   test("writes a 256-bit token to a 0600 file in a 0700 directory", async () => {
     const runtimeDir = root();
     const plugin = createSecretsdPlugin({
       runtimeDir,
-      socketPath: join(runtimeDir, "missing.sock"),
+      socketPath: join(runtimeDir, "broker.sock"),
       pid: 42,
     });
 
-    await plugin.hooks.event({
-      event: { type: "session.created", properties: { info: { id: "session-a" } } },
-    });
+    await plugin.hooks["shell.env"]({ sessionID: "session-a" }, { env: {} });
 
     const file = join(runtimeDir, "secretsd", "session-a.token");
     expect(existsSync(file)).toBe(true);
@@ -60,12 +63,10 @@ describe("secretsd token issuance", () => {
     const runtimeDir = root();
     const plugin = createSecretsdPlugin({
       runtimeDir,
-      socketPath: join(runtimeDir, "missing.sock"),
+      socketPath: join(runtimeDir, "broker.sock"),
       pid: 42,
     });
-    await plugin.hooks.event({
-      event: { type: "session.created", properties: { info: { id: "session-b" } } },
-    });
+    const broker = fakeBroker(join(runtimeDir, "broker.sock"));
     const output: { env: Record<string, string> } = { env: {} };
 
     await plugin.hooks["shell.env"]({ sessionID: "session-b" }, output);
@@ -73,6 +74,7 @@ describe("secretsd token issuance", () => {
     expect(output.env.SECRETSD_SESSION_TOKEN_FILE).toBe(join(runtimeDir, "secretsd", "session-b.token"));
     const token = readFileSync(output.env.SECRETSD_SESSION_TOKEN_FILE, "utf8");
     expect(Object.values(output.env).some((value) => value === token)).toBe(false);
+    broker.stop();
   });
 
   test("rejects an unsafe session ID before deriving a token filename", () => {
@@ -122,65 +124,24 @@ async function eventually(predicate: () => boolean): Promise<boolean> {
   return predicate();
 }
 
-test("registers at creation and unregisters plus removes the file at deletion", async () => {
-  const runtimeDir = root();
-  const socketPath = join(runtimeDir, "broker.sock");
-  const broker = fakeBroker(socketPath);
-  const plugin = createSecretsdPlugin({ runtimeDir, socketPath, pid: 4242 });
-
-  await plugin.hooks.event({
-    event: { type: "session.created", properties: { info: { id: "session-c" } } },
-  });
-  expect(await eventually(() => broker.received.length === 2)).toBe(true);
-  await plugin.hooks.event({
-    event: { type: "session.deleted", properties: { info: { id: "session-c" } } },
-  });
-
-  expect(redactFrames(broker.received)).toEqual([
-    "HELLO\tversion=1",
-    "REGISTER\ttoken=<TOKEN>\tsession=session-c\tpid=4242",
-    "HELLO\tversion=1",
-    "UNREGISTER\tsession=session-c",
-  ]);
-  expect(existsSync(join(runtimeDir, "secretsd", "session-c.token"))).toBe(false);
-  broker.stop();
-});
-
-test("shell.env re-registers a persisted session before shell access", async () => {
+test("shell.env registers a new session once before injecting its token-file path", async () => {
   const runtimeDir = root();
   const socketPath = join(runtimeDir, "broker.sock");
   const plugin = createSecretsdPlugin({ runtimeDir, socketPath, pid: 77 });
-  await plugin.hooks.event({
-    event: { type: "session.created", properties: { info: { id: "session-restart" } } },
-  });
   const broker = fakeBroker(socketPath);
-  const output: { env: Record<string, string> } = { env: {} };
+  const firstOutput: { env: Record<string, string> } = { env: {} };
+  const secondOutput: { env: Record<string, string> } = { env: {} };
 
-  await plugin.hooks["shell.env"]({ sessionID: "session-restart" }, output);
+  await plugin.hooks["shell.env"]({ sessionID: "session-restart" }, firstOutput);
+  await plugin.hooks["shell.env"]({ sessionID: "session-restart" }, secondOutput);
 
   expect(redactFrames(broker.received)).toEqual([
     "HELLO\tversion=1",
     "REGISTER\ttoken=<TOKEN>\tsession=session-restart\tpid=77",
   ]);
-  expect(output.env.SECRETSD_SESSION_TOKEN_FILE).toBe(join(runtimeDir, "secretsd", "session-restart.token"));
+  expect(firstOutput.env.SECRETSD_SESSION_TOKEN_FILE).toBe(join(runtimeDir, "secretsd", "session-restart.token"));
+  expect(secondOutput.env.SECRETSD_SESSION_TOKEN_FILE).toBe(join(runtimeDir, "secretsd", "session-restart.token"));
   broker.stop();
-});
-
-test("session.created never waits on a stale broker socket", async () => {
-  const runtimeDir = root();
-  const socketPath = join(runtimeDir, "broker.sock");
-  const server = Bun.listen({ unix: socketPath, socket: { data() {} } });
-  const plugin = createSecretsdPlugin({ runtimeDir, socketPath, pid: 78 });
-  const eventReturned = await Promise.race([
-    plugin.hooks
-      .event({ event: { type: "session.created", properties: { info: { id: "session-stale" } } } })
-      .then(() => true),
-    Bun.sleep(100).then(() => false),
-  ]);
-
-  expect(eventReturned).toBe(true);
-  server.stop(true);
-  await plugin.hooks.dispose();
 });
 
 test("dispose unregisters every live session and removes its token file", async () => {
@@ -188,10 +149,7 @@ test("dispose unregisters every live session and removes its token file", async 
   const socketPath = join(runtimeDir, "broker.sock");
   const broker = fakeBroker(socketPath);
   const plugin = createSecretsdPlugin({ runtimeDir, socketPath, pid: 88 });
-  await plugin.hooks.event({
-    event: { type: "session.created", properties: { info: { id: "session-dispose" } } },
-  });
-  expect(await eventually(() => broker.received.length === 2)).toBe(true);
+  await plugin.hooks["shell.env"]({ sessionID: "session-dispose" }, { env: {} });
 
   await plugin.hooks.dispose();
 
@@ -241,10 +199,6 @@ test("re-registers once after UNKNOWN_TOKEN and returns value-free granted guida
     },
   });
   const plugin = createSecretsdPlugin({ runtimeDir, socketPath, pid: 99 });
-  await plugin.hooks.event({
-    event: { type: "session.created", properties: { info: { id: "session-d" } } },
-  });
-  expect(await eventually(() => registrations === 1)).toBe(true);
 
   const result = toolOutput(
     await plugin.hooks.tool.secrets_request.execute({ key: "FLEET_LICENSE_KEY" }, toolContext("session-d")),
@@ -301,10 +255,6 @@ async function requestGuidanceFor(responseFrame: string): Promise<string> {
     },
   });
   const plugin = createSecretsdPlugin({ runtimeDir, socketPath, pid: 101 });
-  await plugin.hooks.event({
-    event: { type: "session.created", properties: { info: { id: "session-errors" } } },
-  });
-  expect(await eventually(() => registrations === 1)).toBe(true);
   const result = toolOutput(
     await plugin.hooks.tool.secrets_request.execute(
       { key: "FLEET_LICENSE_KEY" },
@@ -343,9 +293,6 @@ test("keeps an OpenCode session usable when the broker socket is absent", async 
     socketPath: join(runtimeDir, "absent.sock"),
     pid: 7,
   });
-  await plugin.hooks.event({
-    event: { type: "session.created", properties: { info: { id: "session-e" } } },
-  });
   const output: { env: Record<string, string> } = { env: {} };
 
   await plugin.hooks["shell.env"]({ sessionID: "session-e" }, output);
@@ -353,7 +300,7 @@ test("keeps an OpenCode session usable when the broker socket is absent", async 
     await plugin.hooks.tool.secrets_request.execute({ key: "DEEL_API_KEY" }, toolContext("session-e")),
   );
 
-  expect(output.env.SECRETSD_SESSION_TOKEN_FILE).toBe(join(runtimeDir, "secretsd", "session-e.token"));
+  expect(output.env.SECRETSD_SESSION_TOKEN_FILE).toBeUndefined();
   expect(result.startsWith("unavailable:")).toBe(true);
   await plugin.hooks.dispose();
 });
@@ -366,10 +313,6 @@ test("reports a broker version mismatch loudly without a tokenless fallback", as
     socket: { data(socket) { socket.write("ERR\tVERSION_MISMATCH\tupgrade required\n"); } },
   });
   const plugin = createSecretsdPlugin({ runtimeDir, socketPath, pid: 8 });
-  await plugin.hooks.event({
-    event: { type: "session.created", properties: { info: { id: "session-f" } } },
-  });
-
   const result = toolOutput(
     await plugin.hooks.tool.secrets_request.execute(
       { key: "PULUMI_CONFIG_PASSPHRASE" },
@@ -416,11 +359,6 @@ test("dispose aborts a live REQUEST instead of waiting for its 100-second deadli
     },
   });
   const plugin = createSecretsdPlugin({ runtimeDir, socketPath, pid: 9 });
-  await plugin.hooks.event({
-    event: { type: "session.created", properties: { info: { id: "session-abort" } } },
-  });
-  expect(await eventually(() => registrations === 1)).toBe(true);
-
   const request = plugin.hooks.tool.secrets_request
     .execute({ key: "PULUMI_CONFIG_PASSPHRASE" }, toolContext("session-abort"))
     .then(toolOutput);

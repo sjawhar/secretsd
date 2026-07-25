@@ -15,13 +15,6 @@ type PluginOptions = {
   readonly pid?: number;
 };
 
-type EventInput = {
-  readonly event: {
-    readonly type: string;
-    readonly properties: { readonly info?: { readonly id?: string } };
-  };
-};
-
 type ShellInput = { readonly sessionID?: string };
 type ShellOutput = { env: Record<string, string> };
 
@@ -39,6 +32,7 @@ type SecretRequest = {
   readonly pid: number;
   readonly key: string;
   readonly signal: AbortSignal;
+  readonly reregister: () => Promise<void>;
 };
 
 class InvalidSessionIDError extends Error {
@@ -220,7 +214,7 @@ async function requestSecret(broker: BrokerClient, request: SecretRequest): Prom
   try {
     let response = await broker.request(request.key, request.state, request.signal);
     if (responseCode(response) === "UNKNOWN_TOKEN") {
-      await broker.register(request.state, request.sessionID, request.pid);
+      await request.reregister();
       response = await broker.request(request.key, request.state, request.signal);
     }
     if (response === "OK\tstatus=granted") {
@@ -241,6 +235,8 @@ export function createSecretsdPlugin(options: PluginOptions = {}) {
   const broker = new BrokerClient(options.socketPath ?? (runtimeDir ? join(runtimeDir, "secretsd.sock") : ""));
   const pid = options.pid ?? process.pid;
   const states = new Map<string, SessionState>();
+  const registered = new Set<string>();
+  const registrations = new Map<string, Promise<SessionState | undefined>>();
   const requestAbort = new AbortController();
 
   function ensureState(sessionID: string): SessionState | undefined {
@@ -261,8 +257,24 @@ export function createSecretsdPlugin(options: PluginOptions = {}) {
     if (!state) {
       return undefined;
     }
-    await broker.register(state, sessionID, pid);
-    return state;
+    if (registered.has(sessionID)) {
+      return state;
+    }
+    const inFlight = registrations.get(sessionID);
+    if (inFlight) {
+      return inFlight;
+    }
+    const registration = broker
+      .register(state, sessionID, pid)
+      .then(() => {
+        registered.add(sessionID);
+        return state;
+      })
+      .finally(() => {
+        registrations.delete(sessionID);
+      });
+    registrations.set(sessionID, registration);
+    return registration;
   }
 
   function removeState(sessionID: string, state: SessionState): void {
@@ -270,48 +282,19 @@ export function createSecretsdPlugin(options: PluginOptions = {}) {
       removeTokenFile(state);
     } finally {
       states.delete(sessionID);
+      registered.delete(sessionID);
+      registrations.delete(sessionID);
     }
   }
 
   const hooks = {
-    event: async ({ event }: EventInput): Promise<void> => {
-      // no-excuse-ok: catch — plugin hooks must not block session startup.
-      try {
-        if (event.type === "session.created") {
-          const sessionID = event.properties.info?.id;
-          if (sessionID) {
-            if (ensureState(sessionID)) {
-              void ensureRegistered(sessionID).then(undefined, () => undefined);
-            }
-          }
-        }
-        if (event.type === "session.deleted") {
-          const sessionID = event.properties.info?.id;
-          if (sessionID) {
-            const state = states.get(sessionID);
-            if (state) {
-              try {
-                await broker.unregister(sessionID);
-              } catch {
-                removeState(sessionID, state);
-                return;
-              }
-              removeState(sessionID, state);
-            }
-          }
-        }
-      } catch {
-        return;
-      }
-    },
     "shell.env": async (input: ShellInput, output: ShellOutput): Promise<void> => {
       // no-excuse-ok: catch — plugin hooks must not prevent a shell from starting.
       try {
         if (input.sessionID) {
-          const state = ensureState(input.sessionID);
+          const state = await ensureRegistered(input.sessionID);
           if (state) {
             output.env.SECRETSD_SESSION_TOKEN_FILE = state.tokenFile;
-            await ensureRegistered(input.sessionID);
           }
         }
       } catch {
@@ -324,7 +307,7 @@ export function createSecretsdPlugin(options: PluginOptions = {}) {
         args: { key: tool.schema.string().regex(/^[A-Z][A-Z0-9_]*$/) },
         async execute({ key }, context) {
           try {
-            const state = states.get(context.sessionID);
+            const state = await ensureRegistered(context.sessionID);
             if (!state) {
               return guidance({ status: "unavailable", versionMismatch: false });
             }
@@ -335,11 +318,15 @@ export function createSecretsdPlugin(options: PluginOptions = {}) {
                 pid,
                 key,
                 signal: requestAbort.signal,
+                reregister: async () => {
+                  registered.delete(context.sessionID);
+                  await ensureRegistered(context.sessionID);
+                },
               }),
             );
-          } catch {
+          } catch (error) {
             // no-excuse-ok: catch — tool results must not surface broker failures.
-            return guidance({ status: "unavailable", versionMismatch: false });
+            return guidance({ status: "unavailable", versionMismatch: error instanceof ProtocolVersionMismatch });
           }
         },
       }),
@@ -363,4 +350,7 @@ export function createSecretsdPlugin(options: PluginOptions = {}) {
   return { hooks, states };
 }
 
-export default async () => createSecretsdPlugin().hooks;
+export default {
+  id: "secretsd",
+  server: async () => createSecretsdPlugin().hooks,
+};

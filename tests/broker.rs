@@ -82,6 +82,15 @@ fn request_log_attributes_a_grant_without_secret_or_token_bytes() {
     let token = token(TOKEN_A);
     let harness = Harness::start(&["DEEL_API_KEY"]);
     harness.send(&format!("REGISTER\ttoken={token}\tsession=ses_a\tpid=1"));
+    let registration_log = String::from_utf8(request_log().lock().unwrap().clone()).unwrap();
+    assert!(
+        registration_log.contains("untrusted_registered_session=Some(\"ses_a\")"),
+        "REGISTER did not log its session"
+    );
+    assert!(
+        registration_log.contains("untrusted_registered_pid=Some(1)"),
+        "REGISTER did not log its pid"
+    );
     let (header, payload) = harness.send(&format!("GET\tkey=DEEL_API_KEY\ttoken={token}"));
 
     assert!(header.starts_with("OK\tlen="), "{header}");
@@ -89,8 +98,11 @@ fn request_log_attributes_a_grant_without_secret_or_token_bytes() {
     let log = String::from_utf8(request_log().lock().unwrap().clone()).unwrap();
     assert!(log.contains("request handled"), "{log}");
     assert!(log.contains("key=DEEL_API_KEY"), "{log}");
-    assert!(log.contains("scope_kind=Some(VerifiedSession)"), "{log}");
-    assert!(log.contains("peer_pid=Some("), "{log}");
+    assert!(
+        log.contains("untrusted_registered_session=Some(\"ses_a\")"),
+        "{log}"
+    );
+    assert!(log.contains("untrusted_registered_pid=Some("), "{log}");
     assert!(log.contains("decision="), "{log}");
     assert!(!log.contains("value-for-DEEL_API_KEY"), "{log}");
     assert!(!log.contains(&token), "{log}");
