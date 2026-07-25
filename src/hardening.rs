@@ -6,13 +6,24 @@ use nix::sys::mman::{MlockAllFlags, mlockall};
 use nix::sys::prctl::set_dumpable;
 use nix::sys::resource::{RLIM_INFINITY, Resource, getrlimit, rlim_t, setrlimit};
 
+/// Minimum finite `RLIMIT_MEMLOCK` accepted for the daemon.
+///
+/// The daemon creates eleven post-check workers: one approval worker, eight
+/// main-lane workers, one fast-lane worker, and one control-lane worker. At
+/// Rust's 2 MiB default stack size, their stacks need 22 MiB; 512 MiB leaves
+/// 490 MiB for the main stack, bounded connection queues, and later heap
+/// allocations. `MCL_FUTURE` still means no finite limit can guarantee every
+/// future allocation remains lockable, but this floor makes exhaustion
+/// implausible for the bounded daemon.
+pub const MIN_MEMLOCK_BYTES: rlim_t = 512 * 1024 * 1024;
+
 /// Whether locking memory is mandatory.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum MemlockPolicy {
     /// Fail startup if pages cannot be locked in production.
     Require,
-    /// Tolerate a memlock failure in CI containers without `LimitMEMLOCK`.
+    /// Tolerate a memlock failure in development and test environments.
     Optional,
 }
 
@@ -45,7 +56,7 @@ impl fmt::Display for HardeningError {
             }
             Self::InsufficientMemlock { soft, hard } => write!(
                 formatter,
-                "RLIMIT_MEMLOCK is insufficient for mlockall(MCL_CURRENT|MCL_FUTURE) (soft={soft} bytes, hard={hard} bytes); start secretsd through systemd with LimitMEMLOCK=infinity"
+                "RLIMIT_MEMLOCK is insufficient for mlockall(MCL_CURRENT|MCL_FUTURE) (soft={soft} bytes, hard={hard} bytes); configure LimitMEMLOCK=infinity or at least {MIN_MEMLOCK_BYTES} bytes, or use SECRETSD_MEMLOCK=optional only for local development"
             ),
             Self::Memlock(error) => write!(formatter, "mlockall failed: {error}"),
             Self::Dumpable(error) => write!(formatter, "set_dumpable failed: {error}"),
@@ -56,19 +67,26 @@ impl fmt::Display for HardeningError {
 
 impl std::error::Error for HardeningError {}
 
-/// Verify that future daemon allocations can remain locked.
+/// Verify that the supplied memlock limits are adequate for the daemon.
 ///
-/// `MCL_FUTURE` applies the process-wide limit to every later allocation. The
-/// daemon creates an approval worker and ten connection workers after this
-/// check, so no finite byte floor can guarantee all of those stacks and their
-/// later allocations remain lockable.
-pub fn validate_memlock_limit() -> Result<(), HardeningError> {
-    let (soft, hard) = getrlimit(Resource::RLIMIT_MEMLOCK).map_err(HardeningError::MemlockLimit)?;
-    if soft == RLIM_INFINITY && hard == RLIM_INFINITY {
+/// Unlimited memory locking remains ideal. A finite limit at or above
+/// [`MIN_MEMLOCK_BYTES`] is accepted, while acknowledging that `MCL_FUTURE`
+/// cannot guarantee every future allocation remains lockable under a finite
+/// limit.
+pub const fn validate_memlock_limits(soft: rlim_t, hard: rlim_t) -> Result<(), HardeningError> {
+    if (soft == RLIM_INFINITY || soft >= MIN_MEMLOCK_BYTES)
+        && (hard == RLIM_INFINITY || hard >= MIN_MEMLOCK_BYTES)
+    {
         Ok(())
     } else {
         Err(HardeningError::InsufficientMemlock { soft, hard })
     }
+}
+
+/// Verify that the current process has adequate memory-locking limits.
+pub fn validate_memlock_limit() -> Result<(), HardeningError> {
+    let (soft, hard) = getrlimit(Resource::RLIMIT_MEMLOCK).map_err(HardeningError::MemlockLimit)?;
+    validate_memlock_limits(soft, hard)
 }
 
 /// Apply every hardening step.

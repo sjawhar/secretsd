@@ -32,6 +32,20 @@ daemon. Use `mise which sops` to obtain the resolved executable path and
 `mise bin-paths age-plugin-yubikey` to identify the real plugin directory, then
 write those absolute results into the drop-in.
 
+## Memlock policy
+
+`SECRETSD_MEMLOCK` is daemon-side startup configuration only; clients cannot
+select it. It accepts `require` (the default) or `optional`. The packaged unit
+uses `LimitMEMLOCK=infinity`, which is the ideal production setting. `require`
+also accepts a finite soft and hard limit of at least 512 MiB, enough for the
+bounded worker pool plus substantial allocation headroom, but no finite limit
+can guarantee every future `MCL_FUTURE` allocation remains lockable.
+
+Use `SECRETSD_MEMLOCK=optional` only for local development, tests, or a
+hardware-free harness. It logs a warning and continues if memory locking is
+unavailable, so plaintext pages may be swappable. Do not put it in a production
+deployment drop-in.
+
 After creating or changing the drop-in, reload and restart the daemon:
 
 ```bash
