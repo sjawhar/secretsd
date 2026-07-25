@@ -8,8 +8,8 @@ use std::time::Duration;
 
 use crate::decrypt::{Decryptor, PcscReachability, YubikeyProbe};
 
-/// Human-facing decrypt announcements.
-pub mod announce;
+/// Shared Unix-socket protocol client used by the `secrets` CLI.
+pub mod client;
 /// Sops subprocess handling for one human-tier secret.
 pub mod decrypt;
 pub mod grants;
@@ -43,10 +43,6 @@ pub struct Config {
     pub pcsc_socket: Option<PathBuf>,
     /// argv for an optional bounded PC/SC far-end liveness probe.
     pub yubikey_probe_argv: Vec<String>,
-    /// argv for the desktop notification channel.
-    pub notify_argv: Vec<String>,
-    /// argv for the envoy notification channel.
-    pub envoy_argv: Vec<String>,
     /// Backstop lifetime for a grant.
     pub max_grant: Duration,
     /// Gap enforced between decrypts; must exceed the PIV touch cache.
@@ -90,8 +86,6 @@ impl Config {
             sops_bin: var("SECRETSD_SOPS_BIN").map_or_else(|| PathBuf::from("sops"), PathBuf::from),
             pcsc_socket: var("PCSCLITE_CSOCK_NAME").map(PathBuf::from),
             yubikey_probe_argv: argv("SECRETSD_YUBIKEY_PROBE_CMD"),
-            notify_argv: argv("SECRETSD_NOTIFY_CMD"),
-            envoy_argv: argv("SECRETSD_ENVOY_CMD"),
             max_grant: secs("SECRETSD_MAX_GRANT_SECS", 43200),
             cooldown: secs("SECRETSD_COOLDOWN_SECS", 16),
             request_ttl: secs("SECRETSD_REQUEST_TTL_SECS", 90),
@@ -143,8 +137,6 @@ mod tests {
             sops_bin: PathBuf::from("sops"),
             pcsc_socket: None,
             yubikey_probe_argv: Vec::new(),
-            notify_argv: Vec::new(),
-            envoy_argv: Vec::new(),
             max_grant: Duration::from_secs(1),
             cooldown: Duration::from_secs(15),
             request_ttl: Duration::from_secs(1),

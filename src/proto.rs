@@ -10,6 +10,10 @@ pub const PROTOCOL_VERSION: u32 = 1;
 /// Maximum accepted request frame. Requests never carry secret values.
 pub const MAX_FRAME_BYTES: usize = 4096;
 
+mod response;
+
+pub use response::{Response, format_response};
+
 /// Machine-readable failure reasons. The wire form is stable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -34,8 +38,6 @@ pub enum ErrCode {
     Timeout,
     /// The `YubiKey` is not reachable from this machine right now.
     YubikeyUnreachable,
-    /// No announcement channel acknowledged, so no hardware interaction began.
-    NotAnnounced,
     /// This scope already has too many requests awaiting approval.
     TooManyPending,
     /// Decryption failed for a reason that is not the client's fault.
@@ -56,9 +58,27 @@ impl ErrCode {
             Self::Denied => "DENIED",
             Self::Timeout => "TIMEOUT",
             Self::YubikeyUnreachable => "YUBIKEY_UNREACHABLE",
-            Self::NotAnnounced => "NOT_ANNOUNCED",
             Self::TooManyPending => "TOO_MANY_PENDING",
             Self::Internal => "INTERNAL",
+        }
+    }
+
+    /// Parse a stable wire token into its protocol error code.
+    pub fn parse_wire(token: &str) -> Option<Self> {
+        match token {
+            "BAD_REQUEST" => Some(Self::BadRequest),
+            "UNKNOWN_OP" => Some(Self::UnknownOp),
+            "VERSION_MISMATCH" => Some(Self::VersionMismatch),
+            "UNKNOWN_TOKEN" => Some(Self::UnknownToken),
+            "NO_SCOPE" => Some(Self::NoScope),
+            "AGENT_TTY" => Some(Self::AgentTty),
+            "NOT_HUMAN_KEY" => Some(Self::NotHumanKey),
+            "DENIED" => Some(Self::Denied),
+            "TIMEOUT" => Some(Self::Timeout),
+            "YUBIKEY_UNREACHABLE" => Some(Self::YubikeyUnreachable),
+            "TOO_MANY_PENDING" => Some(Self::TooManyPending),
+            "INTERNAL" => Some(Self::Internal),
+            _ => None,
         }
     }
 }
@@ -108,49 +128,11 @@ pub enum Request {
     Grants,
     /// Reject a pending request.
     Deny {
-        /// Request identifier from the announcement.
+        /// Pending request identifier.
         id: u64,
     },
     /// Wipe all plaintext and revoke all grants.
     Lock,
-}
-
-/// A response to send back to a client.
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum Response<'a> {
-    /// Success, no payload.
-    Ok,
-    /// Success with tab-separated `k=v` fields.
-    OkFields(&'a str),
-    /// Success followed by exactly this many raw payload bytes.
-    OkBytes(usize),
-    /// Failure with a machine code and a human-readable reason.
-    Failed(ErrCode, &'a str),
-}
-
-/// Render a response header line, including its trailing newline.
-pub fn format_response(response: &Response<'_>) -> String {
-    match response {
-        Response::Ok => "OK\n".to_owned(),
-        Response::OkFields(fields) => format!("OK\t{}\n", sanitize(fields)),
-        Response::OkBytes(len) => format!("OK\tlen={len}\n"),
-        Response::Failed(code, message) => {
-            format!("ERR\t{}\t{}\n", code.wire(), sanitize(message))
-        }
-    }
-}
-
-fn sanitize(text: &str) -> String {
-    text.chars()
-        .map(|character| {
-            if character == '\n' || character == '\r' || character == '\t' {
-                ' '
-            } else {
-                character
-            }
-        })
-        .collect()
 }
 
 fn field<'a>(fields: &'a [(&'a str, &'a str)], name: &str) -> Option<&'a str> {
@@ -262,6 +244,12 @@ mod tests {
     #[test]
     fn rejects_unknown_op() {
         assert_eq!(parse_request(b"FROBNICATE\tx=1"), Err(ErrCode::UnknownOp));
+    }
+
+    #[test]
+    fn rejects_removed_announcement_frames_and_errors() {
+        assert_eq!(parse_request(b"ACK\tid=9"), Err(ErrCode::UnknownOp));
+        assert_eq!(ErrCode::parse_wire("NOT_ANNOUNCED"), None);
     }
 
     #[test]

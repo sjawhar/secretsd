@@ -9,7 +9,9 @@ fn main() -> std::process::ExitCode {
         .with_target(false)
         .init();
 
-    if let Err(error) = hardening::apply(MemlockPolicy::Require) {
+    if let Err(error) =
+        hardening::validate_memlock_limit().and_then(|()| hardening::apply(MemlockPolicy::Require))
+    {
         tracing::error!(%error, "refusing to start without process hardening");
         return std::process::ExitCode::FAILURE;
     }

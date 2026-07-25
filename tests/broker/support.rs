@@ -20,11 +20,11 @@ fn fake_sops_env_lock() -> &'static Mutex<()> {
 }
 
 impl Harness {
-    fn start(keys: &[&str], notify_succeeds: bool) -> Self {
-        Self::start_with_sops(keys, notify_succeeds, "fake-sops-ok")
+    fn start(keys: &[&str]) -> Self {
+        Self::start_with_sops(keys, "fake-sops-ok")
     }
 
-    fn start_with_sops(keys: &[&str], notify_succeeds: bool, sops: &str) -> Self {
+    fn start_with_sops(keys: &[&str], sops: &str) -> Self {
         let fake_sops_env_lock = fake_sops_env_lock().lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
         let sops_log = dir.path().join("fake-sops-invocations.log");
@@ -42,16 +42,12 @@ impl Harness {
         }
         let socket = dir.path().join("secretsd.sock");
         let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
-        let notify = if notify_succeeds { "true" } else { "false" };
-
         let config = Config {
             socket_path: socket.clone(),
             human_dir: human,
             sops_bin: fixtures.join(sops),
             pcsc_socket: None,
             yubikey_probe_argv: Vec::new(),
-            notify_argv: vec![notify.to_owned()],
-            envoy_argv: Vec::new(),
             max_grant: Duration::from_secs(43200),
             cooldown: Duration::from_secs(16),
             request_ttl: Duration::from_secs(20),

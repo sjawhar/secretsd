@@ -13,8 +13,6 @@ happens once per session instead of once every few minutes.
   sibling session in the same process gets its own request, not a free ride.
 - **No plaintext at rest.** Values live only in the daemon's locked memory,
   zeroized when the grant dies.
-- **Announced hardware interaction.** The key never blinks without a
-  notification first, naming the key and request.
 - **Unattended secrets stay unattended.** Keys that agents legitimately need
   overnight never touch this daemon; they keep decrypting with a disk-resident
   key, exactly as before.
@@ -25,19 +23,29 @@ Status: **design complete, implementation in progress.** See
 
 ## Install
 
-Download and extract a release tarball, then install the binary and link the
-user units:
+Download and extract a release tarball, then install the binary and packaged
+user units. Do not link units to a source checkout: the installed configuration
+must remain valid after the checkout or extracted release directory is gone.
 
 ```bash
 tar xzf secretsd-vX.Y.Z-linux-x86_64.tar.gz
 cd secretsd-vX.Y.Z-linux-x86_64
-install -Dm755 secretsd ~/.dotfiles/bin/secretsd
-mkdir -p ~/.config/systemd/user
-ln -sf "$PWD/systemd/secretsd.socket" ~/.config/systemd/user/secretsd.socket
-ln -sf "$PWD/systemd/secretsd.service" ~/.config/systemd/user/secretsd.service
+install -Dm755 secretsd "$HOME/.local/bin/secretsd"
+install -Dm644 systemd/secretsd.socket "$HOME/.config/systemd/user/secretsd.socket"
+install -Dm644 systemd/secretsd.service "$HOME/.config/systemd/user/secretsd.service"
 systemctl --user daemon-reload
 systemctl --user enable --now secretsd.socket
 ```
+
+Enable the **socket**, not the service. The first client connection to
+`$XDG_RUNTIME_DIR/secretsd.sock` causes systemd to spawn the daemon. Before
+starting it, create the deployment-owned drop-in described in
+[`docs/dotfiles-cutover.md`](docs/dotfiles-cutover.md); it supplies the human
+secret directory and the real helper-binary paths for that machine.
+
+Grants exist only in daemon memory. Any daemon restart—including a release
+upgrade or a drop-in change—removes every grant and requires a fresh YubiKey
+touch before a human-tier secret can be used again.
 
 ## Why not an off-the-shelf secrets manager?
 

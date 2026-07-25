@@ -16,7 +16,6 @@ use nix::sys::stat::{SFlag, fstat};
 use nix::unistd::{Pid, geteuid};
 
 use crate::Config;
-use crate::announce::{Announcer, CommandNotifier, Notifier};
 use crate::decrypt::Decryptor;
 use crate::grants::{GrantTable, Registry};
 use crate::proto::{ErrCode, MAX_FRAME_BYTES, Request, Response, format_response, parse_request};
@@ -49,7 +48,6 @@ struct State {
     queue: Queue,
     store: HumanStore,
     decryptor: Decryptor,
-    announcer: Arc<Announcer>,
     config: Config,
     failures: Vec<(RequestId, ErrCode)>,
     lock_epoch: u64,
@@ -67,15 +65,6 @@ impl State {
         let boot_id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")?
             .trim()
             .to_owned();
-        let notifiers = [
-            CommandNotifier::new("desktop", config.notify_argv.clone())
-                .map(|notifier| Box::new(notifier) as Box<dyn Notifier>),
-            CommandNotifier::new("envoy", config.envoy_argv.clone())
-                .map(|notifier| Box::new(notifier) as Box<dyn Notifier>),
-        ]
-        .into_iter()
-        .flatten()
-        .collect();
         Ok(Self {
             registry: Registry::new(boot_id),
             grants: GrantTable::default(),
@@ -86,7 +75,6 @@ impl State {
             }),
             store: HumanStore::new(config.human_dir.clone()),
             decryptor: config.decryptor(),
-            announcer: Arc::new(Announcer::new(notifiers)),
             config,
             failures: Vec::new(),
             lock_epoch: 0,
@@ -416,8 +404,6 @@ mod tests {
             sops_bin: "/bin/false".into(),
             pcsc_socket: None,
             yubikey_probe_argv: Vec::new(),
-            notify_argv: Vec::new(),
-            envoy_argv: Vec::new(),
             max_grant: Duration::from_secs(1),
             cooldown: Duration::from_secs(16),
             request_ttl: Duration::from_secs(1),

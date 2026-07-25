@@ -63,7 +63,7 @@ pub enum Scope {
     },
 }
 
-/// Coarse scope classification, used in announcements.
+/// Coarse classification for a grant scope.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ScopeKind {

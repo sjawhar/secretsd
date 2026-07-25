@@ -23,7 +23,7 @@ impl Clock for SystemClock {
     }
 }
 
-/// Identifier shown in announcements so a human can name what they approved.
+/// Identifier for a pending hardware-gated request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 #[non_exhaustive]
 pub struct RequestId(pub u64);

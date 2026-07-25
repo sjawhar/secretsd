@@ -4,7 +4,7 @@ use std::fmt;
 
 use nix::sys::mman::{MlockAllFlags, mlockall};
 use nix::sys::prctl::set_dumpable;
-use nix::sys::resource::{Resource, setrlimit};
+use nix::sys::resource::{RLIM_INFINITY, Resource, getrlimit, rlim_t, setrlimit};
 
 /// Whether locking memory is mandatory.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -20,6 +20,15 @@ pub enum MemlockPolicy {
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum HardeningError {
+    /// Reading `RLIMIT_MEMLOCK` failed.
+    MemlockLimit(nix::Error),
+    /// `RLIMIT_MEMLOCK` cannot protect all future daemon allocations.
+    InsufficientMemlock {
+        /// Current soft limit in bytes.
+        soft: rlim_t,
+        /// Current hard limit in bytes.
+        hard: rlim_t,
+    },
     /// `mlockall` failed while the policy required it.
     Memlock(nix::Error),
     /// `PR_SET_DUMPABLE` failed.
@@ -31,6 +40,13 @@ pub enum HardeningError {
 impl fmt::Display for HardeningError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::MemlockLimit(error) => {
+                write!(formatter, "getrlimit(RLIMIT_MEMLOCK) failed: {error}")
+            }
+            Self::InsufficientMemlock { soft, hard } => write!(
+                formatter,
+                "RLIMIT_MEMLOCK is insufficient for mlockall(MCL_CURRENT|MCL_FUTURE) (soft={soft} bytes, hard={hard} bytes); start secretsd through systemd with LimitMEMLOCK=infinity"
+            ),
             Self::Memlock(error) => write!(formatter, "mlockall failed: {error}"),
             Self::Dumpable(error) => write!(formatter, "set_dumpable failed: {error}"),
             Self::CoreLimit(error) => write!(formatter, "RLIMIT_CORE could not be zeroed: {error}"),
@@ -40,6 +56,21 @@ impl fmt::Display for HardeningError {
 
 impl std::error::Error for HardeningError {}
 
+/// Verify that future daemon allocations can remain locked.
+///
+/// `MCL_FUTURE` applies the process-wide limit to every later allocation. The
+/// daemon creates an approval worker and ten connection workers after this
+/// check, so no finite byte floor can guarantee all of those stacks and their
+/// later allocations remain lockable.
+pub fn validate_memlock_limit() -> Result<(), HardeningError> {
+    let (soft, hard) = getrlimit(Resource::RLIMIT_MEMLOCK).map_err(HardeningError::MemlockLimit)?;
+    if soft == RLIM_INFINITY && hard == RLIM_INFINITY {
+        Ok(())
+    } else {
+        Err(HardeningError::InsufficientMemlock { soft, hard })
+    }
+}
+
 /// Apply every hardening step.
 ///
 /// Dumpability and core limits are set before memlock because they must hold
@@ -48,15 +79,27 @@ pub fn apply(policy: MemlockPolicy) -> Result<(), HardeningError> {
     set_dumpable(false).map_err(HardeningError::Dumpable)?;
     setrlimit(Resource::RLIMIT_CORE, 0, 0).map_err(HardeningError::CoreLimit)?;
 
-    match (
-        mlockall(MlockAllFlags::MCL_CURRENT | MlockAllFlags::MCL_FUTURE),
-        policy,
-    ) {
-        (Ok(()), _) => Ok(()),
-        (Err(error), MemlockPolicy::Require) => Err(HardeningError::Memlock(error)),
-        (Err(error), MemlockPolicy::Optional) => {
-            tracing::warn!(%error, "memlock unavailable; plaintext pages may be swappable");
-            Ok(())
+    match validate_memlock_limit() {
+        Ok(()) => {}
+        Err(error) => {
+            return match policy {
+                MemlockPolicy::Require => Err(error),
+                MemlockPolicy::Optional => {
+                    tracing::warn!(%error, "memlock unavailable; plaintext pages may be swappable");
+                    Ok(())
+                }
+            };
         }
+    }
+
+    match mlockall(MlockAllFlags::MCL_CURRENT | MlockAllFlags::MCL_FUTURE) {
+        Ok(()) => Ok(()),
+        Err(error) => match policy {
+            MemlockPolicy::Require => Err(HardeningError::Memlock(error)),
+            MemlockPolicy::Optional => {
+                tracing::warn!(%error, "memlock unavailable; plaintext pages may be swappable");
+                Ok(())
+            }
+        },
     }
 }

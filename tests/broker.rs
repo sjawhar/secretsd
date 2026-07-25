@@ -32,13 +32,74 @@ fn send_to(socket: &PathBuf, line: &str) -> (String, Vec<u8>) {
 const TOKEN_A: &str = "aa";
 const TOKEN_B: &str = "bb";
 
+static REQUEST_LOG: OnceLock<Mutex<Vec<u8>>> = OnceLock::new();
+static REQUEST_LOG_INIT: OnceLock<()> = OnceLock::new();
+
+#[derive(Clone, Copy)]
+struct RequestLogWriter;
+
+impl Write for RequestLogWriter {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        {
+            let mut log = REQUEST_LOG
+                .get_or_init(|| Mutex::new(Vec::new()))
+                .lock()
+                .unwrap();
+            log.extend_from_slice(buffer);
+        }
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn request_log() -> &'static Mutex<Vec<u8>> {
+    REQUEST_LOG.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn install_request_log_capture() {
+    REQUEST_LOG_INIT.get_or_init(|| {
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_target(false)
+            .with_writer(|| RequestLogWriter)
+            .finish();
+        tracing::subscriber::set_global_default(subscriber).unwrap();
+    });
+}
+
 fn token(prefix: &str) -> String {
     prefix.repeat(32)
 }
 
 #[test]
+fn request_log_attributes_a_grant_without_secret_or_token_bytes() {
+    install_request_log_capture();
+    request_log().lock().unwrap().clear();
+    let token = token(TOKEN_A);
+    let harness = Harness::start(&["DEEL_API_KEY"]);
+    harness.send(&format!("REGISTER\ttoken={token}\tsession=ses_a\tpid=1"));
+    let (header, payload) = harness.send(&format!("GET\tkey=DEEL_API_KEY\ttoken={token}"));
+
+    assert!(header.starts_with("OK\tlen="), "{header}");
+    assert_eq!(payload, b"value-for-DEEL_API_KEY");
+    let log = String::from_utf8(request_log().lock().unwrap().clone()).unwrap();
+    assert!(log.contains("request handled"), "{log}");
+    assert!(log.contains("key=DEEL_API_KEY"), "{log}");
+    assert!(log.contains("scope_kind=Some(VerifiedSession)"), "{log}");
+    assert!(log.contains("peer_pid=Some("), "{log}");
+    assert!(log.contains("decision="), "{log}");
+    assert!(!log.contains("value-for-DEEL_API_KEY"), "{log}");
+    assert!(!log.contains(&token), "{log}");
+    drop(harness);
+}
+
+#[test]
 fn hello_reports_protocol_version() {
-    let harness = Harness::start(&[], true);
+    let harness = Harness::start(&[]);
     let (header, _) = harness.send("HELLO\tversion=1");
     assert!(header.starts_with("OK"), "{header}");
     drop(harness);
@@ -46,7 +107,7 @@ fn hello_reports_protocol_version() {
 
 #[test]
 fn version_mismatch_is_rejected() {
-    let harness = Harness::start(&[], true);
+    let harness = Harness::start(&[]);
     let (header, _) = harness.send("HELLO\tversion=999");
     assert!(header.contains("VERSION_MISMATCH"), "{header}");
     drop(harness);
@@ -54,7 +115,7 @@ fn version_mismatch_is_rejected() {
 
 #[test]
 fn stalled_connections_are_bounded_and_do_not_block_requests() {
-    let harness = Harness::start(&[], true);
+    let harness = Harness::start(&[]);
     let baseline_threads = std::fs::read_dir("/proc/self/task").unwrap().count();
     let mut stalled = Vec::new();
     for _ in 0..32 {
@@ -79,7 +140,7 @@ fn stalled_connections_are_bounded_and_do_not_block_requests() {
 
 #[test]
 fn unregister_revokes_grants() {
-    let harness = Harness::start(&["DEEL_API_KEY"], true);
+    let harness = Harness::start(&["DEEL_API_KEY"]);
     harness.send(&format!(
         "REGISTER\ttoken={}\tsession=ses_a\tpid=1",
         token(TOKEN_A)
@@ -94,7 +155,7 @@ fn unregister_revokes_grants() {
 
 #[test]
 fn replacing_a_session_registration_revokes_displaced_grants() {
-    let harness = Harness::start(&["DEEL_API_KEY"], true);
+    let harness = Harness::start(&["DEEL_API_KEY"]);
     harness.send(&format!(
         "REGISTER\ttoken={}\tsession=ses_a\tpid=1",
         token(TOKEN_A)
@@ -116,7 +177,7 @@ fn replacing_a_session_registration_revokes_displaced_grants() {
 
 #[test]
 fn lock_wipes_all_grants() {
-    let harness = Harness::start(&["DEEL_API_KEY"], true);
+    let harness = Harness::start(&["DEEL_API_KEY"]);
     harness.send(&format!(
         "REGISTER\ttoken={}\tsession=ses_a\tpid=1",
         token(TOKEN_A)
@@ -133,7 +194,7 @@ fn lock_wipes_all_grants() {
 
 #[test]
 fn grants_listing_never_contains_values() {
-    let harness = Harness::start(&["DEEL_API_KEY"], true);
+    let harness = Harness::start(&["DEEL_API_KEY"]);
     harness.send(&format!(
         "REGISTER\ttoken={}\tsession=ses_a\tpid=1",
         token(TOKEN_A)
@@ -150,7 +211,7 @@ fn grants_listing_never_contains_values() {
 
 #[test]
 fn tokenless_request_from_a_learned_agent_tty_is_rejected() {
-    let harness = Harness::start(&["DEEL_API_KEY"], true);
+    let harness = Harness::start(&["DEEL_API_KEY"]);
     harness.send(&format!(
         "REGISTER\ttoken={}\tsession=ses_a\tpid=1",
         token(TOKEN_A)
@@ -175,7 +236,7 @@ fn deny_kills_the_hanging_sops_process_group() {
         std::process::id()
     ));
     let _ = std::fs::remove_file(&marker);
-    let harness = Harness::start_with_sops(&["DEEL_API_KEY"], true, "fake-sops-hang");
+    let harness = Harness::start_with_sops(&["DEEL_API_KEY"], "fake-sops-hang");
     harness.send(&format!(
         "REGISTER\ttoken={}\tsession=ses_a\tpid=1",
         token(TOKEN_A)
