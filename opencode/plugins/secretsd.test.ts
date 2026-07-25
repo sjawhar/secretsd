@@ -2,7 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import type { ToolContext, ToolResult } from "@opencode-ai/plugin";
 import { existsSync, mkdtempSync, readFileSync, rmSync, statSync } from "fs";
 import { join } from "path";
-import secretsdPlugin, { REQUEST_TIMEOUT_MS, createSecretsdPlugin, issueTokenFile } from "./secretsd";
+import secretsdPlugin, { DAEMON_ERROR_CODES, REQUEST_TIMEOUT_MS, createSecretsdPlugin, issueTokenFile } from "./secretsd";
 
 // allow: SIZE_OK — the plan requires all fake-broker protocol scenarios in this single test file.
 const roots: string[] = [];
@@ -266,24 +266,63 @@ async function requestGuidanceFor(responseFrame: string): Promise<string> {
   return result;
 }
 
-test("maps every non-version, non-token REQUEST error from the daemon", async () => {
+test("maps every daemon ErrCode to distinct actionable guidance", async () => {
   const cases = [
-    ["ERR\tBAD_REQUEST\tbad request", "unavailable"],
-    ["ERR\tUNKNOWN_OP\tunknown operation", "unavailable"],
-    ["ERR\tNO_SCOPE\tno scope", "unavailable"],
-    ["ERR\tAGENT_TTY\tagent tty", "unavailable"],
-    ["ERR\tNOT_HUMAN_KEY\tnot human", "unavailable"],
-    ["ERR\tDENIED\tdenied", "denied"],
-    ["ERR\tTIMEOUT\ttimed out", "denied"],
-    ["ERR\tYUBIKEY_UNREACHABLE\tunreachable", "unavailable"],
-    ["ERR\tTOO_MANY_PENDING\tqueue full", "unavailable"],
-    ["ERR\tINTERNAL\tinternal", "unavailable"],
+    [
+      "ERR\tBAD_REQUEST\tbad request",
+      "error: secretsd rejected this request as malformed; verify the key name and report the request if it persists.",
+    ],
+    [
+      "ERR\tUNKNOWN_OP\tunknown operation",
+      "error: secretsd does not support the requested operation; update OpenCode and secretsd to matching versions.",
+    ],
+    [
+      "ERR\tVERSION_MISMATCH\tupgrade required",
+      "error: secretsd protocol version mismatch; restart or update secretsd and OpenCode before requesting a secret.",
+    ],
+    [
+      "ERR\tUNKNOWN_TOKEN\tbroker restarted",
+      "error: secretsd lost this session's registration after automatic re-registration; start a new OpenCode session and retry.",
+    ],
+    [
+      "ERR\tNO_SCOPE\tno scope",
+      "error: secretsd cannot attribute this request to a session because no session token or tty was provided; start it from a registered OpenCode session.",
+    ],
+    [
+      "ERR\tAGENT_TTY\tagent tty",
+      "error: secretsd rejected a tokenless request from a tty already assigned to an agent session; use the registered session token.",
+    ],
+    [
+      "ERR\tNOT_HUMAN_KEY\tnot human",
+      "not human-tier: this key does not require approval; read it normally with the secrets CLI, or check the key name for a typo.",
+    ],
+    ["ERR\tDENIED\tdenied", "denied: human approval was refused; do not retry unless the human asks you to."],
+    [
+      "ERR\tTIMEOUT\ttimed out",
+      "timed out: no one approved the request in time; make a new request only if approval is still needed.",
+    ],
+    [
+      "ERR\tYUBIKEY_UNREACHABLE\tunreachable",
+      "error: the YubiKey or its tunnel is unreachable; restore the hardware or tunnel connection and retry.",
+    ],
+    [
+      "ERR\tTOO_MANY_PENDING\tqueue full",
+      "error: this session already has too many approvals pending; wait for an existing request to be resolved before requesting again.",
+    ],
+    [
+      "ERR\tINTERNAL\tinternal",
+      "error: secretsd failed while decrypting; inspect `journalctl --user -u secretsd` for the daemon's sops stderr.",
+    ],
   ] as const;
 
-  for (const [frame, expectedStatus] of cases) {
-    const result = await requestGuidanceFor(frame);
-    expect(result.startsWith(`${expectedStatus}:`)).toBe(true);
-  }
+  const results = await Promise.all(cases.map(async ([frame]) => requestGuidanceFor(frame)));
+
+  expect(cases.map(([frame]) => frame.split("\t")[1])).toEqual(DAEMON_ERROR_CODES);
+  expect(results).toEqual(cases.map(([, expected]) => expected));
+  expect(new Set(results).size).toBe(cases.length);
+  const notHumanKey = results[cases.findIndex(([frame]) => frame.includes("NOT_HUMAN_KEY"))];
+  expect(notHumanKey).not.toContain("YubiKey");
+  expect(notHumanKey).not.toContain("unavailable");
 });
 
 test("keeps an OpenCode session usable when the broker socket is absent", async () => {
@@ -367,7 +406,7 @@ test("dispose aborts a live REQUEST instead of waiting for its 100-second deadli
   const result = await Promise.race([request, Bun.sleep(250).then(() => "still-waiting")]);
 
   expect(REQUEST_TIMEOUT_MS).toBe(100_000);
-  expect(result !== "still-waiting" && result.startsWith("unavailable:")).toBe(true);
+  expect(result).toBe("error: the secretsd request was cancelled because the OpenCode session ended.");
   expect(existsSync(join(runtimeDir, "secretsd", "session-abort.token"))).toBe(false);
   server.stop(true);
 });

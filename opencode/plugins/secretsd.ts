@@ -24,8 +24,47 @@ const SESSION_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
 
 export const REQUEST_TIMEOUT_MS = 100_000;
 
-type RequestStatus = "granted" | "denied" | "unavailable";
-type RequestOutcome = { readonly status: RequestStatus; readonly versionMismatch: boolean };
+export const DAEMON_ERROR_CODES = [
+  "BAD_REQUEST",
+  "UNKNOWN_OP",
+  "VERSION_MISMATCH",
+  "UNKNOWN_TOKEN",
+  "NO_SCOPE",
+  "AGENT_TTY",
+  "NOT_HUMAN_KEY",
+  "DENIED",
+  "TIMEOUT",
+  "YUBIKEY_UNREACHABLE",
+  "TOO_MANY_PENDING",
+  "INTERNAL",
+] as const;
+
+export type DaemonErrorCode = (typeof DAEMON_ERROR_CODES)[number];
+
+const DAEMON_ERROR_GUIDANCE = {
+  BAD_REQUEST: "error: secretsd rejected this request as malformed; verify the key name and report the request if it persists.",
+  UNKNOWN_OP: "error: secretsd does not support the requested operation; update OpenCode and secretsd to matching versions.",
+  VERSION_MISMATCH: "error: secretsd protocol version mismatch; restart or update secretsd and OpenCode before requesting a secret.",
+  UNKNOWN_TOKEN: "error: secretsd lost this session's registration after automatic re-registration; start a new OpenCode session and retry.",
+  NO_SCOPE: "error: secretsd cannot attribute this request to a session because no session token or tty was provided; start it from a registered OpenCode session.",
+  AGENT_TTY: "error: secretsd rejected a tokenless request from a tty already assigned to an agent session; use the registered session token.",
+  NOT_HUMAN_KEY: "not human-tier: this key does not require approval; read it normally with the secrets CLI, or check the key name for a typo.",
+  DENIED: "denied: human approval was refused; do not retry unless the human asks you to.",
+  TIMEOUT: "timed out: no one approved the request in time; make a new request only if approval is still needed.",
+  YUBIKEY_UNREACHABLE: "error: the YubiKey or its tunnel is unreachable; restore the hardware or tunnel connection and retry.",
+  TOO_MANY_PENDING: "error: this session already has too many approvals pending; wait for an existing request to be resolved before requesting again.",
+  INTERNAL: "error: secretsd failed while decrypting; inspect `journalctl --user -u secretsd` for the daemon's sops stderr.",
+} as const satisfies Record<DaemonErrorCode, string>;
+
+type RequestOutcome =
+  | { readonly kind: "broker-unreachable" }
+  | { readonly kind: "broker-unresponsive" }
+  | { readonly kind: "daemon-error"; readonly code: DaemonErrorCode }
+  | { readonly kind: "granted" }
+  | { readonly kind: "request-cancelled" }
+  | { readonly kind: "runtime-unavailable" }
+  | { readonly kind: "unexpected-broker-response" }
+  | { readonly kind: "unexpected-error" };
 type SecretRequest = {
   readonly state: SessionState;
   readonly sessionID: string;
@@ -44,7 +83,23 @@ class InvalidSessionIDError extends Error {
 }
 
 class BrokerError extends Error {
-  readonly name = "BrokerError";
+  readonly name: string = "BrokerError";
+}
+
+class BrokerUnavailableError extends BrokerError {
+  readonly name = "BrokerUnavailableError";
+}
+
+class BrokerUnresponsiveError extends BrokerError {
+  readonly name = "BrokerUnresponsiveError";
+}
+
+class BrokerProtocolError extends BrokerError {
+  readonly name = "BrokerProtocolError";
+}
+
+class BrokerRequestCancelledError extends BrokerError {
+  readonly name = "BrokerRequestCancelledError";
 }
 
 class ProtocolVersionMismatch extends Error {
@@ -96,7 +151,7 @@ class BrokerClient {
       let closeSocket: (() => void) | undefined;
       let timer: ReturnType<typeof setTimeout> | undefined;
       const abort = () => {
-        finish(new BrokerError("broker request aborted"));
+        finish(new BrokerRequestCancelledError("broker request aborted"));
         closeSocket?.();
       };
       const finish = (result: string | Error) => {
@@ -121,7 +176,7 @@ class BrokerClient {
       }
       signal?.addEventListener("abort", abort, { once: true });
       timer = setTimeout(() => {
-        finish(new BrokerError("broker timeout"));
+        finish(new BrokerUnresponsiveError("broker timeout"));
         closeSocket?.();
       }, timeoutMs);
       Bun.connect({
@@ -144,15 +199,15 @@ class BrokerClient {
             }
           },
           error() {
-            finish(new BrokerError("broker connection failed"));
+            finish(new BrokerUnavailableError("broker connection failed"));
           },
           close() {
             if (!settled) {
-              finish(new BrokerError("broker closed without a response"));
+              finish(new BrokerProtocolError("broker closed without a response"));
             }
           },
         },
-      }).catch(() => finish(new BrokerError("broker connection failed")));
+      }).catch(() => finish(new BrokerUnavailableError("broker connection failed")));
     });
   }
 
@@ -162,7 +217,7 @@ class BrokerClient {
       throw new ProtocolVersionMismatch();
     }
     if (hello !== "OK\tversion=1") {
-      throw new BrokerError("broker rejected HELLO");
+      throw new BrokerProtocolError("broker rejected HELLO");
     }
     const response = await this.line(message, timeoutMs, signal);
     if (response === "ERR\tVERSION_MISMATCH" || response.startsWith("ERR\tVERSION_MISMATCH\t")) {
@@ -174,14 +229,14 @@ class BrokerClient {
   async register(state: SessionState, sessionID: string, pid: number): Promise<void> {
     const response = await this.command(`REGISTER\ttoken=${state.token}\tsession=${sessionID}\tpid=${pid}`);
     if (response !== "OK") {
-      throw new BrokerError("broker registration rejected");
+      throw new BrokerProtocolError("broker registration rejected");
     }
   }
 
   async unregister(sessionID: string): Promise<void> {
     const response = await this.command(`UNREGISTER\tsession=${sessionID}`);
     if (response !== "OK") {
-      throw new BrokerError("broker unregistration rejected");
+      throw new BrokerProtocolError("broker unregistration rejected");
     }
   }
 
@@ -191,23 +246,94 @@ class BrokerClient {
 }
 
 function guidance(outcome: RequestOutcome): string {
-  if (outcome.versionMismatch) {
-    return "unavailable: secretsd protocol version mismatch; restart or update secretsd and OpenCode before requesting a secret.";
+  switch (outcome.kind) {
+    case "broker-unreachable":
+      return "unavailable: could not reach the secretsd broker; check that secretsd is running and its socket is available.";
+    case "broker-unresponsive":
+      return "error: the secretsd broker did not respond before the request deadline; retry after confirming it is healthy.";
+    case "daemon-error":
+      return DAEMON_ERROR_GUIDANCE[outcome.code];
+    case "granted":
+      return "granted: use the secrets shim for the requested key.";
+    case "request-cancelled":
+      return "error: the secretsd request was cancelled because the OpenCode session ended.";
+    case "runtime-unavailable":
+      return "error: the secretsd runtime directory is unavailable, so this session cannot be registered.";
+    case "unexpected-broker-response":
+      return "error: secretsd returned an unrecognized protocol response; restart or update secretsd and OpenCode.";
+    case "unexpected-error":
+      return "error: secretsd encountered an unexpected plugin failure; inspect the OpenCode and secretsd logs.";
+    default:
+      return assertNever(outcome);
   }
-  if (outcome.status === "granted") {
-    return "granted: use the secrets shim for the requested key.";
-  }
-  if (outcome.status === "denied") {
-    return "denied: the request was denied or timed out; make a new request only if appropriate.";
-  }
-  return "unavailable: secretsd could not complete this human-tier request; check that the broker and YubiKey are available.";
 }
 
-function responseCode(response: string): string | undefined {
+function assertNever(value: never): never {
+  throw new Error(`unexpected request outcome: ${JSON.stringify(value)}`);
+}
+
+function responseCode(response: string): DaemonErrorCode | undefined {
   if (!response.startsWith("ERR\t")) {
     return undefined;
   }
-  return response.split("\t", 3)[1];
+  switch (response.split("\t", 3)[1]) {
+    case "BAD_REQUEST":
+      return "BAD_REQUEST";
+    case "UNKNOWN_OP":
+      return "UNKNOWN_OP";
+    case "VERSION_MISMATCH":
+      return "VERSION_MISMATCH";
+    case "UNKNOWN_TOKEN":
+      return "UNKNOWN_TOKEN";
+    case "NO_SCOPE":
+      return "NO_SCOPE";
+    case "AGENT_TTY":
+      return "AGENT_TTY";
+    case "NOT_HUMAN_KEY":
+      return "NOT_HUMAN_KEY";
+    case "DENIED":
+      return "DENIED";
+    case "TIMEOUT":
+      return "TIMEOUT";
+    case "YUBIKEY_UNREACHABLE":
+      return "YUBIKEY_UNREACHABLE";
+    case "TOO_MANY_PENDING":
+      return "TOO_MANY_PENDING";
+    case "INTERNAL":
+      return "INTERNAL";
+    default:
+      return undefined;
+  }
+}
+
+function responseOutcome(response: string): RequestOutcome {
+  if (response === "OK\tstatus=granted") {
+    return { kind: "granted" };
+  }
+  const code = responseCode(response);
+  if (code) {
+    return { kind: "daemon-error", code };
+  }
+  return { kind: "unexpected-broker-response" };
+}
+
+function failureOutcome(error: unknown): RequestOutcome {
+  if (error instanceof ProtocolVersionMismatch) {
+    return { kind: "daemon-error", code: "VERSION_MISMATCH" };
+  }
+  if (error instanceof BrokerUnavailableError) {
+    return { kind: "broker-unreachable" };
+  }
+  if (error instanceof BrokerUnresponsiveError) {
+    return { kind: "broker-unresponsive" };
+  }
+  if (error instanceof BrokerRequestCancelledError) {
+    return { kind: "request-cancelled" };
+  }
+  if (error instanceof BrokerProtocolError) {
+    return { kind: "unexpected-broker-response" };
+  }
+  return { kind: "unexpected-error" };
 }
 
 async function requestSecret(broker: BrokerClient, request: SecretRequest): Promise<RequestOutcome> {
@@ -217,16 +343,9 @@ async function requestSecret(broker: BrokerClient, request: SecretRequest): Prom
       await request.reregister();
       response = await broker.request(request.key, request.state, request.signal);
     }
-    if (response === "OK\tstatus=granted") {
-      return { status: "granted", versionMismatch: false };
-    }
-    const code = responseCode(response);
-    if (code === "DENIED" || code === "TIMEOUT") {
-      return { status: "denied", versionMismatch: false };
-    }
-    return { status: "unavailable", versionMismatch: false };
+    return responseOutcome(response);
   } catch (error) {
-    return { status: "unavailable", versionMismatch: error instanceof ProtocolVersionMismatch };
+    return failureOutcome(error);
   }
 }
 
@@ -309,7 +428,7 @@ export function createSecretsdPlugin(options: PluginOptions = {}) {
           try {
             const state = await ensureRegistered(context.sessionID);
             if (!state) {
-              return guidance({ status: "unavailable", versionMismatch: false });
+              return guidance({ kind: "runtime-unavailable" });
             }
             return guidance(
               await requestSecret(broker, {
@@ -326,7 +445,7 @@ export function createSecretsdPlugin(options: PluginOptions = {}) {
             );
           } catch (error) {
             // no-excuse-ok: catch — tool results must not surface broker failures.
-            return guidance({ status: "unavailable", versionMismatch: error instanceof ProtocolVersionMismatch });
+            return guidance(failureOutcome(error));
           }
         },
       }),
