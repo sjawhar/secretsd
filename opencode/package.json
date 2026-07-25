@@ -1,0 +1,6 @@
+{
+  "private": true,
+  "type": "module",
+  "devDependencies": { "@opencode-ai/plugin": "1.3.0" },
+  "scripts": { "test:secretsd-plugin": "bun test plugins/secretsd.test.ts" }
+}

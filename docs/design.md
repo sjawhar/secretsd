@@ -111,14 +111,20 @@ agent (OpenCode session)
      the correct security default. The shim reports "broker restarted;
      re-approval required" clearly.
 
-2. **OpenCode plugin** (new, extends the existing session plugins): the
-   identity authority.
+2. **OpenCode plugin** (`opencode/plugins/secretsd.ts`): the identity
+   authority, shipped and tested with the `secretsd` release.
+   - Package installation places the exact tested plugin at
+     `~/.local/share/secretsd/opencode/plugins/secretsd.ts`. Dotfiles loads it
+     through the stable release-owned entry
+     `file://{env:HOME}/.local/share/secretsd/opencode/plugins/secretsd.ts`,
+     not a symlink into a dotfiles checkout.
    - On session create: generates a random 256-bit token, registers
-     `(token, session_id, serve_pid)` with the broker, writes the token to
-     `$XDG_RUNTIME_DIR/secretsd/<session>.token` (0600), and injects
-     `SECRETSD_SESSION_TOKEN_FILE` (the path, not the value) into the
-     session's bash env — so `env` dumps, transcripts, and child-env logs
-     never contain the bearer credential itself.
+    `(token, session_id, serve_pid)` with the broker, writes the token to
+    `$XDG_RUNTIME_DIR/secretsd/<session>.token` (inside a `0700` directory,
+    with mode `0600`), and injects only
+    `SECRETSD_SESSION_TOKEN_FILE=<path>` into the session's bash environment.
+    The token value never enters the environment, so `env` dumps, transcripts,
+    and child-environment logs never contain the bearer credential itself.
    - Token lifecycle: the token is persisted in the plugin's session state
      and **re-registered on broker or serve restart** before requests are
      allowed. An unknown token is a hard identity error — it never falls
@@ -128,10 +134,9 @@ agent (OpenCode session)
    - On session delete: notifies the broker → grants revoked,
      values zeroized when the last grant for a key dies. Event-driven; no
      `/proc` sweeps needed for the primary path.
-   - Registers an MCP tool `secrets_request(key)` → returns
-     `granted | pending | denied | unavailable` plus human-readable
-     guidance. Never returns secret values (they must not enter the
-     transcript).
+   - Registers an MCP tool `secrets_request(key)` → returns `granted`,
+     `denied`, or `unavailable` guidance. Never returns secret values (they
+     must not enter the transcript).
 
 3. **`shims/secrets`** (modified): same CLI. The human-key set is derived
    from `secrets.human.d/*.env` filenames: those keys **always** route

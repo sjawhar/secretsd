@@ -37,6 +37,14 @@ jobs:
       - uses: taiki-e/install-action@nextest
       - run: cargo nextest run --all-targets --all-features --workspace
 
+  opencode-plugin:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - name: Test OpenCode secretsd plugin
+        run: bun install --cwd opencode --frozen-lockfile && bun run --cwd opencode test:secretsd-plugin
+
   miri:
     runs-on: ubuntu-latest
     steps:

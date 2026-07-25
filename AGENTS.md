@@ -1,8 +1,8 @@
 # secretsd
 
 A session-scoped secrets broker. Holds hardware-gated secrets in memory and
-hands them only to the agent session a human explicitly approved, for that
-session's lifetime.
+scopes them to the workflow of an agent session a human explicitly approved,
+for that session's lifetime.
 
 ## What problem this solves
 
@@ -81,7 +81,21 @@ test harness) — never from a client request, since clients are untrusted.
 
 ## Consumers
 
-The `secrets` shim and the OpenCode plugin that talk to this daemon live in
-`~/.dotfiles` (`shims/secrets`, `opencode/plugins/secretsd.ts`). The wire
-protocol is the contract between the repos: it carries a version in the
-handshake, and a mismatch must fail loudly rather than degrade.
+The Rust client and OpenCode plugin that speak this protocol are owned and
+tested in this repository. Package installation places the exact tested plugin
+at `~/.local/share/secretsd/opencode/plugins/secretsd.ts`; consuming dotfiles
+must load
+`file://{env:HOME}/.local/share/secretsd/opencode/plugins/secretsd.ts`.
+An absolute release-owned path keeps the plugin version coupled to its daemon
+release and cannot point at unrelated working-tree code after a partial
+dotfiles checkout.
+
+The plugin issues a random token per OpenCode session at
+`${XDG_RUNTIME_DIR}/secretsd/<sessionID>.token`, ensures the directory is
+`0700` and the file is `0600`, and exports only
+`SECRETSD_SESSION_TOKEN_FILE=<path>` to that session. The token value must
+never enter the environment. Per-session tokens provide workflow scoping and
+audit, not hard isolation between processes that share a Unix UID.
+
+The wire protocol is the contract between client and daemon: it carries a
+version in the handshake, and a mismatch must fail loudly rather than degrade.
