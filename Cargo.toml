@@ -13,10 +13,6 @@ autobins = false
 path = "src/lib.rs"
 
 [[bin]]
-name = "secretsd"
-path = "src/bin/secretsd.rs"
-
-[[bin]]
 name = "secrets"
 path = "src/bin/secrets.rs"
 

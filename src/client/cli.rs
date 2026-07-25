@@ -9,7 +9,8 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use super::error::CliError;
-use super::{AgentStore, BrokerClient, BrokerResponse, HumanClient, HumanNames};
+use super::status::{GetOutput, TierStatus, active_grant, get_arguments, write_status};
+use super::{AgentStore, BrokerClient, BrokerResponse, ClientError, HumanClient, HumanNames};
 use crate::secret::{SecretBytes, SecretName};
 
 /// Run a compatible `secrets` command.
@@ -20,7 +21,10 @@ pub fn run(arguments: impl IntoIterator<Item = OsString>) -> Result<(), CliError
     let command = arguments.first().ok_or(CliError::Usage)?;
     let context = Context::from_environment()?;
     match command.as_os_str() {
-        value if value == OsStr::new("get") => context.get(argument_at(&arguments, 1)?),
+        value if value == OsStr::new("get") => {
+            let (name, output) = get_arguments(&arguments)?;
+            context.get(name, output)
+        }
         value if value == OsStr::new("list") => context.list(),
         value if value == OsStr::new("edit") => Context::edit(context.agent_file()),
         value if value == OsStr::new("edit-local") => Context::edit(context.local_file()),
@@ -55,14 +59,60 @@ impl Context {
         })
     }
 
-    fn get(&self, raw_name: &OsString) -> Result<(), CliError> {
+    fn get(&self, raw_name: &OsString, output: GetOutput) -> Result<(), CliError> {
         let name = parse_name(raw_name)?;
-        let value = self.value(&name)?;
-        let mut stdout = std::io::stdout().lock();
-        stdout
-            .write_all(value.as_slice())
-            .map_err(CliError::Stdout)?;
-        stdout.write_all(b"\n").map_err(CliError::Stdout)
+        match output {
+            GetOutput::Request => self.request_grant(&name),
+            GetOutput::Status => self.status(&name),
+            GetOutput::Value => {
+                let value = self.value(&name)?;
+                let mut stdout = std::io::stdout().lock();
+                stdout
+                    .write_all(value.as_slice())
+                    .map_err(CliError::Stdout)?;
+                stdout.write_all(b"\n").map_err(CliError::Stdout)
+            }
+        }
+    }
+
+    /// Pre-authorize a key: ask the broker for a grant, then report status.
+    ///
+    /// This blocks for the human's approval and triggers the hardware touch when
+    /// no grant is live, which is what makes a bare `get` useful -- it leaves the
+    /// session authorized for later `--value` or injection calls without the
+    /// value ever being printed. Agent-tier keys need no approval, so they only
+    /// report their tier.
+    fn request_grant(&self, name: &SecretName) -> Result<(), CliError> {
+        let agent = self.agent.contains(name)?;
+        match (agent, self.human.contains(name)) {
+            (true, true) => Err(CliError::AmbiguousKey(name.clone())),
+            (true, false) => write_status(name, TierStatus::Agent),
+            (false, true) => {
+                HumanClient::from_environment()
+                    .and_then(|client| client.request_grant(name))
+                    .map_err(CliError::from_client)?;
+                // The broker answered, so the scope holds a grant now.
+                write_status(name, TierStatus::Human { grant_active: true })
+            }
+            (false, false) => Err(CliError::MissingSecret(name.clone())),
+        }
+    }
+
+    fn status(&self, name: &SecretName) -> Result<(), CliError> {
+        let agent = self.agent.contains(name)?;
+        match (agent, self.human.contains(name)) {
+            (true, true) => Err(CliError::AmbiguousKey(name.clone())),
+            (true, false) => write_status(name, TierStatus::Agent),
+            (false, true) => {
+                let response = Self::broker_call("GRANTS")?;
+                let BrokerResponse::Bytes(grants) = response else {
+                    return Err(CliError::from_client(ClientError::InvalidResponse));
+                };
+                let grant_active = active_grant(name, &grants)?;
+                write_status(name, TierStatus::Human { grant_active })
+            }
+            (false, false) => Err(CliError::MissingSecret(name.clone())),
+        }
     }
 
     fn list(&self) -> Result<(), CliError> {

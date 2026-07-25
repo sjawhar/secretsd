@@ -224,3 +224,83 @@ fn is_unreachable_promptly_when_the_injected_probe_hangs() {
     assert!(!reachable);
     assert!(started.elapsed() < Duration::from_secs(1));
 }
+
+/// Captures emitted log lines so a test can assert on what was recorded.
+#[derive(Clone)]
+struct CapturedLogs(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for CapturedLogs {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'writer> tracing_subscriber::fmt::MakeWriter<'writer> for CapturedLogs {
+    type Writer = Self;
+
+    fn make_writer(&'writer self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+#[test]
+fn classifies_a_sops_failure_without_logging_child_stderr() {
+    // The fixture writes "sops: could not decrypt" to stderr. That text stands in
+    // for anything sops might quote -- including material it just decrypted -- so
+    // its absence from the journal is the invariant under test.
+    let (_dir, store) = store_with_key("K");
+    let decryptor = Decryptor::new(
+        fixture_bin("fake-sops-fail"),
+        Duration::from_secs(5),
+        direct_pcsc(),
+    );
+    let key = SecretName::parse("K").unwrap();
+    let logs = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_writer(CapturedLogs(std::sync::Arc::clone(&logs)))
+        .finish();
+    let outcome = tracing::subscriber::with_default(subscriber, || decryptor.decrypt(&store, &key));
+
+    assert_eq!(outcome.err(), Some(ErrCode::Internal));
+    let output = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
+    assert!(
+        output.contains("sops_failure=") && output.contains("sops_stderr_bytes="),
+        "expected a classified failure, got: {output}"
+    );
+    assert!(
+        !output.contains("could not decrypt"),
+        "child stderr reached the log: {output}"
+    );
+}
+
+#[test]
+fn classifies_known_sops_signatures_and_falls_back_to_unclassified() {
+    // The first case is the real message seen when a YubiKey touch never lands;
+    // it contains both yubikey signatures, so ordering must pick the specific one.
+    assert_eq!(
+        classify_sops_stderr(
+            b"age: yubikey plugin: Failed to decrypt YubiKey stanza. Did you touch it?"
+        ),
+        "yubikey-stanza-undecryptable"
+    );
+    assert_eq!(
+        classify_sops_stderr(b"Failed to get the data key required to decrypt the SOPS file."),
+        "data-key-unavailable"
+    );
+    assert_eq!(
+        classify_sops_stderr(b"open /nope: no such file or directory"),
+        "input-unreadable"
+    );
+    assert_eq!(
+        classify_sops_stderr(b"sops metadata not found"),
+        "missing-sops-metadata"
+    );
+    assert_eq!(classify_sops_stderr(b"a novel failure"), "unclassified");
+    assert_eq!(classify_sops_stderr(b""), "unclassified");
+}

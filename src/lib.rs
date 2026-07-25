@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use crate::decrypt::{Decryptor, PcscReachability, YubikeyProbe};
+use crate::hardening::MemlockPolicy;
 
 /// Shared Unix-socket protocol client used by the `secrets` CLI.
 pub mod client;
@@ -15,6 +16,7 @@ pub mod decrypt;
 pub mod grants;
 /// Process hardening that must complete before plaintext is held.
 pub mod hardening;
+pub mod peer;
 pub mod proto;
 /// Pending approval requests and the single-flight hardware queue.
 pub mod requests;
@@ -125,6 +127,49 @@ impl Config {
 pub fn run(config: Config) -> std::io::Result<()> {
     config.validate()?;
     server::serve(config)
+}
+
+/// Start the hardened daemon until the process is stopped.
+pub fn serve_main() -> std::process::ExitCode {
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_target(false)
+        .init();
+
+    let policy = match memlock_policy() {
+        Ok(policy) => policy,
+        Err(error) => {
+            tracing::error!(%error, "refusing to start without process hardening");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+
+    if let Err(error) = hardening::apply(policy) {
+        tracing::error!(%error, "refusing to start without process hardening");
+        return std::process::ExitCode::FAILURE;
+    }
+
+    match run(Config::from_env()) {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(error) => {
+            tracing::error!(%error, "secretsd exited");
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+fn memlock_policy() -> Result<MemlockPolicy, &'static str> {
+    match std::env::var("SECRETSD_MEMLOCK") {
+        Ok(value) => match value.as_str() {
+            "require" => Ok(MemlockPolicy::Require),
+            "optional" => Ok(MemlockPolicy::Optional),
+            _ => Err("SECRETSD_MEMLOCK must be require (default) or optional"),
+        },
+        Err(std::env::VarError::NotPresent) => Ok(MemlockPolicy::Require),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            Err("SECRETSD_MEMLOCK must be require (default) or optional")
+        }
+    }
 }
 
 #[cfg(test)]

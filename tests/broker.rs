@@ -87,9 +87,16 @@ fn request_log_attributes_a_grant_without_secret_or_token_bytes() {
         registration_log.contains("untrusted_registered_session=Some(\"ses_a\")"),
         "REGISTER did not log its session"
     );
+    // The frame above claims pid=1. The daemon takes the registering process's
+    // identity from the kernel instead, so the log must show this test process
+    // and must not echo the value supplied on the wire.
     assert!(
-        registration_log.contains("untrusted_registered_pid=Some(1)"),
-        "REGISTER did not log its pid"
+        registration_log.contains(&format!("caller_pid=Some({})", std::process::id())),
+        "REGISTER did not log the kernel-derived caller pid"
+    );
+    assert!(
+        !registration_log.contains("caller_pid=Some(1)"),
+        "REGISTER trusted the pid supplied on the wire"
     );
     let (header, payload) = harness.send(&format!("GET\tkey=DEEL_API_KEY\ttoken={token}"));
 
@@ -102,7 +109,10 @@ fn request_log_attributes_a_grant_without_secret_or_token_bytes() {
         log.contains("untrusted_registered_session=Some(\"ses_a\")"),
         "{log}"
     );
-    assert!(log.contains("untrusted_registered_pid=Some("), "{log}");
+    assert!(log.contains("registered_root_pid=Some("), "{log}");
+    // A release served from a live grant is otherwise silent, so the audit
+    // must record that bytes moved and how many.
+    assert!(log.contains("released_bytes=Some("), "{log}");
     assert!(log.contains("decision="), "{log}");
     assert!(!log.contains("value-for-DEEL_API_KEY"), "{log}");
     assert!(!log.contains(&token), "{log}");

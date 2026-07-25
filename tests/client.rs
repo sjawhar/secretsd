@@ -109,7 +109,7 @@ fn client_handshakes_before_sending_a_request() {
 fn agent_get_works_with_a_minimal_noninteractive_environment() {
     let fixture = Fixture::agent("AGENT_ONLY=agent-value\n");
 
-    let output = fixture.run_minimal(["get", "AGENT_ONLY"]);
+    let output = fixture.run_minimal(["get", "--value", "AGENT_ONLY"]);
 
     assert_eq!(output.status.code(), Some(0));
     assert_eq!(output.stdout, b"agent-value\n");
@@ -127,7 +127,7 @@ fn agent_get_uses_the_optional_local_overlay_before_the_shared_file() {
     let fixture = Fixture::agent("KEY=shared-value\n");
     fixture.write_local("KEY=local-value\n");
 
-    let output = fixture.run_minimal(["get", "KEY"]);
+    let output = fixture.run_minimal(["get", "KEY", "--value"]);
 
     assert_eq!(output.status.code(), Some(0));
     assert_eq!(output.stdout, b"local-value\n");
@@ -137,10 +137,51 @@ fn agent_get_uses_the_optional_local_overlay_before_the_shared_file() {
 fn agent_get_succeeds_when_the_optional_local_overlay_is_missing() {
     let fixture = Fixture::agent("AGENT_ONLY=agent-value\n");
 
-    let output = fixture.run_minimal(["get", "AGENT_ONLY"]);
+    let output = fixture.run_minimal(["get", "AGENT_ONLY", "--value"]);
 
     assert_eq!(output.status.code(), Some(0));
     assert_eq!(output.stdout, b"agent-value\n");
+}
+
+#[test]
+fn bare_agent_get_reports_status_without_decrypting_or_printing_the_value() {
+    let fixture = Fixture::agent("AGENT_ONLY=agent-value\n");
+
+    let output = fixture.run_minimal(["get", "AGENT_ONLY"]);
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(output.stdout, b"AGENT_ONLY  agent tier\n");
+    assert!(
+        !output
+            .stdout
+            .windows(b"agent-value".len())
+            .any(|bytes| bytes == b"agent-value")
+    );
+    assert_eq!(fixture.sops_calls(), 0);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("--value"));
+    assert!(stderr.contains("secrets KEY -- command"));
+}
+
+#[test]
+fn get_rejects_missing_extra_and_unknown_arguments() {
+    let fixture = Fixture::agent("AGENT_ONLY=agent-value\n");
+
+    for arguments in [
+        ["get"].as_slice(),
+        ["get", "AGENT_ONLY", "ANOTHER"].as_slice(),
+        ["get", "AGENT_ONLY", "--unknown"].as_slice(),
+        ["get", "--value"].as_slice(),
+    ] {
+        let output = fixture.run_minimal(arguments);
+
+        assert_ne!(output.status.code(), Some(0));
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("usage: secrets get KEY [--value|--no-request]")
+        );
+    }
+    assert_eq!(fixture.sops_calls(), 0);
 }
 
 #[test]

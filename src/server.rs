@@ -169,7 +169,7 @@ fn sanitize_audit_value(value: &str) -> String {
 struct AuditContext {
     key: String,
     untrusted_registered_session: Option<String>,
-    untrusted_registered_pid: Option<i32>,
+    registered_root_pid: Option<i32>,
     request_id: Option<RequestId>,
 }
 
@@ -177,16 +177,17 @@ fn audit_context(request: &Request, shared: &Shared) -> AuditContext {
     let mut audit = AuditContext {
         key: request_key(request).map_or_else(|| "-".to_owned(), sanitize_audit_value),
         untrusted_registered_session: None,
-        untrusted_registered_pid: None,
+        registered_root_pid: None,
         request_id: None,
     };
     let (raw_key, token_hex) = match request {
         Request::Get { key, token_hex, .. } | Request::RequestGrant { key, token_hex, .. } => {
             (key, token_hex)
         }
-        Request::Register { session, pid, .. } => {
+        Request::Register { session, .. } => {
+            // The pid on the wire is not recorded: `caller_pid` on the log line
+            // carries the kernel's view of who actually registered.
             audit.untrusted_registered_session = Some(sanitize_audit_value(session));
-            audit.untrusted_registered_pid = Some(*pid);
             return audit;
         }
         Request::Hello { .. }
@@ -207,7 +208,7 @@ fn audit_context(request: &Request, shared: &Shared) -> AuditContext {
         return audit;
     };
     audit.untrusted_registered_session = Some(sanitize_audit_value(&registration.session));
-    audit.untrusted_registered_pid = Some(registration.pid);
+    audit.registered_root_pid = registration.root.pid();
     audit.request_id = SecretName::parse(raw_key).ok().and_then(|secret_name| {
         let scope = Scope::Session(token);
         if state.grants.lookup(&scope, &secret_name).is_none() && state.store.contains(&secret_name)
@@ -275,6 +276,12 @@ fn handle(stream: UnixStream, shared: &Shared) -> std::io::Result<()> {
         return Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
     }
     let peer_pid = peer.pid();
+    // Pin the caller before reading the frame. Ancestry is only meaningful if the
+    // pid cannot be recycled between now and the /proc walk, and a caller the
+    // kernel will not identify is refused rather than treated as trusted.
+    let caller = crate::peer::PeerIdentity::from_stream(&stream).map_err(|_| {
+        std::io::Error::other("peer identity unavailable; refusing to authorize the connection")
+    })?;
     let mut reader = BufReader::new(stream);
     let mut frame = Vec::new();
     {
@@ -301,15 +308,17 @@ fn handle(stream: UnixStream, shared: &Shared) -> std::io::Result<()> {
         },
         |request| {
             let audit = audit_context(&request, shared);
-            let decision = dispatch(request, shared);
+            let decision = dispatch(request, shared, &caller);
             tracing::info!(
                 key = %audit.key,
             peer_pid = ?peer_pid,
+                caller_pid = ?caller.pid(),
                 scope_kind = ?decision.scope_kind,
                 untrusted_registered_session = ?audit.untrusted_registered_session,
-                untrusted_registered_pid = ?audit.untrusted_registered_pid,
+                registered_root_pid = ?audit.registered_root_pid,
                 request_id = ?audit.request_id,
                 decision = decision.outcome.decision(),
+                released_bytes = ?decision.outcome.released_bytes(),
                 "request handled"
             );
             decision
@@ -667,7 +676,7 @@ mod tests {
         lock_state(&shared.0).registry.register(Registration {
             token,
             session: "opencode-session".to_owned(),
-            pid: 12_345,
+            root: crate::peer::PeerIdentity::current_for_test(),
         });
         let worker_shared = Arc::clone(&shared);
         let _worker = thread::spawn(move || worker(&worker_shared));
@@ -692,7 +701,13 @@ mod tests {
         assert!(output.contains("scope_kind=Some(VerifiedSession)"));
         assert!(output.contains("peer_pid="));
         assert!(output.contains("untrusted_registered_session=Some(\"opencode-session\")"));
-        assert!(output.contains("untrusted_registered_pid=Some(12345)"));
+        // The registered pid now comes from the kernel, so it is this test
+        // process rather than a value supplied over the wire.
+        assert!(output.contains(&format!("caller_pid=Some({})", std::process::id())));
+        assert!(
+            !output.contains("caller_pid=Some(12345)"),
+            "the audit trusted a pid supplied over the wire"
+        );
         assert!(output.contains("request_id=Some(RequestId(1))"));
         assert!(output.contains("decision="));
         assert!(!output.contains(&token_hex));
@@ -711,7 +726,7 @@ mod tests {
         lock_state(&shared.0).registry.register(Registration {
             token,
             session: "opencode-session".to_owned(),
-            pid: 12_345,
+            root: crate::peer::PeerIdentity::current_for_test(),
         });
         let (mut client, server) = UnixStream::pair().unwrap();
         let key = format!("KEY\rINJECT\0{}", "X".repeat(MAX_AUDIT_VALUE_BYTES + 1));

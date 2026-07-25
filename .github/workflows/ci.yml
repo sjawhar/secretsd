@@ -43,7 +43,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: oven-sh/setup-bun@v2
       - name: Test OpenCode secretsd plugin
-        run: bun install --cwd opencode --frozen-lockfile && bun run --cwd opencode test:secretsd-plugin
+        run: bun install --frozen-lockfile && bun run test:secretsd-plugin
 
   miri:
     runs-on: ubuntu-latest

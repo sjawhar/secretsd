@@ -80,6 +80,7 @@ fn accept(listener: &UnixListener, stop: &AtomicBool) -> Option<UnixStream> {
 }
 
 #[test]
+#[cfg_attr(miri, ignore)]
 fn broker_operations_return_timeout_when_the_broker_accepts_without_replying() {
     // Given a broker that completes HELLO and stalls each operation connection.
     for operation in [

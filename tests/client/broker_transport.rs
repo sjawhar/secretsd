@@ -78,7 +78,7 @@ fn human_get_reads_the_token_from_its_file_not_the_environment() {
     let token_file = fixture.write_token(token);
 
     let output = fixture.run_broker(
-        ["get", "HUMAN"],
+        ["get", "HUMAN", "--value"],
         broker.socket(),
         Some(&token_file),
         Some("environment-token-must-not-be-used"),
@@ -99,12 +99,52 @@ fn human_get_routes_to_the_broker_when_the_agent_tier_is_absent() {
     let fixture = Fixture::human("HUMAN");
     std::fs::remove_file(fixture.dotfiles_dir().join("secrets.env")).unwrap();
 
-    let output = fixture.run_broker(["get", "HUMAN"], broker.socket(), None, None);
+    let output = fixture.run_broker(["get", "HUMAN", "--value"], broker.socket(), None, None);
 
     assert_eq!(output.status.code(), Some(0));
     assert_eq!(output.stdout, b"human-value\n");
     assert_eq!(fixture.sops_calls(), 0);
     assert_eq!(broker.frames(), ["HELLO\tversion=1", "GET\tkey=HUMAN"]);
+}
+
+#[test]
+fn get_with_no_request_lists_grants_without_sending_get() {
+    let broker = FakeBroker::script([Reply::Hello, Reply::Bytes(b"no active grants\n".to_vec())]);
+    let fixture = Fixture::human("HUMAN");
+
+    let output = fixture.run_broker(
+        ["get", "HUMAN", "--no-request"],
+        broker.socket(),
+        None,
+        None,
+    );
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(output.stdout, b"HUMAN  human tier  grant: inactive\n");
+    assert_eq!(fixture.sops_calls(), 0);
+    assert_eq!(broker.frames(), ["HELLO\tversion=1", "GRANTS"]);
+}
+
+#[test]
+fn get_with_no_request_reports_an_active_session_grant() {
+    let token = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    let broker = FakeBroker::script([
+        Reply::Hello,
+        Reply::Bytes(b"KEY\tSCOPE\tAGE\nHUMAN\tsession\t0s\n".to_vec()),
+    ]);
+    let fixture = Fixture::human("HUMAN");
+    let token_file = fixture.write_token(token);
+
+    let output = fixture.run_broker(
+        ["get", "HUMAN", "--no-request"],
+        broker.socket(),
+        Some(&token_file),
+        None,
+    );
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(output.stdout, b"HUMAN  human tier  grant: active\n");
+    assert_eq!(broker.frames(), ["HELLO\tversion=1", "GRANTS"]);
 }
 
 #[test]
@@ -199,4 +239,27 @@ fn control_operations_use_the_broker_without_a_token_or_tty() {
             "LOCK",
         ]
     );
+}
+
+#[test]
+fn bare_human_get_requests_a_grant_without_receiving_the_value() {
+    // A bare `get` pre-authorizes the session: it sends REQUEST, which blocks for
+    // the human's approval and triggers the touch, and it never asks for bytes.
+    let token = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    let broker = FakeBroker::script_with_token(
+        [Reply::Hello, Reply::Raw(b"OK\tstatus=granted\n".to_vec())],
+        token.to_owned(),
+    );
+    let fixture = Fixture::human("HUMAN");
+    let token_file = fixture.write_token(token);
+
+    let output = fixture.run_broker(["get", "HUMAN"], broker.socket(), Some(&token_file), None);
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(output.stdout, b"HUMAN  human tier  grant: active\n");
+    assert_eq!(
+        broker.frames(),
+        ["HELLO\tversion=1", "REQUEST\tkey=HUMAN\ttoken=<redacted>"]
+    );
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("human-value"));
 }

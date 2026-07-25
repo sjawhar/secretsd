@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -31,6 +32,18 @@ impl AgentStore {
         self.all()?
             .remove(name)
             .ok_or_else(|| CliError::MissingSecret(name.clone()))
+    }
+
+    /// Check encrypted dotenv key names without decrypting their values.
+    pub fn contains(&self, name: &SecretName) -> Result<bool, CliError> {
+        let local = self.dotfiles_dir.join("secrets.local.env");
+        let shared = self.dotfiles_dir.join("secrets.env");
+        for path in [&local, &shared] {
+            if path.is_file() && Self::contains_name(path, name)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// Decrypt every agent-tier assignment with local values winning on conflicts.
@@ -72,6 +85,26 @@ impl AgentStore {
         let parsed = parse_dotenv(&output.stdout);
         output.stdout.zeroize();
         parsed
+    }
+
+    fn contains_name(path: &Path, target: &SecretName) -> Result<bool, CliError> {
+        let encrypted = fs::read(path).map_err(CliError::AgentKeySet)?;
+        for line in encrypted.split(|byte| *byte == b'\n') {
+            let line = line.strip_suffix(b"\r").unwrap_or(line);
+            if line.is_empty() || line.first() == Some(&b'#') {
+                continue;
+            }
+            let Some(separator) = line.iter().position(|byte| *byte == b'=') else {
+                return Err(CliError::InvalidDotenv);
+            };
+            let raw_name = line.get(..separator).ok_or(CliError::InvalidDotenv)?;
+            let name = std::str::from_utf8(raw_name).map_err(|_| CliError::InvalidDotenv)?;
+            let name = SecretName::parse(name).map_err(|_| CliError::InvalidSecretName)?;
+            if !name.as_str().starts_with("sops_") && name == *target {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 }
 

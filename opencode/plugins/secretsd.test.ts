@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import type { ToolContext, ToolResult } from "@opencode-ai/plugin";
-import { existsSync, mkdtempSync, readFileSync, rmSync, statSync } from "fs";
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync } from "fs";
 import { join } from "path";
 import secretsdPlugin, { DAEMON_ERROR_CODES, REQUEST_TIMEOUT_MS, createSecretsdPlugin, issueTokenFile } from "./secretsd";
 
@@ -75,6 +75,62 @@ describe("secretsd token issuance", () => {
     const token = readFileSync(output.env.SECRETSD_SESSION_TOKEN_FILE, "utf8");
     expect(Object.values(output.env).some((value) => value === token)).toBe(false);
     broker.stop();
+  });
+
+  test("session end unregisters the session and removes its token file", async () => {
+    // Without this, a finished session's token file and broker grant survive
+    // until the whole serve process exits or the daemon's backstop expires.
+    const runtimeDir = root();
+    const socketPath = join(runtimeDir, "broker.sock");
+    const plugin = createSecretsdPlugin({ runtimeDir, socketPath, pid: 4242 });
+    const broker = fakeBroker(socketPath);
+    const output: { env: Record<string, string> } = { env: {} };
+    await plugin.hooks["shell.env"]({ sessionID: "session-ended" }, output);
+    const tokenPath = output.env.SECRETSD_SESSION_TOKEN_FILE;
+    expect(existsSync(tokenPath)).toBe(true);
+
+    await plugin.hooks.event({
+      event: { type: "session.deleted", properties: { sessionID: "session-ended" } },
+    });
+
+    expect(existsSync(tokenPath)).toBe(false);
+    expect(broker.received.some((line) => line.startsWith("UNREGISTER\t"))).toBe(true);
+    broker.stop();
+  });
+
+  test("session end accepts the info-shaped payload and ignores other events", async () => {
+    // The SDK declares both payload shapes; a mismatch would silently skip revocation.
+    const runtimeDir = root();
+    const socketPath = join(runtimeDir, "broker.sock");
+    const plugin = createSecretsdPlugin({ runtimeDir, socketPath, pid: 4343 });
+    const broker = fakeBroker(socketPath);
+    const output: { env: Record<string, string> } = { env: {} };
+    await plugin.hooks["shell.env"]({ sessionID: "session-info" }, output);
+    const tokenPath = output.env.SECRETSD_SESSION_TOKEN_FILE;
+
+    await plugin.hooks.event({
+      event: { type: "session.idle", properties: { sessionID: "session-info" } },
+    });
+    expect(existsSync(tokenPath)).toBe(true);
+
+    await plugin.hooks.event({
+      event: { type: "session.deleted", properties: { info: { id: "session-info" } } },
+    });
+    expect(existsSync(tokenPath)).toBe(false);
+    broker.stop();
+  });
+
+  test("issues the token by rename so no partial token is ever readable", () => {
+    // A reader must see either no file or a complete 64-hex token, and no
+    // staging file may be left behind at the real path's directory.
+    const runtimeDir = root();
+
+    const state = issueTokenFile(runtimeDir, "session-atomic");
+
+    expect(/^[0-9a-f]{64}$/.test(readFileSync(state.tokenFile, "utf8"))).toBe(true);
+    expect(statSync(state.tokenFile).mode & 0o777).toBe(0o600);
+    const leftovers = readdirSync(join(runtimeDir, "secretsd")).filter((name) => name.endsWith(".tmp"));
+    expect(leftovers).toEqual([]);
   });
 
   test("rejects an unsafe session ID before deriving a token filename", () => {
@@ -294,7 +350,7 @@ test("maps every daemon ErrCode to distinct actionable guidance", async () => {
     ],
     [
       "ERR\tNOT_HUMAN_KEY\tnot human",
-      "not human-tier: this key does not require approval; read it normally with the secrets CLI, or check the key name for a typo.",
+      "not human-tier: no approval is needed for this key; read it directly with `secrets get <KEY>`. If that read fails, the key is not configured.",
     ],
     ["ERR\tDENIED\tdenied", "denied: human approval was refused; do not retry unless the human asks you to."],
     [

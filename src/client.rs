@@ -17,6 +17,7 @@ pub mod cli;
 mod error;
 mod human;
 mod response;
+mod status;
 
 pub use agent::AgentStore;
 pub use error::CliError;

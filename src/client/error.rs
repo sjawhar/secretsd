@@ -24,6 +24,8 @@ pub enum CliError {
     SopsFailed,
     /// Decrypted dotenv bytes were malformed or unsafe.
     InvalidDotenv,
+    /// Reading encrypted agent-tier key names failed.
+    AgentKeySet(std::io::Error),
     /// Reading the human-tier directory failed.
     HumanDirectory(std::io::Error),
     /// A human-tier filename was not a valid key name.
@@ -34,8 +36,10 @@ pub enum CliError {
     BrokerTransport(ClientError),
     /// Replacing the process for an edit or injection command failed.
     Exec(std::io::Error),
-    /// Writing an agent-tier value to standard output failed.
+    /// Writing command output to standard output failed.
     Stdout(std::io::Error),
+    /// Writing command guidance to standard error failed.
+    Stderr(std::io::Error),
 }
 
 impl CliError {
@@ -57,7 +61,7 @@ impl fmt::Display for CliError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Usage => formatter.write_str(
-                "usage: secrets get KEY | secrets list | secrets grants | secrets deny ID | secrets lock | secrets KEY1 [KEY2 ...] -- command [args...]",
+                "usage: secrets get KEY [--value|--no-request] | secrets list | secrets grants | secrets deny ID | secrets lock | secrets KEY1 [KEY2 ...] -- command [args...]",
             ),
             Self::InvalidSecretName => formatter.write_str("invalid secret key"),
             Self::MissingSecret(name) => write!(formatter, "secret '{}' not found", name.as_str()),
@@ -69,6 +73,7 @@ impl fmt::Display for CliError {
             Self::SopsStart(error) => write!(formatter, "could not start sops: {error}"),
             Self::SopsFailed => formatter.write_str("sops could not decrypt the agent-tier secrets"),
             Self::InvalidDotenv => formatter.write_str("sops returned invalid dotenv data"),
+            Self::AgentKeySet(error) => write!(formatter, "could not read agent-tier key set: {error}"),
             Self::HumanDirectory(error) => write!(formatter, "could not list human-tier keys: {error}"),
             Self::InvalidHumanFile => {
                 formatter.write_str("human-tier directory contains an invalid key filename")
@@ -77,6 +82,7 @@ impl fmt::Display for CliError {
             Self::BrokerTransport(error) => write!(formatter, "{AGENT_NOTICE} {error}"),
             Self::Exec(error) => write!(formatter, "could not execute command: {error}"),
             Self::Stdout(error) => write!(formatter, "could not write secret value: {error}"),
+            Self::Stderr(error) => write!(formatter, "could not write command guidance: {error}"),
         }
     }
 }
@@ -85,9 +91,11 @@ impl std::error::Error for CliError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::SopsStart(error)
+            | Self::AgentKeySet(error)
             | Self::HumanDirectory(error)
             | Self::Exec(error)
-            | Self::Stdout(error) => Some(error),
+            | Self::Stdout(error)
+            | Self::Stderr(error) => Some(error),
             Self::BrokerTransport(error) => Some(error),
             Self::Usage
             | Self::InvalidSecretName
@@ -120,6 +128,9 @@ const fn broker_guidance(code: ErrCode) -> &'static str {
         }
         ErrCode::AgentTty => {
             "a tokenless request came from a known agent terminal; use the OpenCode token path instead."
+        }
+        ErrCode::ForeignCaller => {
+            "this session's token was presented from outside that session's process tree, so it was refused; run the request from the session that owns the token."
         }
         ErrCode::NotHumanKey => {
             "the requested human-tier key is missing or was moved; ask the human to check its encrypted file."

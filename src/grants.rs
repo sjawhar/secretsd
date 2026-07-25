@@ -91,8 +91,11 @@ pub struct Registration {
     pub token: SessionToken,
     /// Harness-supplied identifier. Untrusted; logging and display only.
     pub session: String,
-    /// Harness process id, displayed as unverified request metadata.
-    pub pid: i32,
+    /// Kernel-pinned identity of the process that registered this session.
+    ///
+    /// Captured from the connection rather than taken from the wire, so requests
+    /// can be checked against the session's real process tree.
+    pub root: crate::peer::PeerIdentity,
 }
 
 /// Known sessions and learned agent terminals.
@@ -159,12 +162,25 @@ impl Registry {
         &mut self,
         token: Option<&SessionToken>,
         tty: Option<&str>,
+        caller: Option<&crate::peer::PeerIdentity>,
     ) -> Result<Scope, ErrCode> {
         match token {
             Some(presented) => {
-                let known = self.sessions.iter().any(|entry| entry.token == *presented);
-                if !known {
+                let Some(root) = self
+                    .sessions
+                    .iter()
+                    .find(|entry| entry.token == *presented)
+                    .map(|entry| entry.root.clone())
+                else {
                     return Err(ErrCode::UnknownToken);
+                };
+                // The token says which session, not that this caller belongs to
+                // it: every process sharing the uid can read the token file.
+                // Require the caller to sit inside that session's process tree,
+                // and refuse outright instead of degrading to a tty scope, which
+                // a caller could otherwise obtain just by allocating a pty.
+                if !caller.is_some_and(|caller| caller.descends_from(&root)) {
+                    return Err(ErrCode::ForeignCaller);
                 }
                 if let Some(tty) = tty
                     && !self.is_agent_tty(tty)
@@ -305,7 +321,7 @@ mod tests {
         registry.register(Registration {
             token: token(0xaa),
             session: "ses_a".to_owned(),
-            pid: 1234,
+            root: crate::peer::PeerIdentity::current_for_test(),
         });
         registry
     }
@@ -325,76 +341,127 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn resolves_registered_token_to_session_scope() {
         let mut registry = registered();
         let scope = registry
-            .resolve(Some(&token(0xaa)), Some("/dev/pts/3"))
+            .resolve(
+                Some(&token(0xaa)),
+                Some("/dev/pts/3"),
+                Some(&crate::peer::PeerIdentity::current_for_test()),
+            )
             .unwrap();
         assert_eq!(scope.kind(), ScopeKind::VerifiedSession);
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn rejects_unregistered_token() {
         let mut registry = registered();
         assert_eq!(
             registry
-                .resolve(Some(&token(0xbb)), Some("/dev/pts/3"))
+                .resolve(
+                    Some(&token(0xbb)),
+                    Some("/dev/pts/3"),
+                    Some(&crate::peer::PeerIdentity::current_for_test())
+                )
                 .err(),
             Some(ErrCode::UnknownToken)
         );
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn unknown_token_never_falls_back_to_tokenless() {
         // A stale token (broker restarted, session did not re-register) must be
         // a hard identity error -- silently degrading to a tty scope would let
         // an env-stripped agent launder itself into the interactive path.
         let mut registry = registered();
         let err = registry
-            .resolve(Some(&token(0xcc)), Some("/dev/pts/9"))
+            .resolve(
+                Some(&token(0xcc)),
+                Some("/dev/pts/9"),
+                Some(&crate::peer::PeerIdentity::current_for_test()),
+            )
             .err();
         assert_eq!(err, Some(ErrCode::UnknownToken));
         assert!(!registry.is_agent_tty("/dev/pts/9"));
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn tokenless_request_from_fresh_tty_is_interactive() {
         let mut registry = registered();
-        let scope = registry.resolve(None, Some("/dev/pts/7")).unwrap();
+        let scope = registry
+            .resolve(
+                None,
+                Some("/dev/pts/7"),
+                Some(&crate::peer::PeerIdentity::current_for_test()),
+            )
+            .unwrap();
         assert_eq!(scope.kind(), ScopeKind::TokenlessTty);
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn tokenless_request_from_learned_agent_tty_is_rejected() {
         let mut registry = registered();
         registry
-            .resolve(Some(&token(0xaa)), Some("/dev/pts/3"))
+            .resolve(
+                Some(&token(0xaa)),
+                Some("/dev/pts/3"),
+                Some(&crate::peer::PeerIdentity::current_for_test()),
+            )
             .unwrap();
         assert!(registry.is_agent_tty("/dev/pts/3"));
         assert_eq!(
-            registry.resolve(None, Some("/dev/pts/3")).err(),
+            registry
+                .resolve(
+                    None,
+                    Some("/dev/pts/3"),
+                    Some(&crate::peer::PeerIdentity::current_for_test())
+                )
+                .err(),
             Some(ErrCode::AgentTty)
         );
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn request_without_token_or_tty_has_no_scope() {
         let mut registry = registered();
-        assert_eq!(registry.resolve(None, None).err(), Some(ErrCode::NoScope));
+        assert_eq!(
+            registry
+                .resolve(
+                    None,
+                    None,
+                    Some(&crate::peer::PeerIdentity::current_for_test())
+                )
+                .err(),
+            Some(ErrCode::NoScope)
+        );
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn unregister_returns_tokens_to_revoke() {
         let mut registry = registered();
         let revoked = registry.unregister("ses_a");
         assert_eq!(revoked, vec![token(0xaa)]);
         assert_eq!(
-            registry.resolve(Some(&token(0xaa)), None).err(),
+            registry
+                .resolve(
+                    Some(&token(0xaa)),
+                    None,
+                    Some(&crate::peer::PeerIdentity::current_for_test())
+                )
+                .err(),
             Some(ErrCode::UnknownToken)
         );
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn replacing_a_session_revokes_its_displaced_token_grants_from_the_table() {
         // Given: a session and a grant associated with its original token.
         let mut registry = Registry::default();
@@ -403,7 +470,7 @@ mod tests {
         registry.register(Registration {
             token: original,
             session: "ses_a".to_owned(),
-            pid: 1234,
+            root: crate::peer::PeerIdentity::current_for_test(),
         });
         table.insert(
             Scope::Session(original),
@@ -416,7 +483,7 @@ mod tests {
         let displaced = registry.register(Registration {
             token: token(0xbb),
             session: "ses_a".to_owned(),
-            pid: 5678,
+            root: crate::peer::PeerIdentity::current_for_test(),
         });
         table.revoke_tokens(&displaced);
 

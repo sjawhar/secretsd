@@ -4,7 +4,7 @@
 
 **Goal:** Make `secretsd` own the Rust `secrets` CLI, its shared wire protocol, its OpenCode plugin, and portable systemd units without regressing unattended agent-tier access.
 
-**Architecture:** Turn the package into a library with `proto` and `client` modules and two thin binaries: `secretsd` and drop-in `secrets`.  The client uses typed protocol frames and exact byte reads for human-tier requests while keeping agent-tier sops decryption local and daemon-independent.  Human-tier requests proceed to the hardware prompt; the physical YubiKey touch is the authorization gesture, and the structured journald request event supplies after-the-fact attribution.
+**Architecture:** Turn the package into a library with `proto` and `client` modules and one `secrets` binary. `secrets serve` runs the daemon; every other invocation is the drop-in client CLI. The client uses typed protocol frames and exact byte reads for human-tier requests while keeping agent-tier sops decryption local and daemon-independent. Human-tier requests proceed to the hardware prompt; the physical YubiKey touch is the authorization gesture, and the structured journald request event supplies after-the-fact attribution.
 
 **Tech Stack:** Rust 1.92 / edition 2024, `nix`, `zeroize`, `subtle`, `tracing`, systemd user units, Bun/OpenCode plugin tests, sops dotenv subprocesses.
 
@@ -32,8 +32,7 @@
 | `src/lib.rs` | Shared crate root; exports daemon modules plus reusable `proto` and `client` modules. |
 | `src/proto.rs` | One canonical protocol version and typed request/response headers. |
 | `src/client.rs` | Unix-socket transport, HELLO negotiation, exact framed-byte read, typed error mapping, lazy socket resolution, and TTY/token-path helpers. |
-| `src/bin/secretsd.rs` | Thin daemon executable: hardening, configuration validation, and `run`. |
-| `src/bin/secrets.rs` | Drop-in CLI: direct agent sops path, filename-only human discovery, duplicate detection, broker operations, edit commands, and env injection. |
+| `src/bin/secrets.rs` | Dispatches `serve` to the library daemon entry point and otherwise runs the drop-in CLI: direct agent sops path, filename-only human discovery, duplicate detection, broker operations, edit commands, and env injection. |
 | `src/main.rs` | Delete after Cargo is switched to the two explicit binaries. |
 | `src/requests.rs` | Pending request lifecycle, timeout, denial, and single-flight state for hardware-backed decrypts. |
 | `src/server/dispatch.rs` and `src/server/worker.rs` | Dispatch requests, retain structured request attribution, and start a decrypt without a software announcement gate. |
@@ -55,7 +54,7 @@
 
 **Files:**
 - Modify: `Cargo.toml`, `src/lib.rs`, `src/proto.rs`
-- Create: `src/client.rs`, `src/bin/secretsd.rs`, `src/bin/secrets.rs`, `tests/client.rs`
+- Create: `src/client.rs`, `src/bin/secrets.rs`, `tests/client.rs`
 - Delete: `src/main.rs`
 
 **Interfaces:**
@@ -116,27 +115,28 @@ Expected: FAIL because `secretsd::client` does not exist.
 
 - [ ] **Step 3: Add the exact shared module boundary**
 
-Replace the module list at the top of `src/lib.rs` and add these binary entry points.  Keep all existing daemon exports unchanged.
+Replace the module list at the top of `src/lib.rs`, add `serve_main()` there, and add the `secrets` binary entry point. Keep all existing daemon exports unchanged.
 
 ```rust
 /// Shared Unix-socket protocol client used by the `secrets` CLI.
 pub mod client;
 pub mod proto;
 
-// src/bin/secretsd.rs
-fn main() -> std::process::ExitCode {
-    match secretsd::hardening::apply(secretsd::hardening::MemlockPolicy::Require)
-        .and_then(|()| secretsd::run(secretsd::Config::from_env())) {
-        Ok(()) => std::process::ExitCode::SUCCESS,
-        Err(error) => { tracing::error!(%error, "secretsd stopped"); std::process::ExitCode::FAILURE }
-    }
-}
-
 // src/bin/secrets.rs
 fn main() -> std::process::ExitCode {
-    match secretsd::client::cli::run(std::env::args_os()) {
-        Ok(()) => std::process::ExitCode::SUCCESS,
-        Err(error) => { eprintln!("secrets: {error}"); std::process::ExitCode::FAILURE }
+    let arguments = std::env::args_os().collect::<Vec<_>>();
+    match arguments.get(1).map(OsString::as_os_str) {
+        Some(command) if command == OsStr::new("serve") && arguments.len() == 2 => {
+            secretsd::serve_main()
+        }
+        Some(command) if command == OsStr::new("serve") => {
+            eprintln!("secrets: serve does not accept arguments");
+            std::process::ExitCode::FAILURE
+        }
+        _ => match secretsd::client::cli::run(arguments) {
+            Ok(()) => std::process::ExitCode::SUCCESS,
+            Err(error) => { eprintln!("secrets: {error}"); std::process::ExitCode::FAILURE }
+        },
     }
 }
 ```
@@ -373,7 +373,7 @@ Expected: client transport and pure parser tests pass under both test runners; n
 **Parallel-safe:** Yes — disjoint from client/plugin work; merge before the final test task.
 
 **Files:**
-- Modify: `src/hardening.rs`, `src/bin/secretsd.rs`, `tests/hardening.rs`, `docs/design.md`, `AGENTS.md`
+- Modify: `src/hardening.rs`, `src/lib.rs`, `src/bin/secrets.rs`, `tests/hardening.rs`, `docs/design.md`, `AGENTS.md`
 
 **Interfaces:**
 - Produces `hardening::validate_memlock_limit() -> Result<(), HardeningError>` and `HardeningError::InsufficientMemlock { soft, hard }`.
@@ -386,9 +386,9 @@ Add this to `tests/hardening.rs`; the helper process avoids changing the test ru
 ```rust
 #[test]
 fn low_memlock_limit_exits_with_actionable_diagnostic_instead_of_sigabrt() {
-    let binary = env!("CARGO_BIN_EXE_secretsd");
+    let binary = env!("CARGO_BIN_EXE_secrets");
     let output = Command::new("sh")
-        .args(["-c", "ulimit -l 8; exec \"$1\"", "sh", binary])
+        .args(["-c", "ulimit -l 8; exec \"$1\" serve", "sh", binary])
         .env("SECRETSD_SOCKET", tempfile::tempdir().unwrap().path().join("broker.sock"))
         .output()
         .unwrap();
@@ -556,7 +556,7 @@ Expected: plugin tests retain every existing token lifecycle, reconnect, error m
 - Create: `docs/dotfiles-cutover.md`
 
 **Interfaces:**
-- The packaged service invokes `%h/.local/bin/secretsd` through an absolute
+- The packaged service invokes `%h/.local/bin/secrets serve` through an absolute
   `ExecStart`; deployment-specific configuration belongs in consumer-owned
   `secretsd.service.d/*.conf` drop-ins.
 - The package contains no software announcement or agent-transport configuration; a human-tier request reaches the hardware touch flow on every supported machine.
@@ -575,7 +575,7 @@ After=secretsd.socket
 Type=simple
 # `%h` expands to an absolute path before execution; `Environment=PATH` does
 # not resolve `ExecStart`.
-ExecStart=%h/.local/bin/secretsd
+ExecStart=%h/.local/bin/secrets serve
 Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin
 # A deployment drop-in must replace this empty value with an absolute directory.
 Environment=SECRETSD_HUMAN_DIR=
@@ -630,7 +630,7 @@ Environment=PCSCLITE_CSOCK_NAME=/run/user/1000/pcscd.comm
 
 Then list the required dotfiles-only changes precisely:
 
-1. Pin the released `secretsd` package/version in `mise.toml`, exposing both `~/.local/bin/secretsd` and `~/.local/bin/secrets` plus `~/.local/share/secretsd/opencode/plugins/secretsd.ts`.
+1. Pin the released `secretsd` package/version in `mise.toml`, exposing `~/.local/bin/secrets` plus `~/.local/share/secretsd/opencode/plugins/secretsd.ts`.
 2. Change the OpenCode plugin entry to `file://{env:HOME}/.local/share/secretsd/opencode/plugins/secretsd.ts`.
 3. Delete `shims/secrets` and `shims/tests/test_secrets_shim.py`; delete the moved plugin and `opencode/plugins/secretsd.test.ts`.
 4. Shrink `installers/secretsd.sh` to installing/enabling the two packaged units, creating the drop-in, and importing `PCSCLITE_CSOCK_NAME`; it must not copy a personal command or a dotfiles path into this repository's unit.
@@ -651,7 +651,7 @@ Expected: unit syntax is valid and Rust formatting remains clean; no command dec
 **Parallel-safe:** No — final integration task; execute after Tasks 1–8.
 
 **Files:**
-- Modify: `src/lib.rs`, `src/bin/secretsd.rs`, `.github/workflows/ci.yml`, `docs/design.md`, `AGENTS.md`
+- Modify: `src/lib.rs`, `src/bin/secrets.rs`, `.github/workflows/ci.yml`, `docs/design.md`, `AGENTS.md`
 
 **Interfaces:**
 - `Config::from_env() -> Result<Config, ConfigError>` requires `SECRETSD_HUMAN_DIR` for the daemon; it no longer defaults to `%h/.dotfiles/secrets.human.d`.
@@ -689,7 +689,7 @@ Expected: FAIL because `Config::from_env` supplies the old dotfiles default.
 
 - [ ] **Step 3: Remove the last daemon-specific personal default**
 
-Replace `Config::from_env() -> Self` with `Config::from_env() -> Result<Self, ConfigError>`.  Delete its `HOME` lookup and its `%h/.dotfiles/secrets.human.d` fallback; use only a nonempty `SECRETSD_HUMAN_DIR`, returning `MissingHumanDir` otherwise.  Update `src/bin/secretsd.rs`, all tests, and test harness constructors to propagate this error without `unwrap`/`expect` outside test code.  Keep defaults only for safe daemon behavior (`SECRETSD_SOCKET`, sops command, timeouts) and do not permit a client to select any daemon configuration path.
+Replace `Config::from_env() -> Self` with `Config::from_env() -> Result<Self, ConfigError>`.  Delete its `HOME` lookup and its `%h/.dotfiles/secrets.human.d` fallback; use only a nonempty `SECRETSD_HUMAN_DIR`, returning `MissingHumanDir` otherwise.  Update `serve_main()`, all tests, and test harness constructors to propagate this error without `unwrap`/`expect` outside test code.  Keep defaults only for safe daemon behavior (`SECRETSD_SOCKET`, sops command, timeouts) and do not permit a client to select any daemon configuration path.
 
 Add all project gates to CI in this order: nightly format, clippy with `-D warnings`, nextest, the pure-module Miri filter extended to `client`, `cargo machete`, `cargo deny check all`, and the Bun plugin test.  The CI YAML must invoke `cargo +nightly fmt --all -- --check`, not stable `cargo fmt`.
 
@@ -710,7 +710,7 @@ Expected: every command exits 0; the Rust count is at least 105 tests; plugin te
 
 ## Requirement Coverage Check
 
-- Shared Rust protocol/client and two explicit binaries: Tasks 1–4 and 9.
+- Shared Rust protocol/client and one explicit binary: Tasks 1–4 and 9.
 - Drop-in CLI surface, unattended agent tier, filename-only list, duplicate failure, exact frames, token-file/TTY/lazy socket/error guidance: Tasks 2 and 4.
 - In-repository OpenCode plugin, token contract, Bun CI, installed-path binding: Task 7.
 - Complete announcement-gate removal, direct physical-touch authorization, headless parity, and journald-only attribution: Task 3.

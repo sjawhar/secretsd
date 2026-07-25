@@ -30,6 +30,8 @@ pub enum ErrCode {
     NoScope,
     /// Tokenless request arrived from a tty known to belong to an agent session.
     AgentTty,
+    /// Token was presented by a process outside its session's process tree.
+    ForeignCaller,
     /// Key is not present in the human-tier store.
     NotHumanKey,
     /// A human denied the request.
@@ -54,6 +56,7 @@ impl ErrCode {
             Self::UnknownToken => "UNKNOWN_TOKEN",
             Self::NoScope => "NO_SCOPE",
             Self::AgentTty => "AGENT_TTY",
+            Self::ForeignCaller => "FOREIGN_CALLER",
             Self::NotHumanKey => "NOT_HUMAN_KEY",
             Self::Denied => "DENIED",
             Self::Timeout => "TIMEOUT",
@@ -72,6 +75,7 @@ impl ErrCode {
             "UNKNOWN_TOKEN" => Some(Self::UnknownToken),
             "NO_SCOPE" => Some(Self::NoScope),
             "AGENT_TTY" => Some(Self::AgentTty),
+            "FOREIGN_CALLER" => Some(Self::ForeignCaller),
             "NOT_HUMAN_KEY" => Some(Self::NotHumanKey),
             "DENIED" => Some(Self::Denied),
             "TIMEOUT" => Some(Self::Timeout),

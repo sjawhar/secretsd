@@ -30,7 +30,7 @@ must remain valid after the checkout or extracted release directory is gone.
 ```bash
 tar xzf secretsd-vX.Y.Z-linux-x86_64.tar.gz
 cd secretsd-vX.Y.Z-linux-x86_64
-install -Dm755 secretsd "$HOME/.local/bin/secretsd"
+install -Dm755 bin/secrets "$HOME/.local/bin/secrets"
 install -Dm644 systemd/secretsd.socket "$HOME/.config/systemd/user/secretsd.socket"
 install -Dm644 systemd/secretsd.service "$HOME/.config/systemd/user/secretsd.service"
 systemctl --user daemon-reload

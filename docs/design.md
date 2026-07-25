@@ -71,7 +71,7 @@ agent (OpenCode session)
   ├── MCP tool: secrets_request(KEY)      ── opencode plugin → broker socket
   │     (triggers grant flow; never returns secret values)
   │
-  └── bash: secrets get KEY / secrets KEY -- cmd
+└── bash: secrets get KEY [--value|--no-request] / secrets KEY -- cmd
         │
         ▼
    shims/secrets (bash, unchanged interface)
@@ -89,9 +89,9 @@ agent (OpenCode session)
 
 ### Components
 
-1. **`secretsd`** (new, Rust): holds grants and decrypted human-tier values
-   in memory; runs the approval state machine; performs sops decrypts;
-   logs everything to journald.
+1. **`secrets`** (Rust, single binary): `secrets serve` holds grants and
+   decrypted human-tier values in memory; runs the approval state machine;
+   performs sops decrypts; and logs everything to journald.
    - Deps: std + `nix` (SO_PEERCRED for logging/UID check) + `zeroize`.
      No serde/dotenv crates on the plaintext path.
    - Hardening: `mlockall(MCL_CURRENT|MCL_FUTURE)` (fail closed if it
@@ -130,18 +130,22 @@ agent (OpenCode session)
    - On session delete: notifies the broker → grants revoked,
      values zeroized when the last grant for a key dies. Event-driven; no
      `/proc` sweeps needed for the primary path.
-   - Registers an MCP tool `secrets_request(key)` → returns `granted`,
+   - Registers an MCP tool `secrets_request(key)` (OpenCode presents this to agents as `SecretsRequest`; instruct them by that name) → returns `granted`,
      `denied`, or `unavailable` guidance. Never returns secret values (they
      must not enter the transcript).
 
-3. **`secrets`** (Rust client, shipped with the daemon): preserves the CLI.
-   The human-key set is derived from `secrets.human.d/*.env` filenames: those
-   keys **always** route through the broker — a duplicate of a human key
-   appearing in an agent-tier file is a fail-closed error, never a silent
-   broker bypass. All other keys use local agent-tier sops decryption without
-   contacting the daemon. Human-tier operations connect to the socket, send
-   the session token when present, and block for the touch flow. No
-   client-controlled daemon file-path overrides exist.
+3. **`secrets` client mode** (every invocation other than `secrets serve`):
+   preserves the CLI. The human-key set is derived from
+   `secrets.human.d/*.env` filenames: those keys **always** route through the
+   broker — a duplicate of a human key appearing in an agent-tier file is a
+   fail-closed error, never a silent broker bypass. All other keys use local
+   agent-tier sops decryption without contacting the daemon. Human-tier
+   operations connect to the socket, send the session token when present, and
+   block for the touch flow. No client-controlled daemon file-path overrides
+   exist.
+   `serve` is a reserved first argument, so a key literally named `serve` is not
+   usable in the `secrets KEY -- cmd` shorthand. The match is exact, so
+   conventional SCREAMING_SNAKE names (including `SERVE`) are unaffected.
 
 ### Storage: recipients are the policy
 
@@ -248,7 +252,11 @@ needs, so PIN+touch (`pin-policy` change) becomes possible per-key.
 ## CLI / tool surface
 
 ```
-secrets get KEY / secrets KEY -- cmd    unchanged for all callers
+secrets get KEY                        pre-authorizes: asks the broker for a grant
+                                       (touch if none is live) and prints status only
+secrets get KEY --value                prints the secret; the only form that does
+secrets get KEY --no-request           status without asking, so it never triggers a touch
+secrets KEY -- cmd                     injects into a child environment, never prints
 secrets list                            names only; never decrypts
 secrets grants                          active grants + pending requests
 secrets deny [id]                       reject a pending request
@@ -263,7 +271,7 @@ MCP: secrets_request(key)               grant flow trigger; no values returned
    recovery only, ordered before the default rule) and a
    recipient-verification check (agent key must fail to decrypt any file
    under `secrets.human.d/`). **This precedes any file creation.**
-2. Build + install `secretsd` and the plugin on both machines (installer +
+2. Build + install `secrets` and the plugin on both machines (installer +
    systemd user units; binary fits the `bin/` convention; `cargo-deny` in CI
    posture per mise setup).
 3. One-time ceremony **on the laptop**: split `secrets.human.env` into
@@ -281,9 +289,9 @@ MCP: secrets_request(key)               grant flow trigger; no values returned
 ## Verification
 
 - Agent tier unattended (must not regress):
-  `ssh devbox '~/.dotfiles/shims/secrets get ANTHROPIC_API_KEY | wc -c'` — no
+`ssh devbox '~/.dotfiles/shims/secrets get ANTHROPIC_API_KEY'` — reports status
   interaction, no broker involvement.
-- Grant flow: from an OpenCode session, `secrets get DEEL_API_KEY` → YubiKey
+- Grant flow: from an OpenCode session, `secrets get DEEL_API_KEY --value` → YubiKey
   blink and touch prompt.
 - Cross-session isolation: session B requesting a key granted to session A
   gets its own pending request, never A's value.

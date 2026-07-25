@@ -5,6 +5,11 @@ on:
 
 permissions:
   contents: write
+  # Attestation lets a consumer verify the archive's provenance against GitHub's
+  # trust root before it becomes the secrets broker; a checksum published in the
+  # same release would only catch transport corruption.
+  id-token: write
+  attestations: write
 
 jobs:
   release:
@@ -19,7 +24,6 @@ jobs:
           tag="${GITHUB_REF_NAME}"
           staging="secretsd-${tag}-linux-x86_64"
           mkdir -p "$staging/bin" "$staging/share/secretsd/opencode/plugins" "$staging/systemd"
-          install -m 0755 target/release/secretsd "$staging/bin/secretsd"
           install -m 0755 target/release/secrets "$staging/bin/secrets"
           install -m 0644 opencode/plugins/secretsd.ts "$staging/share/secretsd/opencode/plugins/secretsd.ts"
           install -m 0644 systemd/secretsd.service "$staging/systemd/secretsd.service"
@@ -31,7 +35,6 @@ jobs:
           staging="secretsd-${GITHUB_REF_NAME}-linux-x86_64"
           archive="${staging}.tar.gz"
           for artifact in \
-            "$staging/bin/secretsd" \
             "$staging/bin/secrets" \
             "$staging/share/secretsd/opencode/plugins/secretsd.ts" \
             "$staging/systemd/secretsd.service" \
@@ -41,6 +44,9 @@ jobs:
               exit 1
             fi
           done
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: secretsd-*-linux-x86_64.tar.gz
       - uses: softprops/action-gh-release@v2
         with:
           files: secretsd-*-linux-x86_64.tar.gz

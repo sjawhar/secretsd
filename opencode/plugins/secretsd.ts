@@ -1,5 +1,5 @@
 import { randomBytes } from "crypto";
-import { chmodSync, mkdirSync, rmSync, writeFileSync } from "fs";
+import { chmodSync, mkdirSync, renameSync, rmSync, writeFileSync } from "fs";
 import { tool } from "@opencode-ai/plugin";
 import { join } from "path";
 
@@ -48,7 +48,7 @@ const DAEMON_ERROR_GUIDANCE = {
   UNKNOWN_TOKEN: "error: secretsd lost this session's registration after automatic re-registration; start a new OpenCode session and retry.",
   NO_SCOPE: "error: secretsd cannot attribute this request to a session because no session token or tty was provided; start it from a registered OpenCode session.",
   AGENT_TTY: "error: secretsd rejected a tokenless request from a tty already assigned to an agent session; use the registered session token.",
-  NOT_HUMAN_KEY: "not human-tier: this key does not require approval; read it normally with the secrets CLI, or check the key name for a typo.",
+  NOT_HUMAN_KEY: "not human-tier: no approval is needed for this key; read it directly with `secrets get <KEY>`. If that read fails, the key is not configured.",
   DENIED: "denied: human approval was refused; do not retry unless the human asks you to.",
   TIMEOUT: "timed out: no one approved the request in time; make a new request only if approval is still needed.",
   YUBIKEY_UNREACHABLE: "error: the YubiKey or its tunnel is unreachable; restore the hardware or tunnel connection and retry.",
@@ -132,8 +132,13 @@ export function issueTokenFile(runtimeDir: string, sessionID: string): SessionSt
 
   const tokenPath = tokenFile(runtimeDir, sessionID);
   const token = randomBytes(32).toString("hex");
-  writeFileSync(tokenPath, token, { encoding: "utf8", mode: 0o600 });
-  chmodSync(tokenPath, 0o600);
+  // Stage then rename: a concurrent reader sees either no file or the whole
+  // token, never a truncated one. `wx` refuses to write through a pre-planted
+  // path, and the mode is fixed before the token is reachable at its real name.
+  const stagingPath = `${tokenPath}.${randomBytes(6).toString("hex")}.tmp`;
+  writeFileSync(stagingPath, token, { encoding: "utf8", mode: 0o600, flag: "wx" });
+  chmodSync(stagingPath, 0o600);
+  renameSync(stagingPath, tokenPath);
   return { token, tokenFile: tokenPath };
 }
 
@@ -254,7 +259,7 @@ function guidance(outcome: RequestOutcome): string {
     case "daemon-error":
       return DAEMON_ERROR_GUIDANCE[outcome.code];
     case "granted":
-      return "granted: use the secrets shim for the requested key.";
+      return "granted: read the value with `secrets get <KEY>`.";
     case "request-cancelled":
       return "error: the secretsd request was cancelled because the OpenCode session ended.";
     case "runtime-unavailable":
@@ -349,6 +354,19 @@ async function requestSecret(broker: BrokerClient, request: SecretRequest): Prom
   }
 }
 
+/// The SDK declares session.deleted with `properties.info` and, in its envelope
+/// form, `properties.sessionID`. Accept either so revocation is not silently
+/// skipped by whichever shape the runtime delivers.
+type SessionEventInput = {
+  readonly event: {
+    readonly type: string;
+    readonly properties?: {
+      readonly sessionID?: string;
+      readonly info?: { readonly id?: string };
+    };
+  };
+};
+
 export function createSecretsdPlugin(options: PluginOptions = {}) {
   const runtimeDir = options.runtimeDir ?? process.env.XDG_RUNTIME_DIR;
   const broker = new BrokerClient(options.socketPath ?? (runtimeDir ? join(runtimeDir, "secretsd.sock") : ""));
@@ -418,6 +436,28 @@ export function createSecretsdPlugin(options: PluginOptions = {}) {
         }
       } catch {
         return;
+      }
+    },
+    event: async ({ event }: SessionEventInput): Promise<void> => {
+      // Revoke at session end. `dispose` only runs when the whole serve process
+      // exits, and the daemon's backstop is hours out, so without this a finished
+      // session's token file and grant stay usable by any same-uid process.
+      if (event.type !== "session.deleted") {
+        return;
+      }
+      const sessionID = event.properties?.sessionID ?? event.properties?.info?.id;
+      if (!sessionID) {
+        return;
+      }
+      const state = states.get(sessionID);
+      if (!state) {
+        return;
+      }
+      // no-excuse-ok: catch — an unreachable broker must not strand the token file.
+      try {
+        await broker.unregister(sessionID);
+      } finally {
+        removeState(sessionID, state);
       }
     },
     tool: {

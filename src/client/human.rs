@@ -54,9 +54,24 @@ impl HumanClient {
         ))
     }
 
-    /// Request a human-tier value, blocking until the broker reaches its terminal response.
-    pub fn get(&self, key: &SecretName) -> Result<SecretBytes, ClientError> {
-        let mut request = Zeroizing::new(format!("GET\tkey={}", key.as_str()));
+    /// Ask the broker to grant this key without receiving its value.
+    ///
+    /// This is the same operation the `OpenCode` plugin sends: it blocks for the
+    /// human's approval, so it triggers the hardware touch when no grant is
+    /// live, and returns once the scope holds a grant. Nothing about the value
+    /// crosses the socket.
+    pub fn request_grant(&self, key: &SecretName) -> Result<(), ClientError> {
+        let request = self.scoped_frame("REQUEST", key);
+        match self.broker.call(&request) {
+            Ok(BrokerResponse::Ok | BrokerResponse::Fields(_)) => Ok(()),
+            Ok(BrokerResponse::Bytes(_)) => Err(ClientError::InvalidResponse),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Build an operation frame carrying whichever scope this caller has.
+    fn scoped_frame(&self, operation: &str, key: &SecretName) -> Zeroizing<String> {
+        let mut request = Zeroizing::new(format!("{operation}\tkey={}", key.as_str()));
         if let Some(token) = &self.token {
             request.push_str("\ttoken=");
             request.push_str(token);
@@ -65,6 +80,12 @@ impl HumanClient {
             request.push_str("\ttty=");
             request.push_str(tty);
         }
+        request
+    }
+
+    /// Request a human-tier value, blocking until the broker reaches its terminal response.
+    pub fn get(&self, key: &SecretName) -> Result<SecretBytes, ClientError> {
+        let request = self.scoped_frame("GET", key);
         match self.broker.call(&request) {
             Ok(BrokerResponse::Bytes(bytes)) => Ok(SecretBytes::from_vec(bytes)),
             Ok(BrokerResponse::Ok | BrokerResponse::Fields(_)) => Err(ClientError::InvalidResponse),

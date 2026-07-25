@@ -23,6 +23,17 @@ pub(super) enum Outcome {
 }
 
 impl Outcome {
+    /// How many secret bytes were handed to the client, if any.
+    ///
+    /// A release served from a live grant asks nothing of the human and produces
+    /// no hardware prompt, so this is the only record that the value moved.
+    pub(super) fn released_bytes(&self) -> Option<usize> {
+        match self {
+            Self::Bytes(value) => Some(value.as_slice().len()),
+            Self::Ok | Self::Fields(_) | Self::Payload(_) | Self::Failed(..) => None,
+        }
+    }
+
     pub(super) const fn decision(&self) -> &'static str {
         match self {
             Self::Ok | Self::Fields(_) | Self::Payload(_) | Self::Bytes(_) => "ok",
@@ -37,7 +48,11 @@ pub(super) struct Decision {
     pub(super) scope_kind: Option<ScopeKind>,
 }
 
-fn resolve_access(shared: &Shared, access: &Access) -> Result<(Scope, SecretName), ErrCode> {
+fn resolve_access(
+    shared: &Shared,
+    access: &Access,
+    caller: &crate::peer::PeerIdentity,
+) -> Result<(Scope, SecretName), ErrCode> {
     let key = SecretName::parse(&access.key)?;
     let token = access
         .token_hex
@@ -48,7 +63,7 @@ fn resolve_access(shared: &Shared, access: &Access) -> Result<(Scope, SecretName
     let mut state = lock_state(mutex);
     let scope = state
         .registry
-        .resolve(token.as_ref(), access.tty.as_deref())?;
+        .resolve(token.as_ref(), access.tty.as_deref(), Some(caller))?;
     drop(state);
     Ok((scope, key))
 }
@@ -94,8 +109,13 @@ fn await_approval(shared: &Shared, scope: &Scope, key: &SecretName) -> Result<()
     }
 }
 
-fn dispatch_access(shared: &Shared, access: &Access, return_value: bool) -> Decision {
-    let (scope, key) = match resolve_access(shared, access) {
+fn dispatch_access(
+    shared: &Shared,
+    access: &Access,
+    return_value: bool,
+    caller: &crate::peer::PeerIdentity,
+) -> Decision {
+    let (scope, key) = match resolve_access(shared, access, caller) {
         Ok(resolved) => resolved,
         Err(error) => {
             return Decision {
@@ -123,7 +143,12 @@ fn dispatch_access(shared: &Shared, access: &Access, return_value: bool) -> Deci
     }
 }
 
-fn register(shared: &Shared, token_hex: &str, session: &str, pid: i32) -> Decision {
+fn register(
+    shared: &Shared,
+    token_hex: &str,
+    session: &str,
+    root: crate::peer::PeerIdentity,
+) -> Decision {
     match SessionToken::parse_hex(token_hex) {
         Ok(token) => {
             let (mutex, condvar) = &**shared;
@@ -131,7 +156,7 @@ fn register(shared: &Shared, token_hex: &str, session: &str, pid: i32) -> Decisi
             let displaced = state.registry.register(crate::grants::Registration {
                 token,
                 session: session.to_owned(),
-                pid,
+                root,
             });
             state.grants.revoke_tokens(&displaced);
             drop(state);
@@ -207,7 +232,11 @@ fn lock(shared: &Shared) -> Decision {
     }
 }
 
-pub(super) fn dispatch(request: Request, shared: &Shared) -> Decision {
+pub(super) fn dispatch(
+    request: Request,
+    shared: &Shared,
+    caller: &crate::peer::PeerIdentity,
+) -> Decision {
     match request {
         Request::Hello { version } => Decision {
             outcome: if version == PROTOCOL_VERSION {
@@ -220,8 +249,8 @@ pub(super) fn dispatch(request: Request, shared: &Shared) -> Decision {
         Request::Register {
             token_hex,
             session,
-            pid,
-        } => register(shared, &token_hex, &session, pid),
+            pid: _wire_pid,
+        } => register(shared, &token_hex, &session, caller.clone()),
         Request::Unregister { session } => unregister(shared, &session),
         Request::Get {
             key,
@@ -233,7 +262,7 @@ pub(super) fn dispatch(request: Request, shared: &Shared) -> Decision {
                 token_hex,
                 tty,
             };
-            dispatch_access(shared, &access, true)
+            dispatch_access(shared, &access, true, caller)
         }
         Request::RequestGrant {
             key,
@@ -245,7 +274,7 @@ pub(super) fn dispatch(request: Request, shared: &Shared) -> Decision {
                 token_hex,
                 tty,
             };
-            dispatch_access(shared, &access, false)
+            dispatch_access(shared, &access, false, caller)
         }
         Request::Grants => grants(shared),
         Request::Deny { id } => deny(shared, id),

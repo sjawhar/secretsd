@@ -91,7 +91,13 @@ pub(super) fn worker(shared: &Shared) {
         match decrypted {
             Ok(value) => {
                 let session_is_active = match &job.scope {
-                    Scope::Session(token) => state.registry.resolve(Some(token), None).is_ok(),
+                    Scope::Session(token) => state
+                        .registry
+                        .registration(token)
+                        // A session whose root process is gone cannot receive
+                        // the value, so the approval is dropped rather than
+                        // waiting for the backstop to expire it.
+                        .is_some_and(|registration| registration.root.is_alive()),
                     Scope::Tty { tty, .. } => std::path::Path::new(tty).exists(),
                 };
                 if state.lock_epoch != job.lock_epoch || !session_is_active {

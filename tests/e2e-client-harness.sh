@@ -24,13 +24,24 @@ skip() {
   exit "$skip_status"
 }
 
-if (($# != 2)); then
-  printf 'usage: %s PATH/TO/secretsd PATH/TO/secrets\n' "$0" >&2
+after_register=false
+if [[ "${1:-}" == --after-register ]]; then
+  after_register=true
+  shift
+fi
+
+if (($# != 3)); then
+  printf 'usage: %s PATH/TO/secrets serve PATH/TO/secrets\n' "$0" >&2
   exit 64
 fi
 
 readonly daemon="$1"
-readonly client="$2"
+readonly daemon_subcommand="$2"
+readonly client="$3"
+
+if [[ "$daemon_subcommand" != serve ]]; then
+  fail 'the daemon subcommand must be serve'
+fi
 
 if ! command -v sops >/dev/null; then
   skip 'sops is unavailable'
@@ -42,7 +53,7 @@ if ! command -v python3 >/dev/null; then
   skip 'python3 is unavailable for the REGISTER protocol frame'
 fi
 if [[ ! -x "$daemon" || ! -x "$client" ]]; then
-  fail 'the built daemon and client binaries must be executable'
+  fail 'the built secrets binary must be executable'
 fi
 
 readonly real_sops="$(command -v sops)"
@@ -60,7 +71,13 @@ if [[ ! "$agent_recipient" =~ ^age1 ]]; then
 fi
 
 mkdir -p /tmp/opencode
-readonly scratch="$(mktemp -d /tmp/opencode/secretsd-e2e-client.XXXXXX)"
+if [[ "$after_register" == true ]]; then
+  readonly scratch="${E2E_CLIENT_HARNESS_SCRATCH:?post-registration scratch path is required}"
+  daemon_pid="${E2E_CLIENT_HARNESS_DAEMON_PID:?post-registration daemon pid is required}"
+else
+  readonly scratch="$(mktemp -d /tmp/opencode/secretsd-e2e-client.XXXXXX)"
+  daemon_pid=''
+fi
 readonly dotfiles_dir="$scratch/dotfiles"
 readonly human_dir="$dotfiles_dir/secrets.human.d"
 readonly socket="$scratch/secretsd.sock"
@@ -68,7 +85,6 @@ readonly token_file="$scratch/session.token"
 readonly harness_bin="$scratch/bin"
 readonly sops_log="$scratch/real-sops-invocations.log"
 readonly daemon_log="$scratch/daemon.log"
-daemon_pid=''
 
 cleanup() {
   local status=$?
@@ -115,75 +131,80 @@ run_client() {
     "$client" "$@"
 }
 
-report '1/10 preparing scratch files and real-sops wrapper'
-umask 077
-mkdir -p "$human_dir" "$harness_bin"
+if [[ "$after_register" == false ]]; then
+  report '1/10 preparing scratch files and real-sops wrapper'
+  umask 077
+  mkdir -p "$human_dir" "$harness_bin"
 
-# The wrapper only records argv and execs the real sops binary; fake-sops remains
-# reserved for unit fixtures that need deterministic fake plaintext.
-cat > "$harness_bin/sops" <<'EOF'
+  # The wrapper only records argv and execs the real sops binary; fake-sops remains
+  # reserved for unit fixtures that need deterministic fake plaintext.
+  cat > "$harness_bin/sops" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 printf '%s\0' "$@" >> "$REAL_SOPS_LOG"
 printf '\n' >> "$REAL_SOPS_LOG"
 exec "$REAL_SOPS_BIN" "$@"
 EOF
-chmod 700 "$harness_bin/sops"
+  chmod 700 "$harness_bin/sops"
 
-# This disposable recipient stands in for the unavailable hardware recipient.
-# If filename override ever selects this human rule, the daemon cannot decrypt.
-age-keygen -o "$scratch/unavailable-human.age" >/dev/null 2>&1
-readonly unavailable_human_recipient="$(age-keygen -y "$scratch/unavailable-human.age")"
-cat > "$scratch/.sops.yaml" <<EOF
+  # This disposable recipient stands in for the unavailable hardware recipient.
+  # If filename override ever selects this human rule, the daemon cannot decrypt.
+  age-keygen -o "$scratch/unavailable-human.age" >/dev/null 2>&1
+  readonly unavailable_human_recipient="$(age-keygen -y "$scratch/unavailable-human.age")"
+  cat > "$scratch/.sops.yaml" <<EOF
 creation_rules:
   - path_regex: secrets\\.human\\.d/[^/]+\\.env$
     age: $unavailable_human_recipient
   - path_regex: .*
     age: $agent_recipient
 EOF
-printf '%s=%s\n' "$human_key" "$human_value" > "$scratch/p.env"
-printf '%s=%s\n' "$agent_key" "$agent_value" > "$scratch/agent.env"
+  printf '%s=%s\n' "$human_key" "$human_value" > "$scratch/p.env"
+  printf '%s=%s\n' "$agent_key" "$agent_value" > "$scratch/agent.env"
 
-report '2/10 encrypting the human and agent fixtures with real sops'
-(
-  cd "$scratch"
-  "$real_sops" --filename-override "$scratch/plain.env" --input-type dotenv --output-type dotenv -e "$scratch/p.env" > "$human_dir/$human_key.env"
-  "$real_sops" --filename-override "$scratch/secrets.env" --input-type dotenv --output-type dotenv -e "$scratch/agent.env" > "$dotfiles_dir/secrets.env"
-)
+  report '2/10 encrypting the human and agent fixtures with real sops'
+  (
+    cd "$scratch"
+    "$real_sops" --filename-override "$scratch/plain.env" --input-type dotenv --output-type dotenv -e "$scratch/p.env" > "$human_dir/$human_key.env"
+    "$real_sops" --filename-override "$scratch/secrets.env" --input-type dotenv --output-type dotenv -e "$scratch/agent.env" > "$dotfiles_dir/secrets.env"
+  )
 
-report '3/10 confirming filename override chose the disk-age recipient'
-grep -F --quiet "$agent_recipient" "$human_dir/$human_key.env" || fail 'human fixture lacks the disk-age recipient'
-if grep -F --quiet "$unavailable_human_recipient" "$human_dir/$human_key.env"; then
-  fail 'human fixture matched the unavailable human-recipient creation rule'
-fi
-
-report '4/10 starting the built daemon on the scratch socket'
-# The daemon consumes SECRETSD_HUMAN_DIR directly, while the client derives
-# DOTFILES_DIR/secrets.human.d; both must name this same scratch directory.
-# Optional memlock is local-harness-only; production keeps the strict default.
-env -i \
-  PATH="$harness_bin:$PATH" \
-  HOME="$HOME" \
-  SECRETSD_MEMLOCK=optional \
-  SECRETSD_SOCKET="$socket" \
-  SECRETSD_HUMAN_DIR="$human_dir" \
-  SECRETSD_SOPS_BIN="$harness_bin/sops" \
-  SOPS_AGE_KEY_FILE="$age_key_file" \
-  REAL_SOPS_BIN="$real_sops" \
-  REAL_SOPS_LOG="$sops_log" \
-  "$daemon" > "$daemon_log" 2>&1 &
-daemon_pid=$!
-for _ in {1..100}; do
-  [[ -S "$socket" ]] && break
-  if ! kill -0 "$daemon_pid" 2>/dev/null; then
-    fail 'daemon exited before creating its scratch socket'
+  report '3/10 confirming filename override chose the disk-age recipient'
+  grep -F --quiet "$agent_recipient" "$human_dir/$human_key.env" || fail 'human fixture lacks the disk-age recipient'
+  if grep -F --quiet "$unavailable_human_recipient" "$human_dir/$human_key.env"; then
+    fail 'human fixture matched the unavailable human-recipient creation rule'
   fi
-  sleep 0.05
-done
-[[ -S "$socket" ]] || fail 'daemon did not create its scratch socket'
 
-report '5/10 registering the session token over the real daemon protocol'
-python3 - "$socket" "$token" "$session" "$$" <<'PY'
+  report '4/10 starting the built daemon on the scratch socket'
+  # The daemon consumes SECRETSD_HUMAN_DIR directly, while the client derives
+  # DOTFILES_DIR/secrets.human.d; both must name this same scratch directory.
+  # Optional memlock is local-harness-only; production keeps the strict default.
+  env -i \
+    PATH="$harness_bin:$PATH" \
+    HOME="$HOME" \
+    SECRETSD_MEMLOCK=optional \
+    SECRETSD_SOCKET="$socket" \
+    SECRETSD_HUMAN_DIR="$human_dir" \
+    SECRETSD_SOPS_BIN="$harness_bin/sops" \
+    SOPS_AGE_KEY_FILE="$age_key_file" \
+    REAL_SOPS_BIN="$real_sops" \
+    REAL_SOPS_LOG="$sops_log" \
+    "$daemon" "$daemon_subcommand" > "$daemon_log" 2>&1 &
+  daemon_pid=$!
+  for _ in {1..100}; do
+    [[ -S "$socket" ]] && break
+    if ! kill -0 "$daemon_pid" 2>/dev/null; then
+      fail 'daemon exited before creating its scratch socket'
+    fi
+    sleep 0.05
+  done
+  [[ -S "$socket" ]] || fail 'daemon did not create its scratch socket'
+
+  report '5/10 registering the session token over the real daemon protocol'
+  # Replacing this shell preserves the registered pid for the client descendants.
+  export E2E_CLIENT_HARNESS_SCRATCH="$scratch"
+  export E2E_CLIENT_HARNESS_DAEMON_PID="$daemon_pid"
+  exec python3 - "$socket" "$token" "$session" "$$" "$0" "$daemon" "$daemon_subcommand" "$client" <<'PY'
+import os
 import socket
 import sys
 
@@ -193,18 +214,20 @@ sock.sendall(f"REGISTER\ttoken={sys.argv[2]}\tsession={sys.argv[3]}\tpid={sys.ar
 response = sock.makefile("rb").readline()
 if response != b"OK\n":
     raise SystemExit(f"REGISTER failed with {response!r}")
+os.execvp("bash", ["bash", sys.argv[5], "--after-register", *sys.argv[6:]])
 PY
+fi
 printf '%s' "$token" > "$token_file"
 chmod 600 "$token_file"
 
 report '6/10 fetching the human value through the real client'
-first_get="$(run_client get "$human_key")"
+first_get="$(run_client get "$human_key" --value)"
 [[ "$first_get" == "$human_value" ]] || fail 'first get returned an unexpected value'
 assert_sops_counts 2 1 'first get'
 report '6/10 get returned the expected value [redacted]; real-sops total=2 daemon=1'
 
 report '7/10 fetching the cached human value through the real client'
-second_get="$(run_client get "$human_key")"
+second_get="$(run_client get "$human_key" --value)"
 [[ "$second_get" == "$human_value" ]] || fail 'cached get returned an unexpected value'
 assert_sops_counts 3 1 'cached get'
 report '7/10 cached get returned the expected value [redacted]; real-sops total=3 daemon=1'

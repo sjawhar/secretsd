@@ -1,0 +1,21 @@
+{
+  "name": "secretsd",
+  "version": "0.1.0",
+  "description": "OpenCode plugin for the secretsd session secrets broker.",
+  "type": "module",
+  "main": "opencode/plugins/secretsd.ts",
+  "types": "opencode/plugins/secretsd.ts",
+  "exports": {
+    ".": "./opencode/plugins/secretsd.ts",
+    "./server": "./opencode/plugins/secretsd.ts"
+  },
+  "files": [
+    "opencode/plugins/secretsd.ts"
+  ],
+  "dependencies": {
+    "@opencode-ai/plugin": "^1.3.0"
+  },
+  "scripts": {
+    "test:secretsd-plugin": "bun test opencode/plugins/secretsd.test.ts"
+  }
+}

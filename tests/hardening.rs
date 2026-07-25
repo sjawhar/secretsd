@@ -11,15 +11,16 @@ fn start_daemon_with_memlock_limit(
     policy: Option<&str>,
 ) -> std::io::Result<(tempfile::TempDir, Child)> {
     let directory = tempfile::tempdir()?;
-    let binary = env!("CARGO_BIN_EXE_secretsd");
+    let binary = env!("CARGO_BIN_EXE_secrets");
     let mut command = Command::new("bash");
     command
         .args([
             "-c",
-            "ulimit -l \"$1\" && exec \"$2\"",
+            "ulimit -l \"$1\" && exec \"$2\" \"$3\"",
             "bash",
             limit,
             binary,
+            "serve",
         ])
         .env("SECRETSD_SOCKET", directory.path().join("broker.sock"))
         .env("SECRETSD_HUMAN_DIR", directory.path().join("human"))
@@ -102,11 +103,17 @@ fn required_memlock_fails_closed_when_locking_is_unavailable() {
 fn low_memlock_limit_exits_with_actionable_diagnostic_instead_of_sigabrt() {
     // Given a daemon process restricted to an 8 KiB memlock limit.
     let directory = tempfile::tempdir().expect("create temporary directory");
-    let binary = env!("CARGO_BIN_EXE_secretsd");
+    let binary = env!("CARGO_BIN_EXE_secrets");
 
     // When it starts before any threads are created.
     let output = Command::new("sh")
-        .args(["-c", "ulimit -l 8; exec timeout 5s \"$1\"", "sh", binary])
+        .args([
+            "-c",
+            "ulimit -l 8; exec timeout 5s \"$1\" \"$2\"",
+            "sh",
+            binary,
+            "serve",
+        ])
         .env("SECRETSD_SOCKET", directory.path().join("broker.sock"))
         .env("SECRETSD_HUMAN_DIR", directory.path().join("human"))
         .output()

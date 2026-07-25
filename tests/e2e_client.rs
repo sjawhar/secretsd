@@ -10,8 +10,8 @@ use std::path::Path;
 use std::process::Command;
 
 #[test]
-fn real_sops_harness_exercises_the_built_daemon_and_client_when_prerequisites_exist() {
-    // Given the built daemon and client binaries plus the permanent standalone harness.
+fn real_sops_harness_exercises_the_built_dual_mode_binary_when_prerequisites_exist() {
+    // Given the built dual-mode binary plus the permanent standalone harness.
     let script = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/e2e-client-harness.sh");
     assert!(
         Path::new(script).is_file(),
@@ -21,7 +21,8 @@ fn real_sops_harness_exercises_the_built_daemon_and_client_when_prerequisites_ex
     // When the harness creates its scratch deployment and drives the human-tier flow.
     let output = Command::new(script)
         .args([
-            env!("CARGO_BIN_EXE_secretsd"),
+            env!("CARGO_BIN_EXE_secrets"),
+            "serve",
             env!("CARGO_BIN_EXE_secrets"),
         ])
         .output()

@@ -89,6 +89,9 @@ impl fmt::Display for ClientError {
             Self::Broker(ErrCode::AgentTty) => {
                 formatter.write_str("tokenless access from an agent terminal is not permitted")
             }
+            Self::Broker(ErrCode::ForeignCaller) => formatter.write_str(
+                "the session token was presented from outside that session's process tree",
+            ),
             Self::Broker(ErrCode::NotHumanKey) => {
                 formatter.write_str("the requested key is not managed by secretsd")
             }

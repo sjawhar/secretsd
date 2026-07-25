@@ -21,6 +21,42 @@ const POLL_INTERVAL: Duration = Duration::from_millis(50);
 const MAX_SOPS_STDERR_BYTES: u64 = 300;
 const YUBIKEY_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// Known sops/age failure signatures, matched against lowercased stderr.
+///
+/// Ordered most specific first; the last entry is a generic wrapper sops emits
+/// around any key failure, so it only matches once the others have missed.
+const SOPS_STDERR_SIGNATURES: &[(&str, &str)] = &[
+    (
+        "failed to decrypt yubikey stanza",
+        "yubikey-stanza-undecryptable",
+    ),
+    ("yubikey plugin", "yubikey-plugin-error"),
+    ("no identity matched", "no-matching-identity"),
+    ("sops metadata not found", "missing-sops-metadata"),
+    ("no such file or directory", "input-unreadable"),
+    ("permission denied", "input-permission-denied"),
+    ("failed to get the data key", "data-key-unavailable"),
+];
+
+fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack.len() >= needle.len() && haystack.windows(needle.len()).any(|w| w == needle)
+}
+
+/// Reduce a sops stderr buffer to a stable label.
+///
+/// The child's bytes never reach a log. A decrypt failure can quote the material
+/// it just decrypted, so logging that output would put plaintext in the journal;
+/// only this label and a byte count are recorded.
+fn classify_sops_stderr(stderr: &[u8]) -> &'static str {
+    let mut lowered = stderr.to_ascii_lowercase();
+    let label = SOPS_STDERR_SIGNATURES
+        .iter()
+        .find(|(needle, _)| contains_subslice(&lowered, needle.as_bytes()))
+        .map_or("unclassified", |(_, label)| *label);
+    lowered.zeroize();
+    label
+}
+
 fn duplicate_ciphertext_fd(validated_raw_fd: RawFd) -> Result<std::fs::File, ErrCode> {
     let inherited_raw_fd =
         fcntl(validated_raw_fd, FcntlArg::F_DUPFD(3)).map_err(|_| ErrCode::Internal)?;
@@ -186,23 +222,26 @@ impl Decryptor {
             match child.try_wait() {
                 Ok(Some(status)) => {
                     let mut stderr = Vec::new();
-                    let stderr_summary = match child
+                    let read_result = child
                         .stderr
                         .take()
                         .ok_or(ErrCode::Internal)?
                         .by_ref()
                         .take(MAX_SOPS_STDERR_BYTES)
-                        .read_to_end(&mut stderr)
-                    {
-                        Ok(_) => stderr
-                            .into_iter()
-                            .filter(|byte| byte.is_ascii_graphic() || *byte == b' ')
-                            .map(char::from)
-                            .collect::<String>(),
-                        Err(_) => "stderr unavailable".to_owned(),
+                        .read_to_end(&mut stderr);
+                    let stderr_bytes = stderr.len();
+                    let failure = match read_result {
+                        Ok(_) => classify_sops_stderr(&stderr),
+                        Err(_) => "stderr-unreadable",
                     };
+                    stderr.zeroize();
                     if !status.success() {
-                        tracing::warn!(%status, sops_stderr = %stderr_summary, "sops decrypt failed");
+                        tracing::warn!(
+                            %status,
+                            sops_failure = failure,
+                            sops_stderr_bytes = stderr_bytes,
+                            "sops decrypt failed"
+                        );
                         return Err(ErrCode::Internal);
                     }
                     let mut stdout = Vec::new();
