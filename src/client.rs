@@ -6,8 +6,14 @@ use std::path::{Path, PathBuf};
 
 use crate::proto::{MAX_FRAME_BYTES, PROTOCOL_VERSION};
 
+mod agent;
+pub mod cli;
+mod human;
 mod response;
 
+pub use agent::AgentStore;
+pub use cli::CliError;
+pub use human::HumanNames;
 pub use response::{BrokerResponse, ClientError, parse_response};
 
 /// A lazily resolved path to the broker's Unix socket.
@@ -104,16 +110,4 @@ pub fn caller_tty() -> Option<String> {
     let path = std::fs::read_link("/proc/self/fd/0").ok()?;
     let text = path.into_os_string().into_string().ok()?;
     text.starts_with("/dev/").then_some(text)
-}
-
-/// Deferred command-line interface surface for the `secrets` binary.
-pub mod cli {
-    use std::ffi::OsString;
-
-    use super::ClientError;
-
-    /// Report that command implementations are intentionally deferred to the next task.
-    pub fn run(_arguments: impl IntoIterator<Item = OsString>) -> Result<(), ClientError> {
-        Err(ClientError::CliUnavailable)
-    }
 }

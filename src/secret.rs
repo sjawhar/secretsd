@@ -10,7 +10,7 @@ use crate::proto::ErrCode;
 /// Longest accepted key name.
 const MAX_NAME_LEN: usize = 128;
 
-/// A validated secret key name: `[A-Z][A-Z0-9_]*`.
+/// A validated secret key name: `[A-Za-z_][A-Za-z0-9_]*`.
 ///
 /// Validation makes it safe to build a file name from client input.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -25,12 +25,10 @@ impl SecretName {
 
         let mut characters = raw.chars();
         let first = characters.next().ok_or(ErrCode::BadRequest)?;
-        if !first.is_ascii_uppercase() {
+        if !first.is_ascii_alphabetic() && first != '_' {
             return Err(ErrCode::BadRequest);
         }
-        if !characters.all(|character| {
-            character.is_ascii_uppercase() || character.is_ascii_digit() || character == '_'
-        }) {
+        if !characters.all(|character| character.is_ascii_alphanumeric() || character == '_') {
             return Err(ErrCode::BadRequest);
         }
 
@@ -126,21 +124,13 @@ mod tests {
         assert_eq!(name("DEEL_API_KEY").as_str(), "DEEL_API_KEY");
         assert_eq!(name("A").as_str(), "A");
         assert_eq!(name("K9_X").as_str(), "K9_X");
+        assert_eq!(name("_A").as_str(), "_A");
+        assert_eq!(name("lowercase").as_str(), "lowercase");
     }
 
     #[test]
-    fn rejects_path_traversal_and_lowercase_and_empty() {
-        for raw in [
-            "",
-            "../etc/passwd",
-            "a",
-            "A-B",
-            "A.B",
-            "A/B",
-            "9A",
-            "_A",
-            "A B",
-        ] {
+    fn rejects_path_traversal_and_invalid_characters_and_empty() {
+        for raw in ["", "../etc/passwd", "A-B", "A.B", "A/B", "9A", "A B"] {
             assert_eq!(
                 SecretName::parse(raw),
                 Err(ErrCode::BadRequest),

@@ -10,6 +10,8 @@ use std::thread;
 
 use secretsd::client::{BrokerClient, BrokerResponse, ClientError, SocketPath, parse_response};
 
+include!("client/fixture.rs");
+
 #[test]
 fn exact_payload_accepts_declared_non_nul_bytes() {
     assert_eq!(
@@ -95,4 +97,94 @@ fn client_handshakes_before_sending_a_request() {
     worker.join().unwrap();
 
     assert_eq!(result, Ok(BrokerResponse::Bytes(b"abc".to_vec())));
+}
+
+#[test]
+fn agent_get_works_with_a_minimal_noninteractive_environment() {
+    let fixture = Fixture::agent("AGENT_ONLY=agent-value\n");
+
+    let output = fixture.run_minimal(["get", "AGENT_ONLY"]);
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(output.stdout, b"agent-value\n");
+    assert!(
+        fixture
+            .sops_arguments()
+            .windows(b"--input-type\0dotenv\0--output-type\0dotenv\0".len())
+            .any(|window| window == b"--input-type\0dotenv\0--output-type\0dotenv\0")
+    );
+    assert!(!fixture.sops_log().contains("secretsd.sock"));
+}
+
+#[test]
+fn agent_get_uses_the_optional_local_overlay_before_the_shared_file() {
+    let fixture = Fixture::agent("KEY=shared-value\n");
+    fixture.write_local("KEY=local-value\n");
+
+    let output = fixture.run_minimal(["get", "KEY"]);
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(output.stdout, b"local-value\n");
+}
+
+#[test]
+fn agent_get_succeeds_when_the_optional_local_overlay_is_missing() {
+    let fixture = Fixture::agent("AGENT_ONLY=agent-value\n");
+
+    let output = fixture.run_minimal(["get", "AGENT_ONLY"]);
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(output.stdout, b"agent-value\n");
+}
+
+#[test]
+fn list_uses_human_filenames_without_decrypting_human_files() {
+    let fixture = Fixture::agent("AGENT_ONLY=agent-value\n");
+    fixture.write_human_name("HUMAN");
+
+    let output = fixture.run_minimal(["list"]);
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(output.stdout, b"AGENT_ONLY\nHUMAN  (human tier)\n");
+    assert_eq!(fixture.sops_calls(), 1);
+    assert!(fixture.sops_log().contains("secrets.env"));
+    assert!(!fixture.sops_log().contains("HUMAN.env"));
+}
+
+#[test]
+fn duplicate_agent_and_human_name_fails_closed_before_output() {
+    let fixture = Fixture::agent("DUP=agent-value\n");
+    fixture.write_human_name("DUP");
+
+    for arguments in [["get", "DUP"].as_slice(), ["list"].as_slice()] {
+        let output = fixture.run_minimal(arguments);
+
+        assert_ne!(output.status.code(), Some(0));
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("exists in both agent and human tiers")
+        );
+    }
+}
+
+#[test]
+fn get_rejects_path_traversal_before_constructing_a_path() {
+    let fixture = Fixture::agent("AGENT_ONLY=agent-value\n");
+
+    let output = fixture.run_minimal(["get", "../AGENT_ONLY"]);
+
+    assert_ne!(output.status.code(), Some(0));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("invalid secret key"));
+    assert_eq!(fixture.sops_calls(), 0);
+    assert!(!fixture.dotfiles_dir().join("AGENT_ONLY.env").exists());
+}
+
+#[test]
+fn inject_form_sets_values_only_in_the_child_environment() {
+    let fixture = Fixture::agent("A=one\nB=two\n");
+
+    let output = fixture.run_minimal(["A", "B", "--", "sh", "-c", "printf '%s:%s' \"$A\" \"$B\""]);
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(output.stdout, b"one:two");
 }

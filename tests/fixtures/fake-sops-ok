@@ -41,5 +41,9 @@ if [[ "$input_type" != dotenv || "$output_type" != dotenv ]]; then
   exit 64
 fi
 
-base=$(basename "$path" .env)
-echo "${base}=value-for-${base}"
+if [ -n "${FAKE_SOPS_PASSTHROUGH:-}" ]; then
+  cat "$path"
+else
+  base=$(basename "$path" .env)
+  echo "${base}=value-for-${base}"
+fi
