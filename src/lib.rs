@@ -1,0 +1,155 @@
+//! Session-scoped secrets broker.
+//!
+//! See `docs/design.md` for the threat model and the reasoning behind the
+//! security properties this crate is required to hold.
+
+use std::path::PathBuf;
+use std::time::Duration;
+
+use crate::decrypt::{Decryptor, PcscReachability, YubikeyProbe};
+
+/// Human-facing decrypt announcements.
+pub mod announce;
+/// Sops subprocess handling for one human-tier secret.
+pub mod decrypt;
+pub mod grants;
+/// Process hardening that must complete before plaintext is held.
+pub mod hardening;
+pub mod proto;
+/// Pending approval requests and the single-flight hardware queue.
+pub mod requests;
+/// Secret names and zeroizing plaintext bytes.
+pub mod secret;
+/// Socket server, worker, and request dispatch.
+pub mod server;
+/// Human-tier ciphertext directory access.
+pub mod store;
+
+/// Daemon configuration. Sourced from the daemon's own environment only —
+/// never from a client request, because clients are untrusted.
+#[derive(Debug, Clone)]
+#[allow(
+    clippy::exhaustive_structs,
+    reason = "integration harnesses construct every configuration field explicitly"
+)]
+pub struct Config {
+    /// Unix socket to serve on when not socket-activated.
+    pub socket_path: PathBuf,
+    /// Directory of per-key sops files.
+    pub human_dir: PathBuf,
+    /// Path to the sops binary.
+    pub sops_bin: PathBuf,
+    /// PC/SC socket whose absence means the `YubiKey` is unreachable.
+    pub pcsc_socket: Option<PathBuf>,
+    /// argv for an optional bounded PC/SC far-end liveness probe.
+    pub yubikey_probe_argv: Vec<String>,
+    /// argv for the desktop notification channel.
+    pub notify_argv: Vec<String>,
+    /// argv for the envoy notification channel.
+    pub envoy_argv: Vec<String>,
+    /// Backstop lifetime for a grant.
+    pub max_grant: Duration,
+    /// Gap enforced between decrypts; must exceed the PIV touch cache.
+    pub cooldown: Duration,
+    /// How long a request waits for approval.
+    pub request_ttl: Duration,
+    /// Pending requests allowed per scope.
+    pub max_pending_per_scope: usize,
+}
+
+impl Config {
+    /// Build configuration from environment variables, with defaults.
+    pub fn from_env() -> Self {
+        let var = |name: &str| std::env::var(name).ok().filter(|value| !value.is_empty());
+        let runtime = var("XDG_RUNTIME_DIR").unwrap_or_else(|| "/tmp".to_owned());
+        let home = var("HOME").unwrap_or_else(|| "/root".to_owned());
+        let argv = |name: &str| {
+            var(name)
+                .map(|value| {
+                    value
+                        .split_whitespace()
+                        .map(ToOwned::to_owned)
+                        .collect::<Vec<String>>()
+                })
+                .unwrap_or_default()
+        };
+        let secs = |name: &str, fallback: u64| {
+            var(name)
+                .and_then(|value| value.parse().ok())
+                .map_or_else(|| Duration::from_secs(fallback), Duration::from_secs)
+        };
+        Self {
+            socket_path: var("SECRETSD_SOCKET").map_or_else(
+                || PathBuf::from(format!("{runtime}/secretsd.sock")),
+                PathBuf::from,
+            ),
+            human_dir: var("SECRETSD_HUMAN_DIR").map_or_else(
+                || PathBuf::from(format!("{home}/.dotfiles/secrets.human.d")),
+                PathBuf::from,
+            ),
+            sops_bin: var("SECRETSD_SOPS_BIN").map_or_else(|| PathBuf::from("sops"), PathBuf::from),
+            pcsc_socket: var("PCSCLITE_CSOCK_NAME").map(PathBuf::from),
+            yubikey_probe_argv: argv("SECRETSD_YUBIKEY_PROBE_CMD"),
+            notify_argv: argv("SECRETSD_NOTIFY_CMD"),
+            envoy_argv: argv("SECRETSD_ENVOY_CMD"),
+            max_grant: secs("SECRETSD_MAX_GRANT_SECS", 43200),
+            cooldown: secs("SECRETSD_COOLDOWN_SECS", 16),
+            request_ttl: secs("SECRETSD_REQUEST_TTL_SECS", 90),
+            max_pending_per_scope: var("SECRETSD_MAX_PENDING")
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(3),
+        }
+    }
+
+    /// Build a decryptor from daemon-only configuration.
+    pub(crate) fn decryptor(&self) -> Decryptor {
+        Decryptor::new(
+            self.sops_bin.clone(),
+            self.request_ttl,
+            PcscReachability::new(
+                self.pcsc_socket.clone(),
+                YubikeyProbe::from_argv(&self.yubikey_probe_argv),
+            ),
+        )
+    }
+
+    /// Reject settings that could allow one touch to authorize two decrypts.
+    pub fn validate(&self) -> std::io::Result<()> {
+        if self.cooldown <= Duration::from_secs(15) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "SECRETSD_COOLDOWN_SECS must exceed the 15s PIV touch cache",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Serve until the process is stopped.
+pub fn run(config: Config) -> std::io::Result<()> {
+    config.validate()?;
+    server::serve(config)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_a_cooldown_at_or_below_the_piv_touch_cache() {
+        let config = Config {
+            socket_path: PathBuf::from("/tmp/secretsd-test.sock"),
+            human_dir: PathBuf::from("/tmp/secretsd-human"),
+            sops_bin: PathBuf::from("sops"),
+            pcsc_socket: None,
+            yubikey_probe_argv: Vec::new(),
+            notify_argv: Vec::new(),
+            envoy_argv: Vec::new(),
+            max_grant: Duration::from_secs(1),
+            cooldown: Duration::from_secs(15),
+            request_ttl: Duration::from_secs(1),
+            max_pending_per_scope: 1,
+        };
+        assert!(config.validate().is_err());
+    }
+}

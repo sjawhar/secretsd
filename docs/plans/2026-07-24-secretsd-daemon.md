@@ -870,7 +870,6 @@ mod tests {
     fn fixture() -> (tempfile::TempDir, HumanStore) {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("DEEL_API_KEY.env"), b"ciphertext").unwrap();
-        std::fs::write(dir.path().join("FLEET_LICENSE_KEY.env"), b"ciphertext").unwrap();
         std::fs::write(dir.path().join("notes.txt"), b"ignored").unwrap();
         std::os::unix::fs::symlink("/etc/passwd", dir.path().join("EVIL_LINK.env")).unwrap();
         std::fs::create_dir(dir.path().join("A_DIR.env")).unwrap();
@@ -887,7 +886,7 @@ mod tests {
         // Non-.env files are ignored; the symlink and directory still *appear*
         // as names because listing must not stat or open anything -- opening is
         // where they get rejected.
-        assert_eq!(names, vec!["A_DIR", "DEEL_API_KEY", "EVIL_LINK", "FLEET_LICENSE_KEY"]);
+        assert_eq!(names, vec!["A_DIR", "DEEL_API_KEY", "EVIL_LINK"]);
     }
 
     #[test]
@@ -2898,7 +2897,7 @@ After=secretsd.socket
 Type=simple
 ExecStart=%h/.dotfiles/bin/secretsd
 Environment=SECRETSD_HUMAN_DIR=%h/.dotfiles/secrets.human.d
-Environment=SECRETSD_NOTIFY_CMD=notify-send --app-name=secretsd --urgency=critical secretsd
+Environment="SECRETSD_NOTIFY_CMD=notify-send --app-name=secretsd --urgency=critical secretsd"
 # Locking pages is mandatory in production; without this the daemon refuses to start.
 LimitMEMLOCK=infinity
 LimitCORE=0

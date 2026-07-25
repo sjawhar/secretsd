@@ -1,0 +1,6 @@
+#!/bin/bash
+if [ -n "${FAKE_SOPS_LOG:-}" ]; then
+  printf '%s\n' "fake-sops-hang $*" >> "$FAKE_SOPS_LOG"
+fi
+echo "$$" > "/tmp/secretsd-fake-sops-hang-$PPID"
+sleep 300

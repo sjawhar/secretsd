@@ -9,7 +9,7 @@ repository = "https://github.com/sjawhar/secretsd"
 publish = false
 
 [dependencies]
-# Syscalls: SO_PEERCRED, mlockall, prctl, pidfd, openat.
+# Syscalls: SO_PEERCRED, mlockall, prctl, openat.
 nix = { version = "0.29", features = [
     "socket",
     "mman",

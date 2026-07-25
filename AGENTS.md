@@ -66,8 +66,13 @@ of them is a bug even if tests pass:
 cargo fmt --all -- --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo nextest run
-cargo +nightly miri nextest run   # required if the change touches unsafe
+cargo +nightly miri nextest run --all-features -E 'test(/^(secret|grants|requests|proto|announce)::tests::/)'
 ```
+
+Miri covers the pure `secret`, `grants`, `requests`, `proto`, and `announce`
+modules. It cannot cover the `unsafe` fd-3 adoption in `server.rs`: that code
+requires a real socket. Guard it through review, the `LISTEN_PID`/`LISTEN_FDS`
+validation, and the integration tests in `tests/broker.rs`.
 
 Tests must not require a real YubiKey. Inject a fake decryptor with
 `SECRETSD_SOPS_BIN` and a scratch socket with `SECRETSD_SOCKET`. Both are read

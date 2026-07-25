@@ -46,9 +46,10 @@ jobs:
           components: miri, rust-src
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@nextest
+      # Miri isolation cannot execute the filesystem and socket tests.
       - env:
           MIRIFLAGS: "-Zmiri-strict-provenance -Zmiri-symbolic-alignment-check"
-        run: cargo +nightly miri nextest run --all-features --workspace
+        run: cargo +nightly miri nextest run --all-features -E 'test(/^(secret|grants|requests|proto|announce)::tests::/)'
 
   machete:
     runs-on: ubuntu-latest
@@ -61,14 +62,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # `check all` includes RustSec advisory checks.
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
           command: check all
-
-  audit:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: rustsec/audit-check@v1
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}

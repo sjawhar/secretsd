@@ -1,0 +1,45 @@
+#!/bin/bash
+path="${!#}"
+if [[ "$path" == /proc/self/fd/* ]]; then
+  path=$(readlink "$path")
+fi
+if [ -n "${FAKE_SOPS_LOG:-}" ]; then
+  printf '%s\n' "$path" >> "$FAKE_SOPS_LOG"
+fi
+if [ -n "${FAKE_SOPS_ARGS_LOG:-}" ]; then
+  printf '%s\0' "$@" >> "$FAKE_SOPS_ARGS_LOG"
+fi
+
+input_type=''
+output_type=''
+while (($# > 0)); do
+  case "$1" in
+    --input-type)
+      if (($# < 2)) || [[ "$2" != dotenv ]]; then
+        printf '%s\n' 'fake-sops-ok: expected --input-type dotenv' >&2
+        exit 64
+      fi
+      input_type="$2"
+      shift 2
+      ;;
+    --output-type)
+      if (($# < 2)) || [[ "$2" != dotenv ]]; then
+        printf '%s\n' 'fake-sops-ok: expected --output-type dotenv' >&2
+        exit 64
+      fi
+      output_type="$2"
+      shift 2
+      ;;
+    *)
+      shift
+      ;;
+  esac
+done
+
+if [[ "$input_type" != dotenv || "$output_type" != dotenv ]]; then
+  printf '%s\n' 'fake-sops-ok: expected both --input-type dotenv and --output-type dotenv' >&2
+  exit 64
+fi
+
+base=$(basename "$path" .env)
+echo "${base}=value-for-${base}"

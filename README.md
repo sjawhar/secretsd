@@ -23,6 +23,22 @@ Status: **design complete, implementation in progress.** See
 [`docs/design.md`](docs/design.md) for the design and
 [`docs/plans/`](docs/plans/) for the implementation plan.
 
+## Install
+
+Download and extract a release tarball, then install the binary and link the
+user units:
+
+```bash
+tar xzf secretsd-vX.Y.Z-linux-x86_64.tar.gz
+cd secretsd-vX.Y.Z-linux-x86_64
+install -Dm755 secretsd ~/.dotfiles/bin/secretsd
+mkdir -p ~/.config/systemd/user
+ln -sf "$PWD/systemd/secretsd.socket" ~/.config/systemd/user/secretsd.socket
+ln -sf "$PWD/systemd/secretsd.service" ~/.config/systemd/user/secretsd.service
+systemctl --user daemon-reload
+systemctl --user enable --now secretsd.socket
+```
+
 ## Why not an off-the-shelf secrets manager?
 
 Vault/OpenBao + GatePlane, Infisical Access Requests, 1Password, and Teleport

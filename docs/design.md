@@ -8,8 +8,7 @@ what was tried and why it failed).
 
 ## Goal
 
-Human-gated secrets (currently DEEL_API_KEY, PULUMI_CONFIG_PASSPHRASE,
-FLEET_LICENSE_KEY) are granted **per agent session**, gated on human presence
+Human-gated secrets (currently DEEL_API_KEY and PULUMI_CONFIG_PASSPHRASE)
 **at grant time only** (one YubiKey touch), and remain available to that
 session — and only that session — for the session's lifetime. Agent-tier
 secrets keep working unattended with zero interaction, exactly as today.
@@ -39,10 +38,12 @@ secrets keep working unattended with zero interaction, exactly as today.
   decrypt could complete without a distinct touch. Mitigated by single-flight
   sequencing (below); the residual window is accepted for touch-only
   ergonomics. The future explicit-approve mode eliminates it.
-- **Grant lifetime**: once granted, a secret stays available to its session
-  until the session ends, `secrets lock`, or the 12h backstop — including
-  while the user is away. This is deliberate: presence is proven at grant
-  time, not continuously.
+- **Grant lifetime and silent harness death**: once granted, a secret stays
+  available to its session until the session-end event, `secrets lock`, or the
+  12h backstop — including while the user is away. This is deliberate:
+  presence is proven at grant time, not continuously. A silently crashed
+  harness cannot send its session-end event, and the broker has no death-watch
+  fallback, so its grants survive until the 12h backstop.
 - **Open registration**: the broker socket is same-UID-open, so any process
   can register a token and pose as "a session". A forged registration cannot
   mint a grant — the touch requirement stands — but it can dress up a request
@@ -212,13 +213,11 @@ request → pending → decrypting → granted ──(session end | lock | 12h)�
   are coalesced **only** for the same `(token, key)`; one session's approval
   never creates another session's grant.
 - Revocation triggers: plugin session-end event (primary), `secrets lock`
-  (wipe all + revoke all), 12h backstop per grant, serve-process death
-  (broker holds a pidfd per registration as a fallback for crashed serves).
-- Grants are never persisted. Killing the harness process revokes its
-  grants; reopening the same on-disk session re-registers the persisted
-  token but starts with zero grants — the first human-tier request goes
-  through a fresh announce-and-touch. One touch to resume is deliberate:
-  a new process is a new presence proof.
+  (wipe all + revoke all), and a 12h backstop per grant.
+- Grants are never persisted. Reopening the same on-disk session re-registers
+  the persisted token but starts with zero grants — the first human-tier
+  request goes through a fresh announce-and-touch. One touch to resume is
+  deliberate: a new process is a new presence proof.
 - Plaintext lifetime = union of active grants for that key; zeroized when
   the last grant dies.
 
@@ -293,8 +292,7 @@ MCP: secrets_request(key)               grant flow trigger; no values returned
 - Agent tier unattended (must not regress):
   `ssh devbox '~/.dotfiles/shims/secrets get ANTHROPIC_API_KEY | wc -c'` — no
   interaction, no broker involvement.
-- Grant flow: from an OpenCode session, `secrets get FLEET_LICENSE_KEY` →
-  announcement → one touch → value; second call instant; new session →
+- Grant flow: from an OpenCode session, `secrets get DEEL_API_KEY` →
   new announcement.
 - Cross-session isolation: session B requesting a key granted to session A
   gets its own pending request, never A's value.
