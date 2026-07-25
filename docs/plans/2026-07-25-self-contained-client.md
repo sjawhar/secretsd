@@ -4,15 +4,15 @@
 
 **Goal:** Make `secretsd` own the Rust `secrets` CLI, its shared wire protocol, its OpenCode plugin, and portable systemd units without regressing unattended agent-tier access.
 
-**Architecture:** Turn the package into a library with `proto` and `client` modules and two thin binaries: `secretsd` and drop-in `secrets`.  The client uses typed protocol frames and exact byte reads for human-tier requests while keeping agent-tier sops decryption local and daemon-independent.  The daemon has two approval paths: tokenless TTY requests use a client-acknowledged in-band announcement; token-scoped requests require the generic configured notifier before hardware access.
+**Architecture:** Turn the package into a library with `proto` and `client` modules and two thin binaries: `secretsd` and drop-in `secrets`.  The client uses typed protocol frames and exact byte reads for human-tier requests while keeping agent-tier sops decryption local and daemon-independent.  Human-tier requests proceed to the hardware prompt; the physical YubiKey touch is the authorization gesture, and the structured journald request event supplies after-the-fact attribution.
 
 **Tech Stack:** Rust 1.92 / edition 2024, `nix`, `zeroize`, `subtle`, `tracing`, systemd user units, Bun/OpenCode plugin tests, sops dotenv subprocesses.
 
 ## Global Constraints
 
 - Use **jj, never git**.  There is one commit per deliverable, never per task.  If recovery is required, every `jj restore` command must name only the intended path; an unscoped restore destroyed secrets today.
-- The current 104 Rust tests must remain passing; add coverage without deleting or weakening security assertions.
-- Run `cargo +nightly fmt --all -- --check`, `cargo clippy --workspace --all-targets --all-features -- -D warnings`, and `cargo nextest run --workspace --all-targets --all-features` for the final Rust gate.  Run Miri only for pure `secret`, `grants`, `requests`, `proto`, `announce`, and new pure `client` tests.
+- The current 104 Rust tests must remain passing; retain all security coverage whose guarded property survives, and delete or rewrite an assertion only when this plan explicitly records why that property no longer applies.
+- Run `cargo +nightly fmt --all -- --check`, `cargo clippy --workspace --all-targets --all-features -- -D warnings`, and `cargo nextest run --workspace --all-targets --all-features` for the final Rust gate.  Run Miri only for pure `secret`, `grants`, `requests`, `proto`, and new pure `client` tests.
 - Enforce clippy `pedantic`, `nursery`, and `cargo` with `-D warnings`.  Do not use `unwrap`, `expect`, `panic`, or indexing outside `#[cfg(test)]`.
 - Secret plaintext and session-token bytes must never occur in logs, `Debug`, errors, test snapshots, or diagnostic output.  Redact test frames before asserting them.
 - Do not use serde or dotenv parsers on plaintext paths.  Continue hand-parsing protocol and dotenv bytes and zeroize temporary plaintext buffers.
@@ -22,7 +22,7 @@
 - Read only the path in `SECRETSD_SESSION_TOKEN_FILE`; do not treat the environment value as a token.  Preserve the token-file contract: `${XDG_RUNTIME_DIR}/secretsd/<sessionID>.token`, directory mode `0700`, file mode `0600`, and export only the path.
 - Resolve the human-tier socket only when a human-tier operation requires it: `SECRETSD_SOCK`, then `${XDG_RUNTIME_DIR}/secretsd.sock`, then `/run/user/<uid>/secretsd.sock`.  Missing environment variables must never abort client startup.
 - Framed `OK\tlen=<n>\n` responses are exact byte frames: reject malformed headers, early EOF, surplus bytes, and payloads containing NUL before values reach stdout or a child environment.
-- Preserve journald request logging and attribution.  No deployment may hardcode Envoy, NATS, Slack, `~/.dotfiles`, or a personal notifier path into this repository.
+- Preserve the structured journald request log as the sole attribution mechanism.  No packaged unit may hardcode a companion-repository path or a personal command into this repository.
 - `LimitMEMLOCK=infinity`, `LimitCORE=0`, `RemoveOnStop=yes`, `Accept=no`, and `SocketMode=0600` are load-bearing deployment invariants and must remain documented and tested where applicable.
 
 ## File Structure
@@ -30,22 +30,21 @@
 | File | Responsibility |
 |---|---|
 | `src/lib.rs` | Shared crate root; exports daemon modules plus reusable `proto` and `client` modules. |
-| `src/proto.rs` | One canonical protocol version, typed request/response headers, including in-band tokenless announcement acknowledgement. |
+| `src/proto.rs` | One canonical protocol version and typed request/response headers. |
 | `src/client.rs` | Unix-socket transport, HELLO negotiation, exact framed-byte read, typed error mapping, lazy socket resolution, and TTY/token-path helpers. |
 | `src/bin/secretsd.rs` | Thin daemon executable: hardening, configuration validation, and `run`. |
 | `src/bin/secrets.rs` | Drop-in CLI: direct agent sops path, filename-only human discovery, duplicate detection, broker operations, edit commands, and env injection. |
 | `src/main.rs` | Delete after Cargo is switched to the two explicit binaries. |
-| `src/announce.rs` | Scope-aware announcement policy: return an in-band tokenless announcement; invoke only `SECRETSD_NOTIFY_CMD` for token scope. |
-| `src/requests.rs` | Pending request state records whether the in-band client acknowledgement is required before decryption. |
-| `src/server/dispatch.rs` and `src/server/worker.rs` | Dispatch `ACK`, return tokenless announcement frames before a decrypt starts, and gate the worker on acknowledgement/notifier success. |
+| `src/requests.rs` | Pending request lifecycle, timeout, denial, and single-flight state for hardware-backed decrypts. |
+| `src/server/dispatch.rs` and `src/server/worker.rs` | Dispatch requests, retain structured request attribution, and start a decrypt without a software announcement gate. |
 | `src/hardening.rs` and `tests/hardening.rs` | Preflight `RLIMIT_MEMLOCK`, fail before threads/allocations, and report the required systemd limit. |
 | `tests/client.rs` and `tests/e2e_client.rs` | Client protocol/CLI tests plus a scratch-daemon REGISTER/GET harness using fake sops and no hardware. |
 | `tests/fixtures/fake-sops-ok` | Strict dotenv-only fake sops used by both daemon and client tests. |
 | `opencode/plugins/secretsd.ts` and `opencode/plugins/secretsd.test.ts` | Relocated plugin and its existing test logic, owned and tested with the daemon release. |
 | `opencode/package.json` | Pinned plugin test dependency and Bun test command. |
 | `.github/workflows/ci.yml` | Existing Rust gates plus Bun installation and the relocated plugin test. |
-| `systemd/secretsd.service` and `systemd/secretsd.socket` | Generic packaged units with no personal paths or notifier configuration. |
-| `docs/design.md` and `AGENTS.md` | Current architecture and operator requirements, rewritten to describe the self-contained client and notifier policy. |
+| `systemd/secretsd.service` and `systemd/secretsd.socket` | Generic packaged units with no personal paths or ancillary-service configuration. |
+| `docs/design.md` and `AGENTS.md` | Current architecture and operator requirements, rewritten to describe the self-contained client, physical-touch authorization, and journald attribution. |
 | `docs/dotfiles-cutover.md` | Companion-repository-only installation contract and safe cross-machine cutover order. |
 
 ---
@@ -61,7 +60,7 @@
 
 **Interfaces:**
 - Produces `client::BrokerClient`, `BrokerResponse`, `ClientError`, `SocketPath`, `read_token_file`, and `caller_tty`.
-- Adds `Request::Acknowledge { id: u64 }`; adds `Response::Announcement { id: u64, message: &'a str }` rendered as `OK\tannouncement=<id>\tmessage=<sanitized>\n`.
+- Does not add an acknowledgement request or announcement response; human requests use the ordinary typed request and response frames.
 - `BrokerClient::call(&self, request: &str) -> Result<BrokerResponse, ClientError>` performs HELLO first, then parses the response without stringly protocol copies in either binary.
 
 - [ ] **Step 1: Write failing typed-frame tests**
@@ -142,7 +141,7 @@ fn main() -> std::process::ExitCode {
 }
 ```
 
-In `src/proto.rs`, add the `Acknowledge` request parser arm and the `Announcement` response formatter exactly as declared above; add unit assertions for `ACK\tid=9` and `OK\tannouncement=9\tmessage=request`.  Do not add another version constant or protocol parser to a binary.
+In `src/proto.rs`, keep the human-request protocol limited to its ordinary typed request and response frames; do not add acknowledgement or announcement variants.  Do not add another version constant or protocol parser to a binary.
 
 Create `src/client.rs` with `SocketPath::resolve`, `ClientError` (whose `Display` maps every current `ErrCode` plus malformed/IO/handshake cases to an actionable message), `BrokerResponse`, and byte-oriented `parse_response`.  Its reader must call `read_until(b'\n', ...)`, parse only ASCII headers, allocate exactly the declared payload length with `try_reserve_exact`, read exactly that many bytes, then make one additional `read` and reject a nonzero result.  Reject a NUL byte before returning `BrokerResponse::Bytes`.  `hello()` accepts only `OK\tversion=1\n`; it must reject the historical typo `OK\tv=1\n`.
 
@@ -243,85 +242,69 @@ Expected: all client tests pass; the smoke command exits nonzero with `secrets: 
 
 ---
 
-### Task 3: Replace Envoy acknowledgements with scope-aware approval
+### Task 3: Remove the announcement gate
 
-**Parallel-safe:** No — must follow Task 1; Task 4 consumes the new `ACK` protocol.
+**Parallel-safe:** No — run after Task 1 has settled `src/proto.rs` and `src/lib.rs`, and before Tasks 4, 6, 8, and 9 consume the resulting protocol, `Config`, broker harness, and packaged-unit contract.  Task 2 may run alongside this task after Task 1 because it is disjoint from these daemon files; do not overlap this task with any task that edits `src/proto.rs`, `src/lib.rs`, `tests/broker.rs`, or either systemd unit.
 
 **Files:**
-- Modify: `src/announce.rs`, `src/requests.rs`, `src/server/dispatch.rs`, `src/server/worker.rs`, `src/lib.rs`, `tests/broker.rs`, `tests/broker/grants.rs`
-- Delete: every `envoy_argv` field, environment parse, command notifier construction, and Envoy-specific test expectation.
+- Delete: `src/announce.rs`, including `Announcement`, `Announcer`, `Notifier`, `CommandNotifier`, `render`, and every test in that module.
+- Modify: `src/lib.rs`, `src/proto.rs`, `src/requests.rs`, `src/server.rs`, `src/server/dispatch.rs`, `src/server/worker.rs`, `tests/broker.rs`, `tests/broker/grants.rs`, `systemd/secretsd.service`, `systemd/secretsd.socket`, `docs/design.md`, and `AGENTS.md`.
+- Remove `notify_argv` and `envoy_argv` from `Config`, `Config::from_env`, every test configuration, daemon state construction, and every systemd/deployment example.  Delete `SECRETSD_NOTIFY_CMD` and `SECRETSD_ENVOY_CMD`; no compatibility alias or no-op command remains.
 
-**Interfaces:**
-- `AnnouncementPolicy::announce(scope: ScopeKind, announcement: &Announcement) -> Result<AnnouncementDelivery, ErrCode>`.
-- `AnnouncementDelivery::InBand { id, message }` means the worker is blocked until `Queue::acknowledge(id)`; `AnnouncementDelivery::Notifier` means the configured `SECRETSD_NOTIFY_CMD` completed successfully.
-- `Request::Acknowledge { id }` succeeds only for the matching pending tokenless request.
+**Decision and rationale:** Remove the gate rather than replacing its transport.  A pending decrypt makes the YubiKey on the operator's desk blink; that physical, out-of-band signal cannot be spoofed by software and already tells the operator exactly when a touch matters.  The operator initiates every request, including requests delegated to an agent, so this workflow has no unattributed-blink case.  The prior concern was unexplained blinks, which is answered after the fact by the existing structured journald request event recording key name, scope kind, peer PID, and decision.
 
-**Decision:** Tokenless TTY uses no notifier and no external acknowledgement.  It returns the request text to the CLI, the CLI writes it to stderr, then sends `ACK`; therefore the daemon cannot start sops before that write/ack round trip.  Token scope requires `SECRETSD_NOTIFY_CMD`; an absent or failing command returns `NOT_ANNOUNCED` and no sops process starts.  The devbox is headless and receives no default notifier: agent-initiated human-tier requests are deliberately unavailable there until its consuming deployment provides a real notifier.  This is accepted fail-closed behavior, not a reason to restore Envoy or add another bespoke service.
+The touch remains the authorization gesture: the daemon starts the requested decrypt, the YubiKey blinks, and the human touches it or does not.  The journald request log is now the sole audit mechanism; retain its structured attribution fields and never log secret plaintext or session-token bytes.  A pre-decrypt software message is redundant and harmful: a missing `notify-send` made grants fail with `NOT_ANNOUNCED`, and making Envoy mandatory converted credential access into a network-service dependency.  The headless-notifier problem therefore disappears, as does the devbox `SECRETSD_NOTIFY_CMD=true` stub and one `~/.dotfiles` reference in the systemd service.
 
-- [ ] **Step 1: Add failing approval-policy tests**
+- [ ] **Step 1: Write failing removal and audit regressions**
 
-Add these integration tests using the existing `Harness` fake sops and a notifier fixture that appends only its request ID (not tokens or values) to a file:
+In `tests/broker/grants.rs`, replace the gate test with `request_without_a_notifier_reaches_the_hardware_gate`: start the existing fake-sops `Harness` without any notification command, register a token scope, request a human key, and assert that fake sops is invoked once and the request receives its normal successful result.  This is deliberately the inverse of the old policy: absence of a notification command must never suppress a hardware prompt.  Production hardware still requires the physical touch; the fake decryptor only proves that configuration no longer inserts a software gate before it.
 
-```rust
-#[test]
-fn tokenless_get_returns_announcement_then_needs_ack_before_sops() {
-    let harness = Harness::start();
-    let first = harness.send(b"GET\tkey=HUMAN\ttty=/dev/pts/77\n");
-    assert!(first.starts_with(b"OK\tannouncement="));
-    assert_eq!(harness.sops_invocations(), 0);
-    let id = announcement_id(&first).unwrap();
-    assert_eq!(harness.send(format!("ACK\tid={id}\n").as_bytes()), b"OK\n");
-    assert_eq!(harness.send(b"GET\tkey=HUMAN\ttty=/dev/pts/77\n"), b"OK\tlen=15\nvalue-for-HUMAN");
-    assert_eq!(harness.sops_invocations(), 1);
-}
+Keep the existing structured journald event as the sole audit record.  Add a server logging regression beside the request-handler tests that captures `request handled` and asserts its `key`, `scope_kind`, kernel-derived `peer_pid`, and `decision` fields are present, while secret plaintext and session-token bytes are absent.  Do not reintroduce client-supplied session metadata solely for logging.
 
-#[test]
-fn token_scope_without_notifier_fails_closed_without_sops() {
-    let harness = Harness::start_without_notifier();
-    harness.register("a1", "session-a");
-    assert!(harness.send(b"GET\tkey=HUMAN\ttoken=a1\n").starts_with(b"ERR\tNOT_ANNOUNCED\t"));
-    assert_eq!(harness.sops_invocations(), 0);
-}
+Apply these explicit dispositions to every announcement test:
 
-#[test]
-fn token_scope_uses_generic_notifier_before_sops() {
-    let harness = Harness::start_with_notifier();
-    harness.register("a1", "session-a");
-    assert_eq!(harness.get("HUMAN", Some("a1"), None), b"value-for-HUMAN");
-    assert_eq!(harness.notifier_calls(), 1);
-    assert_eq!(harness.sops_invocations(), 1);
-}
-```
+| Existing test | Disposition | Does its guarded property survive? |
+|---|---|---|
+| `announce_fails_closed_when_no_channels_are_configured` | Delete with `src/announce.rs`. | No. It required a configured software delivery channel before a decrypt could start; authorization is now the YubiKey touch. The replacement broker test covers the intended new invariant: no notification configuration may block the hardware prompt. |
+| `announce_fails_closed_when_every_channel_fails` | Delete with `src/announce.rs`. | No. A failed software message is no longer an authorization signal or a reason to suppress the hardware prompt. No replacement notification behavior is added. |
+| `render_sanitizes_metadata_so_it_cannot_forge_lines` | Delete with `render`. | No. Its free-text, human-visible rendering target no longer exists, so there is no remaining line-oriented metadata channel to sanitize. The distinct surviving audit-attribution requirement is covered by the structured journald regression above. |
+| `no_announcement_channel_means_no_grant` | Rewrite as `request_without_a_notifier_reaches_the_hardware_gate`. | No. Its original assertion that a missing channel prevents sops is intentionally reversed. The rewritten test covers the surviving requirement that an unconfigured headless environment is not denied before the YubiKey can request a touch. |
 
-- [ ] **Step 2: Verify the policy tests fail**
+Delete the other renderer and delivery tests with their module; do not preserve any assertion that counts calls to a notifier or waits for a client acknowledgement.
 
-Run: `cargo nextest run --test broker tokenless_get_returns_announcement_then_needs_ack_before_sops`
+- [ ] **Step 2: Verify the removal regression fails**
 
-Expected: FAIL because `ACK` is unknown and tokenless GET blocks rather than returning an announcement.
+Run: `cargo nextest run --test broker request_without_a_notifier_reaches_the_hardware_gate`
 
-- [ ] **Step 3: Implement the state machine without an Envoy fallback**
+Expected: FAIL on the current implementation because its announcement gate suppresses fake sops when no delivery command is configured.
 
-Add `AwaitingInBandAck` to `RequestState`; its transitions are only `Pending -> AwaitingInBandAck -> Decrypting` for tokenless and `Pending -> Decrypting` for token scope after a successful notifier.  Store the announcement text in the queue record, not in logs or a secret buffer.  `Queue::acknowledge` must reject unknown, expired, denied, token-scoped, and already-acknowledged IDs with `ErrCode::BadRequest`.
+- [ ] **Step 3: Delete the gate instead of substituting another precondition**
 
-Make `dispatch_access` return `Outcome::Announcement` only when it newly enqueues a tokenless request.  Make `dispatch(Request::Acknowledge)` call the typed queue method and wake the worker.  The worker must skip `AwaitingInBandAck`; it may call `Decryptor` only after an `ACK` or `CommandNotifier` success.  Build the token notifier only from `SECRETSD_NOTIFY_CMD`; split the existing command variable exactly once during configuration and treat empty/missing as no notifier.  Preserve the structured journal request event and label untrusted session metadata explicitly.
+Delete `src/announce.rs`; remove its public module from `src/lib.rs`; remove all announcer imports, state, construction, test fixtures, worker jobs, and call sites from `src/server.rs` and `src/server/worker.rs`.  The worker must proceed directly from `Queue::mark_decrypting` to `Decryptor::decrypt_with_start`; remove `request_metadata` and `fail_request` if they are then dead.  Preserve the existing pending/decrypting, expiry, denial, single-flight, and process-group-kill behavior.  In `src/requests.rs`, remove the announcement-specific wording for request IDs but do not add a replacement waiting state.
 
-- [ ] **Step 4: Run worker and protocol checks**
+Remove any interim `Request::Acknowledge`, acknowledgement parser, announcement response, and `Outcome::Announcement` from `src/proto.rs`, `src/server/dispatch.rs`, and client-facing dispatch paths.  Remove `ErrCode::NotAnnounced` and its `NOT_ANNOUNCED` wire mapping.  This is a protocol-surface change, but **do not bump `PROTOCOL_VERSION`**: the only consumers are this repository's client and plugin, both ship with this restructuring release, and mixed old/new peers are not a supported deployment.  Keeping version 1 avoids claiming a compatibility boundary that the release does not provide; a future independently deployed consumer would require a version bump before incompatible interoperation.
 
-Run: `cargo nextest run --test broker && cargo nextest run --test broker -- no_announcement_channel_means_no_grant && cargo nextest run proto`
+Delete `SECRETSD_NOTIFY_CMD` and `SECRETSD_ENVOY_CMD` parsing from `Config::from_env`, their `Config` fields, all explicit test `Config` literals, and the command construction in `State::new`.  Delete both environment assignments from the packaged systemd service and every deployment/drop-in example.  A headless machine has no special credential-access configuration: it follows the same hardware-touch flow as any other machine, without a `true` stub, desktop utility, network service, or companion-repository command.
 
-Expected: broker tests pass; all unavailable token-scope requests report `NOT_ANNOUNCED`; no test invokes Envoy.
+Retain the existing `tracing::info!` request event with structured key name, scope kind, peer PID, and decision fields.  It is the sole audit mechanism and records attribution after the fact; it must not gain a pre-decrypt notification, a free-text renderer, secret plaintext, or session-token bytes.
+
+- [ ] **Step 4: Run removal, broker, and protocol checks**
+
+Run: `cargo nextest run --lib && cargo nextest run --test broker && cargo nextest run proto`
+
+Expected: the no-notifier broker regression reaches fake sops, the structured request-log regression retains attribution without secrets, all broker tests pass, and the protocol has neither acknowledgement frames nor the removed error code.
 
 ---
 
 ### Task 4: Complete human-tier CLI transport and all failure messages
 
-**Parallel-safe:** No — follows Tasks 1 and 3.
+**Parallel-safe:** No — follows Tasks 1 and 3, which settle the ordinary human request frames and remove the obsolete error code.
 
 **Files:**
 - Modify: `src/client.rs`, `src/bin/secrets.rs`, `tests/client.rs`
 
 **Interfaces:**
-- `HumanClient::get(&self, key: &SecretName) -> Result<SecretBytes, CliError>` handles an announcement frame by stderr write, `ACK`, and retrying GET once.
+- `HumanClient::get(&self, key: &SecretName) -> Result<SecretBytes, CliError>` sends one typed human request and handles its ordinary terminal response.
 - `CliError::from_broker(ErrCode)` is exhaustive and has a distinct message for every protocol error.
 
 - [ ] **Step 1: Add end-to-end fake-broker tests**
@@ -330,17 +313,15 @@ Use the typed `FakeBroker` in `tests/client.rs` to assert exact wire frames and 
 
 ```rust
 #[test]
-fn human_get_reads_token_from_its_file_sends_tty_and_acks_inband_notice() {
+fn human_get_sends_tty_once_without_a_software_gate() {
     let broker = FakeBroker::script([
-        Reply::Hello, Reply::Announcement { id: 7, message: "Touch YubiKey for HUMAN (TOKENLESS)" },
-        Reply::Ok, Reply::Hello, Reply::Bytes(b"human-value"),
+        Reply::Hello, Reply::Bytes(b"human-value"),
     ]);
     let fixture = Fixture::human("HUMAN", broker.socket());
     fixture.unset_token_file();
     let output = fixture.run_in_tty(["get", "HUMAN"]);
     assert_eq!(output.stdout, b"human-value\n");
-    assert!(String::from_utf8_lossy(&output.stderr).contains("Touch YubiKey for HUMAN"));
-    assert_eq!(broker.frames(), ["HELLO\tversion=1", "GET\tkey=HUMAN\ttty=/dev/pts/test", "HELLO\tversion=1", "ACK\tid=7", "HELLO\tversion=1", "GET\tkey=HUMAN\ttty=/dev/pts/test"]);
+    assert_eq!(broker.frames(), ["HELLO\tversion=1", "GET\tkey=HUMAN\ttty=/dev/pts/test"]);
 }
 
 #[test]
@@ -356,7 +337,7 @@ fn token_file_path_is_read_but_its_token_is_not_rendered_on_error() {
 
 #[test]
 fn every_daemon_error_has_clear_agent_guidance() {
-    for code in ["BAD_REQUEST", "UNKNOWN_OP", "VERSION_MISMATCH", "UNKNOWN_TOKEN", "NO_SCOPE", "AGENT_TTY", "NOT_HUMAN_KEY", "DENIED", "TIMEOUT", "YUBIKEY_UNREACHABLE", "NOT_ANNOUNCED", "TOO_MANY_PENDING", "INTERNAL"] {
+    for code in ["BAD_REQUEST", "UNKNOWN_OP", "VERSION_MISMATCH", "UNKNOWN_TOKEN", "NO_SCOPE", "AGENT_TTY", "NOT_HUMAN_KEY", "DENIED", "TIMEOUT", "YUBIKEY_UNREACHABLE", "TOO_MANY_PENDING", "INTERNAL"] {
         let text = CliError::from_wire_error(code, "detail").to_string();
         assert!(!text.is_empty());
         assert!(text.contains("AGENT NOTICE"), "{code}: {text}");
@@ -366,17 +347,17 @@ fn every_daemon_error_has_clear_agent_guidance() {
 
 - [ ] **Step 2: Verify red tests**
 
-Run: `cargo nextest run --test client human_get_reads_token_from_its_file_sends_tty_and_acks_inband_notice`
+Run: `cargo nextest run --test client human_get_sends_tty_once_without_a_software_gate`
 
-Expected: FAIL because announcement/ACK retry handling is absent.
+Expected: FAIL because the typed human client is absent.
 
 - [ ] **Step 3: Implement exact reads, retry and error mapping**
 
-For each broker call, use `BrokerClient::call` so HELLO and frame parsing cannot drift from daemon types.  When it returns `Announcement { id, message }`, write `message`, then one newline, to stderr; flush stderr; issue `ACK\tid=<id>`; then retry the same GET exactly once.  A second announcement or any non-OK ACK is `InvalidResponse`, not a loop.
+For each broker call, use `BrokerClient::call` so HELLO and frame parsing cannot drift from daemon types.  `HumanClient::get` sends exactly one GET after HELLO and returns its terminal response; it does not print a pre-decrypt message, issue an acknowledgement frame, or retry the request.
 
 `read_token_file` must use `std::fs::read`, reject missing/empty/non-UTF-8/whitespace-padded token content, and remove the byte vector with `zeroize()` after parsing.  `caller_tty` returns `None` where no controlling terminal exists; it never makes agent-tier use fail.  Keep token scope authoritative: if a token-file variable is set but invalid, do not downgrade to tokenless.
 
-Map errors as follows: `VERSION_MISMATCH` → update/restart client and daemon; `UNKNOWN_TOKEN` → broker restarted, request human re-approval; `NO_SCOPE`/`AGENT_TTY` → request from a human terminal or use the OpenCode token path; `NOT_HUMAN_KEY` → malformed/moved human key; `DENIED`/`TIMEOUT` → human declined/was unavailable; `YUBIKEY_UNREACHABLE` → connect the configured hardware path; `NOT_ANNOUNCED` → agent access is unavailable until the deployment configures its notifier; `TOO_MANY_PENDING` → stop retrying and ask the human; `BAD_REQUEST`, `UNKNOWN_OP`, `INTERNAL` → report broker failure.  Prefix all broker-derived CLI failures with `AGENT NOTICE: ask the human; do not retry-loop.`
+Map errors as follows: `VERSION_MISMATCH` → update/restart client and daemon; `UNKNOWN_TOKEN` → broker restarted, request human re-approval; `NO_SCOPE`/`AGENT_TTY` → request from a human terminal or use the OpenCode token path; `NOT_HUMAN_KEY` → malformed/moved human key; `DENIED`/`TIMEOUT` → human declined/was unavailable; `YUBIKEY_UNREACHABLE` → connect the configured hardware path; `TOO_MANY_PENDING` → stop retrying and ask the human; `BAD_REQUEST`, `UNKNOWN_OP`, `INTERNAL` → report broker failure.  Prefix all broker-derived CLI failures with `AGENT NOTICE: ask the human; do not retry-loop.`
 
 - [ ] **Step 4: Run the client acceptance tests**
 
@@ -451,7 +432,7 @@ Expected: all hardening tests pass; low-limit execution exits 1 with the `RLIMIT
 - Create: `tests/e2e_client.rs`
 
 **Interfaces:**
-- `ClientHarness::start() -> Result<Self, TestError>` starts a scratch daemon on a unique Unix socket with `SECRETSD_HUMAN_DIR`, `SECRETSD_SOPS_BIN`, and a successful generic notifier fixture.
+- `ClientHarness::start() -> Result<Self, TestError>` starts a scratch daemon on a unique Unix socket with `SECRETSD_HUMAN_DIR` and `SECRETSD_SOPS_BIN`, with no notification command fixture.
 - `ClientHarness::register(token, session)` and `ClientHarness::cli(args, env)` drive the real `secrets` binary.
 
 - [ ] **Step 1: Write the full acceptance test**
@@ -478,7 +459,6 @@ fn registered_agent_gets_a_human_value_from_a_scratch_daemon_without_hardware() 
     assert_eq!(result.status.code(), Some(0));
     assert_eq!(result.stdout, b"value-for-HUMAN\n");
     assert_eq!(harness.sops_arguments(), vec![vec!["-d", "--input-type", "dotenv", "--output-type", "dotenv"]]);
-    assert_eq!(harness.notifier_calls(), 1);
     assert!(!String::from_utf8_lossy(&result.stderr).contains("value-for-HUMAN"));
 }
 ```
@@ -491,9 +471,9 @@ Expected: FAIL because `ClientHarness` and the installed `secrets` executable te
 
 - [ ] **Step 3: Build the scratch deployment rather than a mock protocol server**
 
-Extend the existing `Harness` support rather than duplicating socket code.  It must start `secretsd::run(Config { socket_path, human_dir, sops_bin: fake_sops, notify_argv: notifier, .. })` in a thread with `MemlockPolicy::Optional` only for the test process.  Spawn the actual `CARGO_BIN_EXE_secrets` with `SECRETSD_SOCK` set to the scratch socket and no `XDG_RUNTIME_DIR`; use a real `REGISTER` frame before the CLI call.  The fake sops must produce the single expected dotenv assignment and reject a missing input/output dotenv flag.
+Extend the existing `Harness` support rather than duplicating socket code.  It must start `secretsd::run(Config { socket_path, human_dir, sops_bin: fake_sops, .. })` in a thread with `MemlockPolicy::Optional` only for the test process.  Spawn the actual `CARGO_BIN_EXE_secrets` with `SECRETSD_SOCK` set to the scratch socket and no `XDG_RUNTIME_DIR`; use a real `REGISTER` frame before the CLI call.  The fake sops must produce the single expected dotenv assignment and reject a missing input/output dotenv flag.
 
-This test is specifically the regression harness for the production failure: it exercises `REGISTER -> CLI token-file read -> HELLO -> GET -> generic notification -> fake sops -> framed bytes`, not a hand-written substitute for any of those links.
+This test is specifically the regression harness for the production flow: it exercises `REGISTER -> CLI token-file read -> HELLO -> GET -> fake sops -> framed bytes`, not a hand-written substitute for any of those links.  Production substitutes the fake decryptor with the blinking YubiKey and its physical touch requirement.
 
 - [ ] **Step 4: Run acceptance and baseline tests**
 
@@ -568,7 +548,7 @@ Expected: plugin tests retain every existing token lifecycle, reconnect, error m
 
 ### Task 8: Package generic systemd units and the companion cutover contract
 
-**Parallel-safe:** Yes — unit/doc changes are disjoint from Rust implementation; execute after Task 5 so the memlock diagnostic is documented accurately.
+**Parallel-safe:** No — execute after Tasks 3 and 5: Task 3 removes the obsolete unit environment and deployment assumptions, and Task 5 supplies the memlock diagnostic that this task documents.
 
 **Files:**
 - Modify: `systemd/secretsd.service`, `systemd/secretsd.socket`, `docs/design.md`, `AGENTS.md`
@@ -576,7 +556,7 @@ Expected: plugin tests retain every existing token lifecycle, reconnect, error m
 
 **Interfaces:**
 - Package service resolves `secretsd` through its service `PATH`; all deployment-specific configuration belongs in consumer-owned `secretsd.service.d/*.conf` drop-ins.
-- The unit declares no `SECRETSD_NOTIFY_CMD`; token-scope access fails with `NOT_ANNOUNCED` unless a deployment configures it.
+- The package contains no software announcement or agent-transport configuration; a human-tier request reaches the hardware touch flow on every supported machine.
 
 - [ ] **Step 1: Replace the service unit with this complete portable content**
 
@@ -624,9 +604,9 @@ WantedBy=sockets.target
 
 - [ ] **Step 2: Validate the packaged units**
 
-Run: `systemd-analyze verify systemd/secretsd.service systemd/secretsd.socket && ! grep -R --line-number --fixed-strings '.dotfiles' systemd && ! grep -R --line-number --fixed-strings 'ENVOY' systemd`
+Run: `systemd-analyze verify systemd/secretsd.service systemd/secretsd.socket && ! grep -R --line-number --fixed-strings '.dotfiles' systemd`
 
-Expected: `systemd-analyze` exits 0 and both negative searches exit 0 (no matching output).
+Expected: `systemd-analyze` and the negative search exit 0 with no matching output.
 
 - [ ] **Step 3: Write the consuming-dotfiles contract in `docs/dotfiles-cutover.md`**
 
@@ -637,8 +617,6 @@ Document this exact drop-in example, owned by dotfiles rather than this package:
 [Service]
 Environment=SECRETSD_HUMAN_DIR=%h/.dotfiles/secrets.human.d
 Environment=PCSCLITE_CSOCK_NAME=/run/user/1000/pcscd.comm
-# Configure only on machines with a real out-of-band notifier for token scope.
-Environment="SECRETSD_NOTIFY_CMD=notify-send --app-name=secretsd --urgency=critical secretsd"
 ```
 
 Then list the required dotfiles-only changes precisely:
@@ -646,10 +624,10 @@ Then list the required dotfiles-only changes precisely:
 1. Pin the released `secretsd` package/version in `mise.toml`, exposing both `~/.local/bin/secretsd` and `~/.local/bin/secrets` plus `~/.local/share/secretsd/opencode/plugins/secretsd.ts`.
 2. Change the OpenCode plugin entry to `file://{env:HOME}/.local/share/secretsd/opencode/plugins/secretsd.ts`.
 3. Delete `shims/secrets` and `shims/tests/test_secrets_shim.py`; delete the moved plugin and `opencode/plugins/secretsd.test.ts`.
-4. Shrink `installers/secretsd.sh` to installing/enabling the two packaged units, creating the drop-in, and importing `PCSCLITE_CSOCK_NAME`; it must not copy a notifier or a dotfiles path into this repository's unit.
-5. **Cutover order:** install the Rust release on laptop and devbox; run its full tests; on **both machines** run `env -i PATH="$PATH" HOME="$HOME" DOTFILES_DIR="$HOME/.dotfiles" secrets get ANTHROPIC_API_KEY` through non-interactive SSH and confirm success with no daemon socket/runtime directory; only after both checks pass may the bash shim be removed.  Then install the plugin path, reload user systemd, and verify agent-tier consumers (Legion, Envoy infrastructure, Dojo, skill MCPs) before enabling human-tier requests.
+4. Shrink `installers/secretsd.sh` to installing/enabling the two packaged units, creating the drop-in, and importing `PCSCLITE_CSOCK_NAME`; it must not copy a personal command or a dotfiles path into this repository's unit.
+5. **Cutover order:** install the Rust release on laptop and devbox; run its full tests; on **both machines** run `env -i PATH="$PATH" HOME="$HOME" DOTFILES_DIR="$HOME/.dotfiles" secrets get ANTHROPIC_API_KEY` through non-interactive SSH and confirm success with no daemon socket/runtime directory; only after both checks pass may the bash shim be removed.  Then install the plugin path, reload user systemd, and verify agent-tier consumers (Legion, Dojo, skill MCPs) before enabling human-tier requests.
 
-State explicitly that a headless devbox without an independently configured notifier cannot perform agent-initiated human-tier grants; tokenless local terminal use remains in-band and does not depend on a notifier.
+State explicitly that a headless devbox follows the same direct hardware-touch flow for agent-initiated human-tier grants as any other machine; no desktop session or auxiliary service is required.
 
 - [ ] **Step 4: Run packaging/document checks**
 
@@ -714,7 +692,7 @@ Run exactly:
 cargo +nightly fmt --all -- --check && \
 cargo clippy --workspace --all-targets --all-features -- -D warnings && \
 cargo nextest run --workspace --all-targets --all-features && \
-cargo +nightly miri nextest run --all-features -E 'test(/^(secret|grants|requests|proto|announce|client)::tests::/)' && \
+cargo +nightly miri nextest run --all-features -E 'test(/^(secret|grants|requests|proto|client)::tests::/)' && \
 ```
 
 Expected: every command exits 0; the Rust count is at least 105 tests; plugin tests pass; systemd units validate.  Then inspect the scoped change only with `jj diff --git -- docs/plans/2026-07-25-self-contained-client.md` while this plan is being authored, and during implementation inspect the intended changed paths only.  Do not run an unscoped restore.
@@ -726,7 +704,7 @@ Expected: every command exits 0; the Rust count is at least 105 tests; plugin te
 - Shared Rust protocol/client and two explicit binaries: Tasks 1–4 and 9.
 - Drop-in CLI surface, unattended agent tier, filename-only list, duplicate failure, exact frames, token-file/TTY/lazy socket/error guidance: Tasks 2 and 4.
 - In-repository OpenCode plugin, token contract, Bun CI, installed-path binding: Task 7.
-- Envoy removal, in-band tokenless ACK, required generic notifier for token scope, headless consequence, journald preservation: Task 3.
+- Complete announcement-gate removal, direct physical-touch authorization, headless parity, and journald-only attribution: Task 3.
 - Generic portable systemd units and load-bearing socket/memlock invariants: Task 8.
 - Low-`RLIMIT_MEMLOCK` early diagnostic regression: Task 5.
 - Hardware-free scratch daemon REGISTER/GET harness and strict fake sops: Task 6.
