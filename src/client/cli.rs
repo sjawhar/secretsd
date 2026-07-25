@@ -2,91 +2,15 @@
 
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
-use std::fmt;
 use std::io::Write;
 use std::os::unix::ffi::OsStringExt;
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::Command;
 
-use super::{AgentStore, HumanNames};
+use super::error::CliError;
+use super::{AgentStore, BrokerClient, BrokerResponse, HumanClient, HumanNames};
 use crate::secret::{SecretBytes, SecretName};
-
-/// A CLI failure that never renders plaintext secret bytes.
-#[derive(Debug)]
-#[non_exhaustive]
-pub enum CliError {
-    /// The command line did not match the compatible CLI surface.
-    Usage,
-    /// A key name does not satisfy `[A-Za-z_][A-Za-z0-9_]*`.
-    InvalidSecretName,
-    /// A requested agent-tier key was absent.
-    MissingSecret(SecretName),
-    /// A key exists in both storage tiers and access is denied.
-    AmbiguousKey(SecretName),
-    /// Starting `sops` failed.
-    SopsStart(std::io::Error),
-    /// `sops` exited unsuccessfully.
-    SopsFailed,
-    /// Decrypted dotenv bytes were malformed or unsafe.
-    InvalidDotenv,
-    /// Reading the human-tier directory failed.
-    HumanDirectory(std::io::Error),
-    /// A human-tier filename was not a valid key name.
-    InvalidHumanFile,
-    /// The requested operation needs Task 4's broker transport.
-    HumanTierNotImplemented,
-    /// Replacing the process for an edit or injection command failed.
-    Exec(std::io::Error),
-    /// Writing an agent-tier value to standard output failed.
-    Stdout(std::io::Error),
-}
-
-impl fmt::Display for CliError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Usage => formatter.write_str(
-                "usage: secrets get KEY | secrets list | secrets KEY1 [KEY2 ...] -- command [args...]",
-            ),
-            Self::InvalidSecretName => formatter.write_str("invalid secret key"),
-            Self::MissingSecret(name) => write!(formatter, "secret '{}' not found", name.as_str()),
-            Self::AmbiguousKey(name) => write!(
-                formatter,
-                "key '{}' exists in both agent and human tiers; refusing ambiguous access",
-                name.as_str()
-            ),
-            Self::SopsStart(error) => write!(formatter, "could not start sops: {error}"),
-            Self::SopsFailed => formatter.write_str("sops could not decrypt the agent-tier secrets"),
-            Self::InvalidDotenv => formatter.write_str("sops returned invalid dotenv data"),
-            Self::HumanDirectory(error) => write!(formatter, "could not list human-tier keys: {error}"),
-            Self::InvalidHumanFile => formatter.write_str("human-tier directory contains an invalid key filename"),
-            Self::HumanTierNotImplemented => formatter.write_str(
-                "human-tier transport is not yet implemented; ask the human to use the existing shim",
-            ),
-            Self::Exec(error) => write!(formatter, "could not execute command: {error}"),
-            Self::Stdout(error) => write!(formatter, "could not write secret value: {error}"),
-        }
-    }
-}
-
-impl std::error::Error for CliError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::SopsStart(error)
-            | Self::HumanDirectory(error)
-            | Self::Exec(error)
-            | Self::Stdout(error) => Some(error),
-            Self::Usage
-            | Self::InvalidSecretName
-            | Self::MissingSecret(_)
-            | Self::AmbiguousKey(_)
-            | Self::SopsFailed
-            | Self::InvalidDotenv
-            | Self::InvalidHumanFile
-            | Self::HumanTierNotImplemented => None,
-        }
-    }
-}
 
 /// Run a compatible `secrets` command.
 pub fn run(arguments: impl IntoIterator<Item = OsString>) -> Result<(), CliError> {
@@ -104,13 +28,9 @@ pub fn run(arguments: impl IntoIterator<Item = OsString>) -> Result<(), CliError
             let name = parse_name(argument_at(&arguments, 1)?)?;
             Context::edit(context.human_file(&name))
         }
-        value
-            if value == OsStr::new("grants")
-                || value == OsStr::new("deny")
-                || value == OsStr::new("lock") =>
-        {
-            Err(CliError::HumanTierNotImplemented)
-        }
+        value if value == OsStr::new("grants") => Context::grants(),
+        value if value == OsStr::new("deny") => Context::deny(argument_at(&arguments, 1)?),
+        value if value == OsStr::new("lock") => Context::lock(),
         _ => context.inject(&arguments),
     }
 }
@@ -190,7 +110,9 @@ impl Context {
         let agent = self.agent.all()?;
         if self.human.contains(name) {
             self.reject_duplicates(&agent)?;
-            return Err(CliError::HumanTierNotImplemented);
+            return HumanClient::from_environment()
+                .and_then(|client| client.get(name))
+                .map_err(CliError::from_client);
         }
         agent
             .get(name)
@@ -205,6 +127,46 @@ impl Context {
             }
         }
         Ok(())
+    }
+
+    fn grants() -> Result<(), CliError> {
+        let response = Self::broker_call("GRANTS")?;
+        let BrokerResponse::Bytes(bytes) = response else {
+            return Err(CliError::from_client(super::ClientError::InvalidResponse));
+        };
+        std::io::stdout()
+            .lock()
+            .write_all(&bytes)
+            .map_err(CliError::Stdout)
+    }
+
+    fn deny(raw_id: &OsString) -> Result<(), CliError> {
+        let id = raw_id
+            .to_str()
+            .ok_or(CliError::Usage)?
+            .parse::<u64>()
+            .map_err(|_| CliError::Usage)?;
+        let request = format!("DENY\tid={id}");
+        Self::expect_ok(&request)
+    }
+
+    fn lock() -> Result<(), CliError> {
+        Self::expect_ok("LOCK")
+    }
+
+    fn broker_call(request: &str) -> Result<BrokerResponse, CliError> {
+        BrokerClient::from_environment()
+            .call(request)
+            .map_err(CliError::from_client)
+    }
+
+    fn expect_ok(request: &str) -> Result<(), CliError> {
+        match Self::broker_call(request)? {
+            BrokerResponse::Ok => Ok(()),
+            BrokerResponse::Fields(_) | BrokerResponse::Bytes(_) => {
+                Err(CliError::from_client(super::ClientError::InvalidResponse))
+            }
+        }
     }
 
     fn agent_file(&self) -> PathBuf {

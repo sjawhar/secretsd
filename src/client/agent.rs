@@ -7,7 +7,7 @@ use std::process::{Command, Stdio};
 
 use zeroize::Zeroize;
 
-use super::cli::CliError;
+use super::CliError;
 use crate::secret::{SecretBytes, SecretName};
 
 /// Decrypts the unattended agent tier without connecting to `secretsd`.
@@ -41,7 +41,9 @@ impl AgentStore {
             Self::merge_first_values(&mut values, self.decrypt_all(&local)?);
         }
         let shared = self.dotfiles_dir.join("secrets.env");
-        Self::merge_first_values(&mut values, self.decrypt_all(&shared)?);
+        if shared.is_file() {
+            Self::merge_first_values(&mut values, self.decrypt_all(&shared)?);
+        }
         Ok(values)
     }
 

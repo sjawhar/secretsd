@@ -1,10 +1,6 @@
 # Secrets Session Broker (`secretsd`) — Design
 
-**Date**: 2026-07-24
-**Status**: approved design, pending implementation plan
-**Supersedes**: the touch-per-window human-tier model (see
-`docs/plans/2026-07-23-human-tier-secrets-redesign.md` for the full history of
-what was tried and why it failed).
+**Status**: current architecture
 
 ## Goal
 
@@ -20,9 +16,9 @@ secrets keep working unattended with zero interaction, exactly as today.
 2. **Cross-session grant theft by string-claiming**: a session cannot obtain
    another session's grant by claiming its session ID. Authorization requires
    an unguessable per-session token issued by trusted harness code.
-3. **Attribution**: every human-tier access is logged with session identity
-   and caller details; every hardware interaction is announced before it
-   happens.
+3. **Attribution**: every human-tier access is recorded in structured
+   journald fields with its scope and caller details. The YubiKey blink is the
+   physical prompt and its touch is the authorization.
 
 ### Accepted residual risks (stated plainly)
 
@@ -34,10 +30,10 @@ secrets keep working unattended with zero interaction, exactly as today.
   prompt-injected agents**, plus audit — not a hard security boundary. The
   hard boundary remains: no touch → no new plaintext.
 - **Touch-cache window**: the YubiKey PIV touch cache is firmware-fixed at
-  15s. Within 15s of a legitimate touch, one additional *pending, announced*
-  decrypt could complete without a distinct touch. Mitigated by single-flight
-  sequencing (below); the residual window is accepted for touch-only
-  ergonomics. The future explicit-approve mode eliminates it.
+  15s. Within 15s of a legitimate touch, one additional pending decrypt could
+  complete without a distinct touch. Mitigated by single-flight sequencing
+  (below); the residual window is accepted for touch-only ergonomics. The
+  future explicit-approve mode eliminates it.
 - **Grant lifetime and silent harness death**: once granted, a secret stays
   available to its session until the session-end event, `secrets lock`, or the
   12h backstop — including while the user is away. This is deliberate:
@@ -46,19 +42,16 @@ secrets keep working unattended with zero interaction, exactly as today.
   fallback, so its grants survive until the 12h backstop.
 - **Open registration**: the broker socket is same-UID-open, so any process
   can register a token and pose as "a session". A forged registration cannot
-  mint a grant — the touch requirement stands — but it can dress up a request
-  with misleading metadata. A same-UID "private plugin channel" would be
-  security theater (any such credential is readable by the same UID), so the
-  defense is announcement hygiene: registrant-supplied metadata is labeled
-  untrusted in announcements, and the registrant's peer PID/cmdline is
-  logged.
+  mint a grant — the touch requirement stands — but it can supply misleading
+  metadata. A same-UID "private plugin channel" would be security theater
+  (any such credential is readable by the same UID); structured journald
+  records retain kernel-derived peer attribution for after-the-fact review.
 - **Tokenless path abuse**: an agent that strips its own env can reach the
   interactive `(tty, boot-id)` flow. It still cannot get a grant without a
-  touch, and tokenless requests are loudly labeled as such in the
-  announcement — a tokenless announcement you didn't personally trigger is a
-  deny. Best-effort hardening: the plugin registers PTYs it allocates and
-  the broker rejects tokenless requests from them; ttys the plugin can't see
-  (e.g. agent-created tmux panes) remain covered only by the labeling.
+  touch, and the request's scope is recorded in journald. Best-effort
+  hardening: the plugin registers PTYs it allocates and the broker rejects
+  tokenless requests from them; ttys the plugin cannot see (for example,
+  agent-created tmux panes) remain an accepted same-UID residual.
 
 ## Non-goals
 
@@ -91,7 +84,7 @@ agent (OpenCode session)
         │     clients and `-- cmd` children necessarily receive the
         │     plaintext of keys granted to them
         ▼
-   YubiKey (touch = grant approval)  +  envoy (announcements)
+   YubiKey (blink = physical prompt; touch = grant approval)
 ```
 
 ### Components
@@ -107,6 +100,9 @@ agent (OpenCode session)
    - Input validation: key names must match `[A-Z][A-Z0-9_]*`; human-tier
      files opened via `openat` against the `secrets.human.d` directory with
      `O_NOFOLLOW`, regular files only.
+   - `SECRETSD_HUMAN_DIR` is required daemon configuration and must be set to
+     an explicit deployment-owned directory by the user service. The daemon
+     refuses to start when it is absent.
    - Restart semantics: grants are memory-only and lost on restart. This is
      the correct security default. The shim reports "broker restarted;
      re-approval required" clearly.
@@ -138,15 +134,14 @@ agent (OpenCode session)
      `denied`, or `unavailable` guidance. Never returns secret values (they
      must not enter the transcript).
 
-3. **`shims/secrets`** (modified): same CLI. The human-key set is derived
-   from `secrets.human.d/*.env` filenames: those keys **always** route
-   through the broker — a duplicate of a human key appearing in an
-   agent-tier file is a fail-closed error, never a silent broker bypass.
-   All other keys: agent tier, untouched. Human tier: connect to socket,
-   send `{key, token}`, block up to 90s for the grant flow, print the value
-   or a clear failure. The `/dev/shm` cache is deleted. No
-   client-controlled file-path overrides — test configuration uses a
-   separate broker socket/config path instead.
+3. **`secrets`** (Rust client, shipped with the daemon): preserves the CLI.
+   The human-key set is derived from `secrets.human.d/*.env` filenames: those
+   keys **always** route through the broker — a duplicate of a human key
+   appearing in an agent-tier file is a fail-closed error, never a silent
+   broker bypass. All other keys use local agent-tier sops decryption without
+   contacting the daemon. Human-tier operations connect to the socket, send
+   the session token when present, and block for the touch flow. No
+   client-controlled daemon file-path overrides exist.
 
 ### Storage: recipients are the policy
 
@@ -197,10 +192,8 @@ A grant is `(session_token, key)`, held in broker memory.
   transcripts.
 - **Tokenless requests** (the human at an interactive shell): keyed on
   `(tty, boot-id)` as the grant scope; same touch flow; revoked when the tty
-  vanishes. Tokenless requests are prominently labeled `TOKENLESS` in every
-  announcement, and are rejected outright from PTYs registered as
-  agent-session ttys. A tokenless announcement the user didn't personally
-  trigger should be denied (see residual risks).
+  vanishes. They are rejected outright from PTYs registered as agent-session
+  ttys, and their scope is retained in the journald audit event.
 - Requests from other-UID peers: rejected (socket is 0600; SO_PEERCRED
   double-checks).
 
@@ -221,28 +214,22 @@ request → pending → decrypting → granted ──(session end | lock | 12h)�
   (wipe all + revoke all), and a 12h backstop per grant.
 - Grants are never persisted. Reopening the same on-disk session re-registers
   the persisted token but starts with zero grants — the first human-tier
-  request goes through a fresh announce-and-touch. One touch to resume is
+  request goes through a fresh blink-and-touch. One touch to resume is
   deliberate: a new process is a new presence proof.
 - Plaintext lifetime = union of active grants for that key; zeroized when
   the last grant dies.
 
 ## Approval UX
 
-1. Agent requests a human-tier key (via tool or blocked shell command).
-2. Broker creates the pending request and **announces before any hardware
-   interaction**: AGENT NOTICE on the requester's stderr (agent relays
-   in-session — the primary path, since human-tier use is interactive),
-   `notify-send` locally on the laptop, envoy event
-   (`notifications.secrets.request`) → Slack as belt-and-braces. Every
-   announcement contains: the **key name**, a **broker-generated request
-   ID**, and the **verified scope type** (token-verified session vs.
-   TOKENLESS tty); registrant-supplied metadata (session ID, cmdline) is
-   included but labeled untrusted. The decrypt starts only after an
-   announcement channel acknowledges submission; if every channel fails,
-   the request stays pending (no unannounced blink) until timeout.
-3. The YubiKey blink is the approval prompt; **one touch completes the
-   grant**. `secrets deny <id>` or the 90s timeout rejects it.
-4. **Single-flight**: at most one YubiKey operation in flight; the broker
+1. Agent or interactive shell requests a human-tier key.
+2. The broker creates the pending request and starts the decrypt. The YubiKey
+   blink is the unspoofable physical prompt; no software channel or client
+   acknowledgement gates this step. The operator initiates the request, and
+   the structured journald event is the sole after-the-fact attribution when
+   asking why the key blinked.
+3. **One touch completes the grant**. `secrets deny <id>` or the 90s timeout
+   rejects it.
+4. **Single-flight**: at most one YubiKey operation is in flight; the broker
    waits out the 15s hardware touch cache before starting the next pending
    decrypt, so one touch can never approve two requests.
    Per-scope pending-request limits with backoff after deny/timeout prevent
@@ -250,7 +237,7 @@ request → pending → decrypting → granted ──(session end | lock | 12h)�
    locking out legitimate grants; `secrets deny` and `secrets lock` are
    always serviced immediately, ahead of the queue.
 5. Devbox: approval requires the YubiKey tunnel. If unreachable, fail fast
-   with "YubiKey unreachable — connect via the devbox wrapper", not a hang.
+   with "YubiKey unreachable — connect the pcscd bridge", not a hang.
 6. Repeat access within a granted session: instant, silent, no hardware
    interaction.
 
@@ -285,9 +272,8 @@ MCP: secrets_request(key)               grant flow trigger; no values returned
    devbox). Run the recipient-verification check. Confirm no human key
    also exists in an agent-tier file. `dojo/.env` is agent-tier and
    untouched — no key ceremony.
-4. Update `shims/secrets`: remove `/dev/shm` cache, add socket path +
-   human-key routing (filenames win), keep AGENT NOTICE behavior on
-   failure.
+4. Install the Rust `secrets` client and route human-key requests by filename
+   through the broker; agent-tier reads remain local and daemon-independent.
 5. Verify (section below), then remove `secrets.human.env`.
 6. sops files never merge textually (existing rule; per-key files also
    shrink conflict surface).
@@ -297,8 +283,8 @@ MCP: secrets_request(key)               grant flow trigger; no values returned
 - Agent tier unattended (must not regress):
   `ssh devbox '~/.dotfiles/shims/secrets get ANTHROPIC_API_KEY | wc -c'` — no
   interaction, no broker involvement.
-- Grant flow: from an OpenCode session, `secrets get DEEL_API_KEY` →
-  new announcement.
+- Grant flow: from an OpenCode session, `secrets get DEEL_API_KEY` → YubiKey
+  blink and touch prompt.
 - Cross-session isolation: session B requesting a key granted to session A
   gets its own pending request, never A's value.
 - Revocation: end the session → `secrets grants` empty → next request
@@ -309,7 +295,7 @@ MCP: secrets_request(key)               grant flow trigger; no values returned
 - Duplicate-key bypass: a human key planted in `secrets.env` → shim fails
   closed, never serves the agent-tier copy.
 - Token-strip: unset `SECRETSD_SESSION_TOKEN_FILE` inside an agent session
-  → request is labeled TOKENLESS (or rejected if the PTY is registered),
+  → request uses the tokenless scope (or is rejected if the PTY is registered),
   never inherits the session's grant.
 - Broker restart mid-session → clear re-approval message, no hang.
 - Recovery path unchanged: `SOPS_AGE_KEY=$(op ...) sops -d
@@ -324,5 +310,3 @@ MCP: secrets_request(key)               grant flow trigger; no values returned
 - Migrating agent-tier storage to per-key files / per-key recipient sets
   (e.g., laptop-only keys) — the "recipients are the policy" model already
   covers it; pure churn today.
-- Envoy-mediated remote approval (approve from phone/Slack when away from
-  the YubiKey) — deliberately out: touch-at-grant is the presence proof.

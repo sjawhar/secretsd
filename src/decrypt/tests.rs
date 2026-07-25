@@ -1,6 +1,8 @@
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
+use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use super::*;
@@ -65,6 +67,36 @@ fn decrypts_the_inode_validated_before_its_path_is_replaced() {
     let value = decryptor.decrypt(&store, &key).unwrap();
 
     assert_eq!(value.as_slice(), b"validated");
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn duplicate_fd_avoids_standard_descriptors_when_stdin_is_closed() {
+    if std::env::var_os("SECRETSD_TEST_CLOSE_STDIN").is_some() {
+        let directory = tempfile::tempdir().unwrap();
+        let ciphertext = directory.path().join("ciphertext.env");
+        std::fs::write(&ciphertext, b"ciphertext").unwrap();
+        let validated = std::fs::File::open(ciphertext).unwrap();
+        nix::unistd::close(0).unwrap();
+
+        let inherited = duplicate_ciphertext_fd(validated.as_raw_fd()).unwrap();
+
+        assert!(inherited.as_raw_fd() >= 3);
+        return;
+    }
+
+    let status = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "decrypt::tests::duplicate_fd_avoids_standard_descriptors_when_stdin_is_closed",
+            "--nocapture",
+        ])
+        .env("SECRETSD_TEST_CLOSE_STDIN", "1")
+        .stdin(Stdio::null())
+        .status()
+        .unwrap();
+
+    assert!(status.success());
 }
 
 #[test]

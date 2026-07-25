@@ -1,4 +1,5 @@
 #![allow(
+    clippy::redundant_pub_crate,
     clippy::unwrap_used,
     missing_docs,
     reason = "integration tests use concise setup and assertion helpers"
@@ -10,7 +11,12 @@ use std::thread;
 
 use secretsd::client::{BrokerClient, BrokerResponse, ClientError, SocketPath, parse_response};
 
+#[path = "client/broker.rs"]
+mod fake_broker;
+use fake_broker::{FakeBroker, Reply};
 include!("client/fixture.rs");
+#[path = "client/broker_transport.rs"]
+mod broker_transport;
 
 #[test]
 fn exact_payload_accepts_declared_non_nul_bytes() {
@@ -156,7 +162,11 @@ fn duplicate_agent_and_human_name_fails_closed_before_output() {
     let fixture = Fixture::agent("DUP=agent-value\n");
     fixture.write_human_name("DUP");
 
-    for arguments in [["get", "DUP"].as_slice(), ["list"].as_slice()] {
+    for arguments in [
+        ["get", "DUP"].as_slice(),
+        ["list"].as_slice(),
+        ["DUP", "--", "true"].as_slice(),
+    ] {
         let output = fixture.run_minimal(arguments);
 
         assert_ne!(output.status.code(), Some(0));

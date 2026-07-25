@@ -3,17 +3,24 @@
 use std::io::{IsTerminal, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+use zeroize::Zeroize;
 
 use crate::proto::{MAX_FRAME_BYTES, PROTOCOL_VERSION};
 
+const GET_TIMEOUT: Duration = Duration::from_secs(100);
+const CONTROL_TIMEOUT: Duration = Duration::from_secs(5);
+
 mod agent;
 pub mod cli;
+mod error;
 mod human;
 mod response;
 
 pub use agent::AgentStore;
-pub use cli::CliError;
-pub use human::HumanNames;
+pub use error::CliError;
+pub use human::{HumanClient, HumanNames};
 pub use response::{BrokerResponse, ClientError, parse_response};
 
 /// A lazily resolved path to the broker's Unix socket.
@@ -46,14 +53,47 @@ impl AsRef<Path> for SocketPath {
 #[derive(Debug, Clone)]
 pub struct BrokerClient {
     socket_path: PathBuf,
+    get_timeout: Duration,
+    control_timeout: Duration,
 }
 
 impl BrokerClient {
     /// Build a client connected to `socket_path` on demand.
     pub fn new(socket_path: impl AsRef<Path>) -> Self {
+        Self::with_timeouts(socket_path, GET_TIMEOUT, CONTROL_TIMEOUT)
+    }
+
+    fn with_timeouts(
+        socket_path: impl AsRef<Path>,
+        get_timeout: Duration,
+        control_timeout: Duration,
+    ) -> Self {
         Self {
             socket_path: socket_path.as_ref().to_path_buf(),
+            get_timeout,
+            control_timeout,
         }
+    }
+
+    #[cfg(test)]
+    fn with_test_timeouts(
+        socket_path: impl AsRef<Path>,
+        get_timeout: Duration,
+        control_timeout: Duration,
+    ) -> Self {
+        Self::with_timeouts(socket_path, get_timeout, control_timeout)
+    }
+
+    /// Resolve the broker socket only when a broker operation is requested.
+    pub fn from_environment() -> Self {
+        let socket_override = std::env::var("SECRETSD_SOCK").ok();
+        let runtime_directory = std::env::var("XDG_RUNTIME_DIR").ok();
+        let socket_path = SocketPath::resolve(
+            socket_override.as_deref(),
+            runtime_directory.as_deref(),
+            nix::unistd::getuid().as_raw(),
+        );
+        Self::new(socket_path)
     }
 
     /// Verify that the connected broker speaks exactly this protocol version.
@@ -77,6 +117,17 @@ impl BrokerClient {
 
     fn request(&self, request: &str) -> Result<BrokerResponse, ClientError> {
         let mut stream = UnixStream::connect(&self.socket_path).map_err(ClientError::Io)?;
+        let timeout = if request.starts_with("GET\t") {
+            self.get_timeout
+        } else {
+            self.control_timeout
+        };
+        stream
+            .set_read_timeout(Some(timeout))
+            .map_err(ClientError::Io)?;
+        stream
+            .set_write_timeout(Some(timeout))
+            .map_err(ClientError::Io)?;
         write_request(&mut stream, request)?;
         response::read_response(stream)
     }
@@ -98,8 +149,14 @@ fn write_request(stream: &mut UnixStream, request: &str) -> Result<(), ClientErr
 
 /// Read a session token from an inherited token file without exposing its bytes in errors.
 pub fn read_token_file(path: impl AsRef<Path>) -> Result<String, ClientError> {
-    let bytes = std::fs::read(path).map_err(|_| ClientError::TokenFile)?;
-    String::from_utf8(bytes).map_err(|_| ClientError::TokenFile)
+    let mut bytes = std::fs::read(path).map_err(|_| ClientError::TokenFile)?;
+    let token = std::str::from_utf8(&bytes)
+        .ok()
+        .filter(|value| !value.is_empty() && value.trim() == *value)
+        .map(ToOwned::to_owned)
+        .ok_or(ClientError::TokenFile);
+    bytes.zeroize();
+    token
 }
 
 /// Return the caller's terminal path when standard input is an interactive Unix terminal.
@@ -111,3 +168,6 @@ pub fn caller_tty() -> Option<String> {
     let text = path.into_os_string().into_string().ok()?;
     text.starts_with("/dev/").then_some(text)
 }
+
+#[cfg(test)]
+mod tests;

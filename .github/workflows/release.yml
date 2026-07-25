@@ -18,10 +18,29 @@ jobs:
           set -euo pipefail
           tag="${GITHUB_REF_NAME}"
           staging="secretsd-${tag}-linux-x86_64"
-          mkdir -p "$staging/systemd"
-          cp target/release/secretsd "$staging/"
-          cp systemd/* "$staging/systemd/"
+          mkdir -p "$staging/bin" "$staging/share/secretsd/opencode/plugins" "$staging/systemd"
+          install -m 0755 target/release/secretsd "$staging/bin/secretsd"
+          install -m 0755 target/release/secrets "$staging/bin/secrets"
+          install -m 0644 opencode/plugins/secretsd.ts "$staging/share/secretsd/opencode/plugins/secretsd.ts"
+          install -m 0644 systemd/secretsd.service "$staging/systemd/secretsd.service"
+          install -m 0644 systemd/secretsd.socket "$staging/systemd/secretsd.socket"
           tar czf "${staging}.tar.gz" "$staging"
+      - name: Verify release archive
+        run: |
+          set -euo pipefail
+          staging="secretsd-${GITHUB_REF_NAME}-linux-x86_64"
+          archive="${staging}.tar.gz"
+          for artifact in \
+            "$staging/bin/secretsd" \
+            "$staging/bin/secrets" \
+            "$staging/share/secretsd/opencode/plugins/secretsd.ts" \
+            "$staging/systemd/secretsd.service" \
+            "$staging/systemd/secretsd.socket"; do
+            if ! tar --list --gzip --file="$archive" | grep --fixed-strings --line-regexp -- "$artifact" >/dev/null; then
+              printf 'release archive is missing required artifact: %s\n' "$artifact" >&2
+              exit 1
+            fi
+          done
       - uses: softprops/action-gh-release@v2
         with:
           files: secretsd-*-linux-x86_64.tar.gz

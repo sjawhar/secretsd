@@ -1,7 +1,8 @@
 # Dotfiles cutover contract
 
 This package owns generic user units. The consuming dotfiles own every
-machine-specific path and hardware connection in a systemd drop-in.
+machine-specific secret-store path and hardware connection in a systemd
+drop-in.
 
 ## Deployment drop-in
 
@@ -18,14 +19,16 @@ Environment=PATH=/home/alice/.local/bin:/home/alice/.local/share/mise/installs/a
 ```
 
 Replace every example path with the path on that machine before starting the
-service. All values must be absolute: systemd does not run an interactive
-shell for user services, so `~`, `$HOME`, command substitutions, and version
-placeholders are not deployment configuration. On a machine with a directly
-attached YubiKey, omit `PCSCLITE_CSOCK_NAME`; on a headless devbox, set it to
-the absolute path of the pcscd bridge socket.
+service. `SECRETSD_HUMAN_DIR` is mandatory: the daemon refuses to start if it
+is absent or empty, preventing an accidental fallback to another user's
+secret directory. All deployment values must be absolute: systemd does not run
+an interactive shell for user services, so `~`, `$HOME`, command
+substitutions, and version placeholders are not deployment configuration. On
+a machine with a directly attached YubiKey, omit `PCSCLITE_CSOCK_NAME`; on a
+headless devbox, set it to the absolute path of the pcscd bridge socket.
 
 `SECRETSD_SOPS_BIN` must name the real `sops` executable, not a mise shim.
-Likewise, the `PATH` value must contain the directory holding the real
+Likewise, `PATH` must include the absolute directory holding the real
 `age-plugin-yubikey` executable. A systemd user service starts with a minimal
 PATH, and a mise shim re-executes `mise`; neither assumption is safe for the
 daemon. Use `mise which sops` to obtain the resolved executable path and
@@ -68,16 +71,36 @@ systemctl --user enable --now secretsd.socket
 
 `secretsd.socket` listens at `%t/secretsd.sock` (`%t` is
 `XDG_RUNTIME_DIR`). On the first client connection, systemd starts
-`secretsd.service` and passes it the listening socket. The service's packaged
-PATH has the release default `%h/.local/bin`; all additions required by a
-specific deployment belong in the drop-in above.
+`secretsd.service` and passes it the listening socket. The packaged service
+uses an absolute release-owned executable path, `%h/.local/bin/secretsd`; its
+child `PATH` is only for `sops` and `age-plugin-yubikey` and never resolves
+`ExecStart`.
+
+## Release archive layout
+
+Each Linux release archive has one top-level `secretsd-<tag>-linux-x86_64/`
+directory with this installation layout:
+
+```
+bin/secretsd
+bin/secrets
+share/secretsd/opencode/plugins/secretsd.ts
+systemd/secretsd.service
+systemd/secretsd.socket
+```
+
+Install the two `bin/` files as executable `~/.local/bin/secretsd` and
+`~/.local/bin/secrets`, install the plugin at
+`~/.local/share/secretsd/opencode/plugins/secretsd.ts`, and install both unit
+files for the user service manager. The plugin has no release-local imports;
+the OpenCode loader supplies `@opencode-ai/plugin`.
 
 ## Consuming-dotfiles changes
 
 The consuming dotfiles must:
 
-1. Pin the released `secretsd` version in `mise.toml` and expose
-   `~/.local/bin/secretsd`, `~/.local/bin/secrets`, and
+1. Pin the released `secretsd` version in `mise.toml` and install the archive
+   layout so it exposes `~/.local/bin/secretsd`, `~/.local/bin/secrets`, and
    `~/.local/share/secretsd/opencode/plugins/secretsd.ts`.
 2. Point the OpenCode plugin entry at
    `file://{env:HOME}/.local/share/secretsd/opencode/plugins/secretsd.ts`.

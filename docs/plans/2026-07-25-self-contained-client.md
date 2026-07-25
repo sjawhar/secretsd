@@ -276,7 +276,8 @@ Delete the other renderer and delivery tests with their module; do not preserve 
 
 Run: `cargo nextest run --test broker request_without_a_notifier_reaches_the_hardware_gate`
 
-Expected: FAIL on the current implementation because its announcement gate suppresses fake sops when no delivery command is configured.
+Expected: the regression proves that missing delivery configuration never
+suppresses the hardware prompt.
 
 - [ ] **Step 3: Delete the gate instead of substituting another precondition**
 
@@ -555,7 +556,9 @@ Expected: plugin tests retain every existing token lifecycle, reconnect, error m
 - Create: `docs/dotfiles-cutover.md`
 
 **Interfaces:**
-- Package service resolves `secretsd` through its service `PATH`; all deployment-specific configuration belongs in consumer-owned `secretsd.service.d/*.conf` drop-ins.
+- The packaged service invokes `%h/.local/bin/secretsd` through an absolute
+  `ExecStart`; deployment-specific configuration belongs in consumer-owned
+  `secretsd.service.d/*.conf` drop-ins.
 - The package contains no software announcement or agent-transport configuration; a human-tier request reaches the hardware touch flow on every supported machine.
 
 - [ ] **Step 1: Replace the service unit with this complete portable content**
@@ -570,8 +573,12 @@ After=secretsd.socket
 
 [Service]
 Type=simple
+# `%h` expands to an absolute path before execution; `Environment=PATH` does
+# not resolve `ExecStart`.
+ExecStart=%h/.local/bin/secretsd
 Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin
-ExecStart=secretsd
+# A deployment drop-in must replace this empty value with an absolute directory.
+Environment=SECRETSD_HUMAN_DIR=
 LimitMEMLOCK=infinity
 LimitCORE=0
 Restart=on-failure
@@ -604,7 +611,7 @@ WantedBy=sockets.target
 
 - [ ] **Step 2: Validate the packaged units**
 
-Run: `systemd-analyze verify systemd/secretsd.service systemd/secretsd.socket && ! grep -R --line-number --fixed-strings '.dotfiles' systemd`
+Run: `systemd-analyze --user verify systemd/secretsd.service systemd/secretsd.socket && ! grep -R --line-number --fixed-strings '.dotfiles' systemd`
 
 Expected: `systemd-analyze` and the negative search exit 0 with no matching output.
 
@@ -615,7 +622,9 @@ Document this exact drop-in example, owned by dotfiles rather than this package:
 ```ini
 # ~/.config/systemd/user/secretsd.service.d/deployment.conf
 [Service]
-Environment=SECRETSD_HUMAN_DIR=%h/.dotfiles/secrets.human.d
+Environment=SECRETSD_HUMAN_DIR=/home/alice/.config/secretsd/secrets.human.d
+Environment=SECRETSD_SOPS_BIN=/home/alice/.local/share/mise/installs/sops/3.10.2/sops
+Environment=PATH=/home/alice/.local/bin:/home/alice/.local/share/mise/installs/age-plugin-yubikey/0.5.0:/usr/local/bin:/usr/bin
 Environment=PCSCLITE_CSOCK_NAME=/run/user/1000/pcscd.comm
 ```
 
@@ -631,7 +640,7 @@ State explicitly that a headless devbox follows the same direct hardware-touch f
 
 - [ ] **Step 4: Run packaging/document checks**
 
-Run: `systemd-analyze verify systemd/secretsd.service systemd/secretsd.socket && cargo +nightly fmt --all -- --check`
+Run: `systemd-analyze --user verify systemd/secretsd.service systemd/secretsd.socket && cargo +nightly fmt --all -- --check`
 
 Expected: unit syntax is valid and Rust formatting remains clean; no command decrypts a file under `secrets.human.d`.
 

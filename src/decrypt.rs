@@ -1,7 +1,7 @@
 //! Running sops to decrypt one key.
 
 use std::io::Read;
-use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -20,6 +20,14 @@ use crate::store::HumanStore;
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 const MAX_SOPS_STDERR_BYTES: u64 = 300;
 const YUBIKEY_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+
+fn duplicate_ciphertext_fd(validated_raw_fd: RawFd) -> Result<std::fs::File, ErrCode> {
+    let inherited_raw_fd =
+        fcntl(validated_raw_fd, FcntlArg::F_DUPFD(3)).map_err(|_| ErrCode::Internal)?;
+    // SAFETY: `F_DUPFD` returned a fresh non-CLOEXEC descriptor with a unique close-on-drop
+    // obligation, which this `File` assumes and discharges.
+    Ok(unsafe { std::fs::File::from_raw_fd(inherited_raw_fd) })
+}
 
 /// A bounded command that verifies a PC/SC bridge reaches the `YubiKey`.
 #[derive(Debug, Clone)]
@@ -153,11 +161,7 @@ impl Decryptor {
             return Err(ErrCode::YubikeyUnreachable);
         }
         let validated = store.open(key)?;
-        let inherited_raw_fd =
-            fcntl(validated.as_raw_fd(), FcntlArg::F_DUPFD(0)).map_err(|_| ErrCode::Internal)?;
-        // SAFETY: `F_DUPFD` returned a fresh non-CLOEXEC descriptor owned solely by this call.
-        // `File` assumes and discharges that one close-on-drop obligation.
-        let inherited = unsafe { std::fs::File::from_raw_fd(inherited_raw_fd) };
+        let inherited = duplicate_ciphertext_fd(validated.as_raw_fd())?;
         let fd_path = format!("/proc/self/fd/{}", inherited.as_raw_fd());
         let mut child = Command::new(&self.sops_bin)
             .arg("-d")
