@@ -163,7 +163,13 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add Cargo.toml Cargo.lock package.json
-          git commit -m "chore: release v${VERSION} [skip ci]"
+          # The first release takes its version from Cargo.toml, so the files can
+          # already be at VERSION and there is nothing to commit. Tag either way.
+          if git diff --cached --quiet; then
+            echo "version files already at v${VERSION}; tagging without a bump commit"
+          else
+            git commit -m "chore: release v${VERSION} [skip ci]"
+          fi
           git tag "v${VERSION}"
           git push origin main --tags
 
