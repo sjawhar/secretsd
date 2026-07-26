@@ -1,7 +1,8 @@
-name: release
+name: Release
+
 on:
   push:
-    tags: ["v*"]
+    branches: [main]
 
 permissions:
   contents: write
@@ -11,28 +12,111 @@ permissions:
   id-token: write
   attestations: write
 
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
-  release:
+  version:
+    name: Determine Version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.bump.outputs.version }}
+      should_release: ${{ steps.bump.outputs.should_release }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Determine version bump
+        id: bump
+        run: |
+          LATEST_TAG=$(git tag -l 'v*' --sort=-v:refname | head -1)
+
+          if [ -z "$LATEST_TAG" ]; then
+            # No tags yet — the first release uses the version already in Cargo.toml.
+            VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+            echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+            echo "should_release=true" >> "$GITHUB_OUTPUT"
+            echo "First release: v$VERSION"
+            exit 0
+          fi
+
+          COMMITS=$(git log "${LATEST_TAG}..HEAD" --format='%s')
+
+          if [ -z "$COMMITS" ]; then
+            echo "should_release=false" >> "$GITHUB_OUTPUT"
+            echo "No commits since $LATEST_TAG"
+            exit 0
+          fi
+
+          MAJOR=false
+          MINOR=false
+          PATCH=false
+
+          while IFS= read -r msg; do
+            if echo "$msg" | grep -qE '^[a-z]+(\(.+\))?!:' || echo "$msg" | grep -q 'BREAKING CHANGE'; then
+              MAJOR=true
+            elif echo "$msg" | grep -qE '^feat(\(.+\))?:'; then
+              MINOR=true
+            elif echo "$msg" | grep -qE '^fix(\(.+\))?:'; then
+              PATCH=true
+            fi
+          done <<< "$COMMITS"
+
+          if ! $MAJOR && ! $MINOR && ! $PATCH; then
+            echo "should_release=false" >> "$GITHUB_OUTPUT"
+            echo "No version-bumping commits since $LATEST_TAG"
+            exit 0
+          fi
+
+          CURRENT="${LATEST_TAG#v}"
+          IFS='.' read -r major minor patch <<< "$CURRENT"
+
+          if $MAJOR; then
+            major=$((major + 1)); minor=0; patch=0
+          elif $MINOR; then
+            minor=$((minor + 1)); patch=0
+          else
+            patch=$((patch + 1))
+          fi
+
+          VERSION="${major}.${minor}.${patch}"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "should_release=true" >> "$GITHUB_OUTPUT"
+          echo "Bumping $CURRENT → $VERSION"
+
+  build:
+    name: Build
+    needs: version
+    if: needs.version.outputs.should_release == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo build --release --locked
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-x86_64
+
+      - name: Set release version
+        run: sed -i '0,/^version = ".*"/s//version = "${{ needs.version.outputs.version }}"/' Cargo.toml
+
+      - run: cargo build --release
+
       - name: Package
         run: |
           set -euo pipefail
-          tag="${GITHUB_REF_NAME}"
-          staging="secretsd-${tag}-linux-x86_64"
+          staging="secretsd-v${{ needs.version.outputs.version }}-linux-x86_64"
           mkdir -p "$staging/bin" "$staging/share/secretsd/opencode/plugins" "$staging/systemd"
           install -m 0755 target/release/secrets "$staging/bin/secrets"
           install -m 0644 opencode/plugins/secretsd.ts "$staging/share/secretsd/opencode/plugins/secretsd.ts"
           install -m 0644 systemd/secretsd.service "$staging/systemd/secretsd.service"
           install -m 0644 systemd/secretsd.socket "$staging/systemd/secretsd.socket"
           tar czf "${staging}.tar.gz" "$staging"
+
       - name: Verify release archive
         run: |
           set -euo pipefail
-          staging="secretsd-${GITHUB_REF_NAME}-linux-x86_64"
+          staging="secretsd-v${{ needs.version.outputs.version }}-linux-x86_64"
           archive="${staging}.tar.gz"
           for artifact in \
             "$staging/bin/secrets" \
@@ -44,9 +128,64 @@ jobs:
               exit 1
             fi
           done
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: secretsd-linux-x86_64
+          path: secretsd-*-linux-x86_64.tar.gz
+
+  release:
+    name: Create Release
+    needs: [version, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ssh-key: ${{ secrets.DEPLOY_KEY }}
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Bump version in repo
+        run: |
+          set -euo pipefail
+          VERSION="${{ needs.version.outputs.version }}"
+          # The plugin speaks a versioned protocol to the binary, so both carry
+          # the same version and are released together.
+          sed -i '0,/^version = ".*"/s//version = "'"$VERSION"'"/' Cargo.toml
+          sed -i '0,/"version": ".*"/s//"version": "'"$VERSION"'"/' package.json
+          cargo update --workspace
+
+      - name: Commit and tag
+        run: |
+          set -euo pipefail
+          VERSION="${{ needs.version.outputs.version }}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Cargo.toml Cargo.lock package.json
+          git commit -m "chore: release v${VERSION} [skip ci]"
+          git tag "v${VERSION}"
+          git push origin main --tags
+
+      - uses: actions/download-artifact@v4
+
+      - name: Generate checksums
+        run: |
+          set -euo pipefail
+          (cd secretsd-linux-x86_64 && sha256sum ./*.tar.gz > ../SHA256SUMS)
+
       - uses: actions/attest-build-provenance@v2
         with:
-          subject-path: secretsd-*-linux-x86_64.tar.gz
-      - uses: softprops/action-gh-release@v2
-        with:
-          files: secretsd-*-linux-x86_64.tar.gz
+          subject-path: secretsd-linux-x86_64/secretsd-*-linux-x86_64.tar.gz
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          VERSION="${{ needs.version.outputs.version }}"
+          gh release create "v${VERSION}" \
+            --title "v${VERSION}" \
+            --generate-notes \
+            secretsd-linux-x86_64/secretsd-*-linux-x86_64.tar.gz \
+            SHA256SUMS
