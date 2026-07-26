@@ -114,7 +114,7 @@ const fn broker_guidance(code: ErrCode) -> &'static str {
             "this client requested an unsupported operation; the human should update the client and daemon together."
         }
         ErrCode::VersionMismatch => {
-            "the client and daemon speak different protocol versions; ask the human to run the secretsd installer, which replaces the binary and restarts the daemon, and then to restart OpenCode so its plugin matches."
+            "the client and daemon speak different protocol versions; ask the human to move both halves to the same release -- the `secrets` binary and the tag OpenCode pins for its plugin -- then restart the daemon with `systemctl --user restart secretsd.service` and restart OpenCode. Restarting OpenCode while its plugin pin still names the old tag re-fetches the same mismatched plugin, so updating only one half leaves this error in place."
         }
         ErrCode::UnknownToken => {
             "the broker restarted, losing this session's registration and every grant. The OpenCode plugin re-registers on the next command, so run this command once more -- once, not in a loop -- and expect the human's key to blink, because the first request after a restart needs a fresh touch."
