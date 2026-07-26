@@ -38,8 +38,6 @@ pub enum CliError {
     Exec(std::io::Error),
     /// Writing command output to standard output failed.
     Stdout(std::io::Error),
-    /// Writing command guidance to standard error failed.
-    Stderr(std::io::Error),
 }
 
 impl CliError {
@@ -82,7 +80,6 @@ impl fmt::Display for CliError {
             Self::BrokerTransport(error) => write!(formatter, "{AGENT_NOTICE} {error}"),
             Self::Exec(error) => write!(formatter, "could not execute command: {error}"),
             Self::Stdout(error) => write!(formatter, "could not write secret value: {error}"),
-            Self::Stderr(error) => write!(formatter, "could not write command guidance: {error}"),
         }
     }
 }
@@ -94,8 +91,7 @@ impl std::error::Error for CliError {
             | Self::AgentKeySet(error)
             | Self::HumanDirectory(error)
             | Self::Exec(error)
-            | Self::Stdout(error)
-            | Self::Stderr(error) => Some(error),
+            | Self::Stdout(error) => Some(error),
             Self::BrokerTransport(error) => Some(error),
             Self::Usage
             | Self::InvalidSecretName

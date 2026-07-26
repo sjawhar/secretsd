@@ -253,7 +253,8 @@ needs, so PIN+touch (`pin-policy` change) becomes possible per-key.
 
 ```
 secrets get KEY                        pre-authorizes: asks the broker for a grant
-                                       (touch if none is live) and prints status only
+                                       (touch if none is live) and prints one JSON
+                                       status object, nothing else
 secrets get KEY --value                prints the secret; the only form that does
 secrets get KEY --no-request           status without asking, so it never triggers a touch
 secrets KEY -- cmd                     injects into a child environment, never prints

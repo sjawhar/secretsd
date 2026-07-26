@@ -120,7 +120,10 @@ fn get_with_no_request_lists_grants_without_sending_get() {
     );
 
     assert_eq!(output.status.code(), Some(0));
-    assert_eq!(output.stdout, b"HUMAN  human tier  grant: inactive\n");
+    assert_eq!(
+        output.stdout,
+        b"{\"key\":\"HUMAN\",\"tier\":\"human\",\"grant\":false}\n"
+    );
     assert_eq!(fixture.sops_calls(), 0);
     assert_eq!(broker.frames(), ["HELLO\tversion=1", "GRANTS"]);
 }
@@ -143,7 +146,10 @@ fn get_with_no_request_reports_an_active_session_grant() {
     );
 
     assert_eq!(output.status.code(), Some(0));
-    assert_eq!(output.stdout, b"HUMAN  human tier  grant: active\n");
+    assert_eq!(
+        output.stdout,
+        b"{\"key\":\"HUMAN\",\"tier\":\"human\",\"grant\":true}\n"
+    );
     assert_eq!(broker.frames(), ["HELLO\tversion=1", "GRANTS"]);
 }
 
@@ -256,7 +262,10 @@ fn bare_human_get_requests_a_grant_without_receiving_the_value() {
     let output = fixture.run_broker(["get", "HUMAN"], broker.socket(), Some(&token_file), None);
 
     assert_eq!(output.status.code(), Some(0));
-    assert_eq!(output.stdout, b"HUMAN  human tier  grant: active\n");
+    assert_eq!(
+        output.stdout,
+        b"{\"key\":\"HUMAN\",\"tier\":\"human\",\"grant\":true}\n"
+    );
     assert_eq!(
         broker.frames(),
         ["HELLO\tversion=1", "REQUEST\tkey=HUMAN\ttoken=<redacted>"]

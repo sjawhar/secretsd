@@ -37,20 +37,16 @@ pub(super) fn get_arguments(arguments: &[OsString]) -> Result<(&OsString, GetOut
 
 pub(super) fn write_status(name: &SecretName, status: TierStatus) -> Result<(), CliError> {
     let mut stdout = std::io::stdout().lock();
+    // A key name is validated as [A-Za-z_][A-Za-z0-9_]*, so it needs no escaping.
     match status {
-        TierStatus::Agent => writeln!(stdout, "{}  agent tier", name.as_str()),
-        TierStatus::Human { grant_active } => {
-            let grant = if grant_active { "active" } else { "inactive" };
-            writeln!(stdout, "{}  human tier  grant: {grant}", name.as_str())
-        }
+        TierStatus::Agent => writeln!(stdout, r#"{{"key":"{}","tier":"agent"}}"#, name.as_str()),
+        TierStatus::Human { grant_active } => writeln!(
+            stdout,
+            r#"{{"key":"{}","tier":"human","grant":{grant_active}}}"#,
+            name.as_str()
+        ),
     }
-    .map_err(CliError::Stdout)?;
-
-    writeln!(
-        std::io::stderr().lock(),
-        "Use --value to print the secret, secrets KEY -- command to inject it into a child process, or --no-request to check status without asking for approval."
-    )
-    .map_err(CliError::Stderr)
+    .map_err(CliError::Stdout)
 }
 
 #[derive(Clone, Copy)]
