@@ -135,7 +135,7 @@ fn record_frame(
 
     let mut stream = reader.into_inner();
     match reply {
-        Reply::Hello => stream.write_all(b"OK\tversion=1\n").unwrap(),
+        Reply::Hello => stream.write_all(b"OK\tversion=2\n").unwrap(),
         Reply::Ok => stream.write_all(b"OK\n").unwrap(),
         Reply::Bytes(bytes) => {
             let header = format!("OK\tlen={}\n", bytes.len());

@@ -67,8 +67,9 @@ up front, without printing anything, and everything afterwards just works.
 
 ## When it refuses
 
-Errors start with `AGENT NOTICE: ask the human; do not retry-loop.` Take that literally:
-re-running will not help, and repeated attempts make the human's key blink repeatedly.
+Errors start with `AGENT NOTICE: ask the human; do not retry-loop.` Take that literally: with
+one exception (`the broker restarted`, below), re-running will not help, and repeated attempts
+make the human's key blink repeatedly.
 
 | Message contains | Means | Do |
 |---|---|---|
@@ -77,10 +78,11 @@ re-running will not help, and repeated attempts make the human's key blink repea
 | `outside that session's process tree` | the token came from elsewhere | run the request from this session |
 | `failure to spawn sops` | decryption failed, usually a missed touch | tell the human; ask them to touch the key |
 | `secret 'X' not found` | the key genuinely is not configured | ask the human to add it; do not invent a value |
+| `the broker restarted` | the daemon restarted, so its registrations and grants are gone | run the command **once** more: the plugin re-registers between commands. Expect a touch. If it fails twice, tell the human |
 
 ## Never
 
 - Never paste a secret's value into a message, a commit, a log, or a file.
 - Never write a secret into a script, a `.env`, or a shell history line.
 - Never conclude a key is wrong from `secrets get` output — that output is status, not the key.
-- Never retry after an `AGENT NOTICE`; ask the human.
+- Never retry after an `AGENT NOTICE`, with one exception: `the broker restarted` clears itself once the plugin re-registers, so run that command **once** more. Never loop.

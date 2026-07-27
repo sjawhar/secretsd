@@ -153,17 +153,25 @@ fn register(
         Ok(token) => {
             let (mutex, condvar) = &**shared;
             let mut state = lock_state(mutex);
-            let displaced = state.registry.register(crate::grants::Registration {
+            let registered = state.registry.register(crate::grants::Registration {
                 token,
                 session: session.to_owned(),
                 root,
             });
-            state.grants.revoke_tokens(&displaced);
-            drop(state);
-            condvar.notify_all();
-            Decision {
-                outcome: Outcome::Ok,
-                scope_kind: Some(ScopeKind::VerifiedSession),
+            match registered {
+                Ok(displaced) => {
+                    state.grants.revoke_tokens(&displaced);
+                    drop(state);
+                    condvar.notify_all();
+                    Decision {
+                        outcome: Outcome::Ok,
+                        scope_kind: Some(ScopeKind::VerifiedSession),
+                    }
+                }
+                Err(error) => Decision {
+                    outcome: Outcome::Failed(error, "token is already bound to another session"),
+                    scope_kind: None,
+                },
             }
         }
         Err(error) => Decision {
@@ -240,7 +248,11 @@ pub(super) fn dispatch(
     match request {
         Request::Hello { version } => Decision {
             outcome: if version == PROTOCOL_VERSION {
-                Outcome::Fields(format!("version={PROTOCOL_VERSION}"))
+                // Reported so a harness can tell "same daemon" from "restarted
+                // daemon" and re-register before its requests start failing.
+                let (mutex, _) = &**shared;
+                let instance = lock_state(mutex).instance.clone();
+                Outcome::Fields(format!("version={PROTOCOL_VERSION} instance={instance}"))
             } else {
                 Outcome::Failed(ErrCode::VersionMismatch, "unsupported protocol version")
             },

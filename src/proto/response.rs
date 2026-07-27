@@ -6,7 +6,11 @@ use super::ErrCode;
 pub enum Response<'a> {
     /// Success, no payload.
     Ok,
-    /// Success with tab-separated `k=v` fields.
+    /// Success with space-separated `k=v` fields.
+    ///
+    /// Space, not tab: `sanitize` collapses tabs so that a value can never
+    /// inject an extra field, which also makes tab unusable as the separator.
+    /// Field values must therefore not contain spaces.
     OkFields(&'a str),
     /// Success followed by exactly this many raw payload bytes.
     OkBytes(usize),

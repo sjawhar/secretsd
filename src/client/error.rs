@@ -114,10 +114,10 @@ const fn broker_guidance(code: ErrCode) -> &'static str {
             "this client requested an unsupported operation; the human should update the client and daemon together."
         }
         ErrCode::VersionMismatch => {
-            "the client and daemon versions differ; the human should update and restart both."
+            "the client and daemon speak different protocol versions; ask the human to run the secretsd installer, which replaces the binary and restarts the daemon, and then to restart OpenCode so its plugin matches."
         }
         ErrCode::UnknownToken => {
-            "the broker restarted or lost this session; ask the human to re-approve after the OpenCode token path re-registers."
+            "the broker restarted, losing this session's registration and every grant. The OpenCode plugin re-registers on the next command, so run this command once more -- once, not in a loop -- and expect the human's key to blink, because the first request after a restart needs a fresh touch."
         }
         ErrCode::NoScope => {
             "there is neither a terminal tty nor a session token. This is what non-interactive ssh host 'secrets get KEY' produces; run from a human terminal with a tty or use the OpenCode token path."

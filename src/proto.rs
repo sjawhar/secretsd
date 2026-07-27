@@ -1,11 +1,11 @@
-//! Wire protocol v1: line-oriented, tab-separated, ASCII.
+//! Wire protocol v2: line-oriented, tab-separated, ASCII.
 //!
 //! Hand-rolled deliberately. Secret plaintext is written straight from a
 //! zeroizing buffer to the socket and never passes through a serializer whose
 //! internal buffers we cannot wipe.
 
 /// Protocol version. A mismatch is a hard error, never a downgrade.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// Maximum accepted request frame. Requests never carry secret values.
 pub const MAX_FRAME_BYTES: usize = 4096;

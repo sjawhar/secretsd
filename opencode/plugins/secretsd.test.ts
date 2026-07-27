@@ -174,7 +174,7 @@ function fakeBroker(socketPath: string) {
           const line = buffered.slice(0, newline);
           buffered = buffered.slice(newline + 1);
           received.push(line);
-          socket.write(line === "HELLO\tversion=1" ? "OK\tversion=1\n" : "OK\n");
+          socket.write(line === "HELLO\tversion=2" ? "OK\tversion=2 instance=test-instance\n" : "OK\n");
         }
       },
     },
@@ -208,9 +208,13 @@ test("shell.env registers a new session once before injecting its token-file pat
   await plugin.hooks["shell.env"]({ sessionID: "session-restart" }, firstOutput);
   await plugin.hooks["shell.env"]({ sessionID: "session-restart" }, secondOutput);
 
+  // The trailing HELLO is the restart probe: the second call already believed
+  // this session was registered, so it asks which daemon is answering before
+  // trusting that belief. It still registers only once.
   expect(redactFrames(broker.received)).toEqual([
-    "HELLO\tversion=1",
+    "HELLO\tversion=2",
     "REGISTER\ttoken=<TOKEN>\tsession=session-restart\tpid=77",
+    "HELLO\tversion=2",
   ]);
   expect(firstOutput.env.SECRETSD_SESSION_TOKEN_FILE).toBe(join(runtimeDir, "secretsd", "session-restart.token"));
   expect(secondOutput.env.SECRETSD_SESSION_TOKEN_FILE).toBe(join(runtimeDir, "secretsd", "session-restart.token"));
@@ -227,9 +231,9 @@ test("dispose unregisters every live session and removes its token file", async 
   await plugin.hooks.dispose();
 
   expect(redactFrames(broker.received)).toEqual([
-    "HELLO\tversion=1",
+    "HELLO\tversion=2",
     "REGISTER\ttoken=<TOKEN>\tsession=session-dispose\tpid=88",
-    "HELLO\tversion=1",
+    "HELLO\tversion=2",
     "UNREGISTER\tsession=session-dispose",
   ]);
   expect(existsSync(join(runtimeDir, "secretsd", "session-dispose.token"))).toBe(false);
@@ -256,8 +260,8 @@ test("re-registers once after UNKNOWN_TOKEN and returns value-free granted guida
           const line = buffered.slice(0, newline);
           buffered = buffered.slice(newline + 1);
           received.push(line);
-          if (line === "HELLO\tversion=1") {
-            socket.write("OK\tversion=1\n");
+          if (line === "HELLO\tversion=2") {
+            socket.write("OK\tversion=2 instance=test-instance\n");
           } else if (line.startsWith("REGISTER\t")) {
             registrations += 1;
             socket.write("OK\n");
@@ -283,13 +287,13 @@ test("re-registers once after UNKNOWN_TOKEN and returns value-free granted guida
   expect(/[0-9a-f]{64}/.test(result)).toBe(false);
   expect(result.includes("synthetic-secret-value")).toBe(false);
   expect(redactFrames(received)).toEqual([
-    "HELLO\tversion=1",
+    "HELLO\tversion=2",
     "REGISTER\ttoken=<TOKEN>\tsession=session-d\tpid=99",
-    "HELLO\tversion=1",
+    "HELLO\tversion=2",
     "REQUEST\tkey=FLEET_LICENSE_KEY\ttoken=<TOKEN>",
-    "HELLO\tversion=1",
+    "HELLO\tversion=2",
     "REGISTER\ttoken=<TOKEN>\tsession=session-d\tpid=99",
-    "HELLO\tversion=1",
+    "HELLO\tversion=2",
     "REQUEST\tkey=FLEET_LICENSE_KEY\ttoken=<TOKEN>",
   ]);
   await plugin.hooks.dispose();
@@ -313,8 +317,8 @@ async function requestGuidanceFor(responseFrame: string): Promise<string> {
           }
           const line = buffered.slice(0, newline);
           buffered = buffered.slice(newline + 1);
-          if (line === "HELLO\tversion=1") {
-            socket.write("OK\tversion=1\n");
+          if (line === "HELLO\tversion=2") {
+            socket.write("OK\tversion=2 instance=test-instance\n");
           } else if (line.startsWith("REGISTER\t")) {
             registrations += 1;
             socket.write("OK\n");
@@ -355,7 +359,7 @@ test("maps every daemon ErrCode to distinct actionable guidance", async () => {
     ],
     [
       "ERR\tUNKNOWN_TOKEN\tbroker restarted",
-      "error: secretsd lost this session's registration after automatic re-registration; start a new OpenCode session and retry.",
+      "error: secretsd still does not know this session, even after an automatic re-registration; ask the human to check `systemctl --user status secretsd`, because a daemon that keeps restarting cannot hold a grant.",
     ],
     [
       "ERR\tNO_SCOPE\tno scope",
@@ -366,8 +370,12 @@ test("maps every daemon ErrCode to distinct actionable guidance", async () => {
       "error: secretsd rejected a tokenless request from a tty already assigned to an agent session; use the registered session token.",
     ],
     [
+      "ERR\tFOREIGN_CALLER\tforeign caller",
+      "error: secretsd refused this request because the session token was presented from outside that session's process tree; run the request from the session that owns the token.",
+    ],
+    [
       "ERR\tNOT_HUMAN_KEY\tnot human",
-      "not human-tier: no approval is needed for this key; read it directly with `secrets get <KEY>`. If that read fails, the key is not configured.",
+      "not human-tier: no approval is needed for this key. Run the command that needs it with `secrets <KEY> -- <command>`, or read the bytes with `secrets get <KEY> --value`; plain `secrets get <KEY>` prints status, not the value. If that fails, the key is not configured.",
     ],
     ["ERR\tDENIED\tdenied", "denied: human approval was refused; do not retry unless the human asks you to."],
     [
@@ -456,8 +464,8 @@ test("dispose aborts a live REQUEST instead of waiting for its 100-second deadli
           }
           const line = buffered.slice(0, newline);
           buffered = buffered.slice(newline + 1);
-          if (line === "HELLO\tversion=1") {
-            socket.write("OK\tversion=1\n");
+          if (line === "HELLO\tversion=2") {
+            socket.write("OK\tversion=2 instance=test-instance\n");
           } else if (line.startsWith("REGISTER\t")) {
             registrations += 1;
             socket.write("OK\n");
@@ -481,5 +489,54 @@ test("dispose aborts a live REQUEST instead of waiting for its 100-second deadli
   expect(REQUEST_TIMEOUT_MS).toBe(100_000);
   expect(result).toBe("error: the secretsd request was cancelled because the OpenCode session ended.");
   expect(existsSync(join(runtimeDir, "secretsd", "session-abort.token"))).toBe(false);
+  server.stop(true);
+});
+
+
+test("re-registers a live session when the daemon reports a new instance", async () => {
+  const runtimeDir = root();
+  const socketPath = join(runtimeDir, "broker.sock");
+  const received: string[] = [];
+  let instance = "instance-one";
+  let buffered = "";
+  const server = Bun.listen({
+    unix: socketPath,
+    socket: {
+      data(socket, data) {
+        buffered += new TextDecoder().decode(data);
+        for (;;) {
+          const newline = buffered.indexOf("\n");
+          if (newline < 0) {
+            return;
+          }
+          const line = buffered.slice(0, newline);
+          buffered = buffered.slice(newline + 1);
+          received.push(line);
+          socket.write(line === "HELLO\tversion=2" ? `OK\tversion=2 instance=${instance}\n` : "OK\n");
+        }
+      },
+    },
+  });
+  const plugin = createSecretsdPlugin({ runtimeDir, socketPath, pid: 55 });
+  const registrations = () => received.filter((frame) => frame.startsWith("REGISTER")).length;
+
+  // Given: a session registered with whichever daemon answered first.
+  await plugin.hooks["shell.env"]({ sessionID: "session-restarted" }, { env: {} });
+  const beforeRestart = registrations();
+
+  // When: a different daemon process answers, as a restart leaves things. It
+  // holds no registrations, and nothing notifies the plugin.
+  instance = "instance-two";
+  await plugin.hooks["shell.env"]({ sessionID: "session-restarted" }, { env: {} });
+
+  // Then: the session registers again up front, rather than waiting for a
+  // request to fail with UNKNOWN_TOKEN -- which the raw `secrets` CLI could
+  // never recover from, since only this plugin can register.
+  expect(beforeRestart).toBe(1);
+  expect(registrations()).toBe(2);
+
+  // And: while the same daemon keeps answering, nothing re-registers.
+  await plugin.hooks["shell.env"]({ sessionID: "session-restarted" }, { env: {} });
+  expect(registrations()).toBe(2);
   server.stop(true);
 });

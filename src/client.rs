@@ -101,12 +101,19 @@ impl BrokerClient {
     pub fn hello(&self) -> Result<(), ClientError> {
         let version = PROTOCOL_VERSION.to_string();
         let request = format!("HELLO\tversion={version}");
-        let expected = format!("version={version}");
-        match self.request(&request)? {
-            BrokerResponse::Fields(fields) if fields == expected => Ok(()),
-            BrokerResponse::Ok | BrokerResponse::Fields(_) | BrokerResponse::Bytes(_) => {
-                Err(ClientError::VersionHandshake)
-            }
+        let BrokerResponse::Fields(fields) = self.request(&request)? else {
+            return Err(ClientError::VersionHandshake);
+        };
+        // Fields this client does not consume are tolerated -- the daemon also
+        // reports its instance id, which only a registering harness needs -- but
+        // a missing or differing version must fail rather than degrade.
+        if fields
+            .split(' ')
+            .any(|field| field.strip_prefix("version=") == Some(version.as_str()))
+        {
+            Ok(())
+        } else {
+            Err(ClientError::VersionHandshake)
         }
     }
 

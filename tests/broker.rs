@@ -122,7 +122,7 @@ fn request_log_attributes_a_grant_without_secret_or_token_bytes() {
 #[test]
 fn hello_reports_protocol_version() {
     let harness = Harness::start(&[]);
-    let (header, _) = harness.send("HELLO\tversion=1");
+    let (header, _) = harness.send("HELLO\tversion=2");
     assert!(header.starts_with("OK"), "{header}");
     drop(harness);
 }
@@ -151,7 +151,7 @@ fn stalled_connections_are_bounded_and_do_not_block_requests() {
         "stalled clients created unbounded handler threads: {baseline_threads} -> {threads_after_pressure}"
     );
 
-    let (header, _) = harness.send("HELLO\tversion=1");
+    let (header, _) = harness.send("HELLO\tversion=2");
     assert!(
         header.starts_with("OK"),
         "request was blocked by stalled clients: {header}"
@@ -296,4 +296,135 @@ fn deny_kills_the_hanging_sops_process_group() {
     }
     drop(harness);
     panic!("denied sops process group remained alive");
+}
+
+fn hello_instance(header: &str) -> String {
+    let fields = header.trim().strip_prefix("OK\t").unwrap();
+    fields
+        .split(' ')
+        .find_map(|field| field.strip_prefix("instance="))
+        .unwrap()
+        .to_owned()
+}
+
+#[test]
+fn a_restarted_daemon_is_detectable_and_recovers_by_re_registering() {
+    let token = token(TOKEN_A);
+    let hello = format!("HELLO\tversion={}", secretsd::proto::PROTOCOL_VERSION);
+    let register = format!("REGISTER\ttoken={token}\tsession=ses_a\tpid=1");
+    let get = format!("GET\tkey=DEEL_API_KEY\ttoken={token}");
+
+    // Given: a daemon that has granted a key to a registered session.
+    let first_instance = {
+        let harness = Harness::start(&["DEEL_API_KEY"]);
+        let (header, _) = harness.send(&hello);
+        harness.send(&register);
+        let (granted, payload) = harness.send(&get);
+        // Release the harness (and its fake-sops env lock) before the next
+        // daemon starts: only one may hold it at a time.
+        drop(harness);
+        assert!(granted.starts_with("OK\tlen="), "{granted}");
+        assert_eq!(payload, b"value-for-DEEL_API_KEY");
+        hello_instance(&header)
+    };
+
+    // When: a fresh daemon process serves the same session, as a restart leaves
+    // things -- registrations and grants are memory-only, so both are gone.
+    let harness = Harness::start(&["DEEL_API_KEY"]);
+    let (header, _) = harness.send(&hello);
+    let second_instance = hello_instance(&header);
+
+    // Then: the restart is visible in the handshake. This is what lets a harness
+    // re-register before its session's requests start failing.
+    assert_ne!(
+        first_instance, second_instance,
+        "a restarted daemon reported the same instance id, so a restart is undetectable"
+    );
+
+    // And: the registration the restart destroyed fails closed. It must never
+    // degrade to the tokenless path.
+    let (stale, _) = harness.send(&get);
+    assert!(stale.contains("UNKNOWN_TOKEN"), "{stale}");
+
+    // And: re-registering the same token restores access.
+    harness.send(&register);
+    let (recovered, payload) = harness.send(&get);
+    assert!(recovered.starts_with("OK\tlen="), "{recovered}");
+    assert_eq!(payload, b"value-for-DEEL_API_KEY");
+
+    // And: re-registering a session the daemon already knows keeps its live
+    // grant, so a harness may re-register defensively without spending a touch.
+    let decrypts = harness.sops_invocations();
+    harness.send(&register);
+    let (kept, payload) = harness.send(&get);
+    assert!(kept.starts_with("OK\tlen="), "{kept}");
+    assert_eq!(payload, b"value-for-DEEL_API_KEY");
+    assert_eq!(
+        harness.sops_invocations(),
+        decrypts,
+        "re-registering a live session forced a new decrypt, so it would cost a new touch"
+    );
+    drop(harness);
+}
+
+/// Send one frame from a *separate process*, so the daemon pins a peer identity
+/// that is not this test process. python3 is how `e2e-client-harness.sh` already
+/// writes protocol frames.
+fn send_from_another_process(socket: &Path, line: &str) -> Option<String> {
+    let script = concat!(
+        "import socket,sys\n",
+        "s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM)\n",
+        "s.connect(sys.argv[1])\n",
+        "s.sendall(sys.argv[2].encode()+b'\\n')\n",
+        "sys.stdout.write(s.recv(4096).decode())\n",
+    );
+    let output = std::process::Command::new("python3")
+        .args(["-c", script, socket.to_str().unwrap(), line])
+        .output()
+        .ok()?;
+    Some(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+#[test]
+fn a_foreign_process_cannot_take_over_a_session_that_holds_a_grant() {
+    // A same-uid process can read a session's token file -- an accepted residual.
+    // It must not be able to turn that into the session's grant. REGISTER pins the
+    // caller as the session's root, so if re-registering an existing session
+    // replaced that root, a foreign caller could pass the ancestry check and
+    // inherit a live grant with no touch.
+    let token = token(TOKEN_A);
+    let register = format!("REGISTER\ttoken={token}\tsession=ses_a\tpid=1");
+    let get = format!("GET\tkey=DEEL_API_KEY\ttoken={token}");
+    let harness = Harness::start(&["DEEL_API_KEY"]);
+
+    // Given: this process owns the session and holds a grant.
+    harness.send(&register);
+    let (granted, payload) = harness.send(&get);
+    assert!(granted.starts_with("OK\tlen="), "{granted}");
+    assert_eq!(payload, b"value-for-DEEL_API_KEY");
+    let decrypts = harness.sops_invocations();
+
+    // When: a process outside this session's tree re-registers the same session
+    // and token, as a caller that had read the token file could.
+    let Some(reply) = send_from_another_process(harness.socket(), &register) else {
+        // python3 absent: nothing to assert rather than a false pass.
+        drop(harness);
+        return;
+    };
+    assert!(!reply.is_empty(), "the foreign REGISTER got no reply");
+
+    // Then: the session's root is untouched, so its owner still reads the value
+    // from the same grant -- no new decrypt, so no new touch.
+    let (still_ours, payload) = harness.send(&get);
+    assert!(
+        still_ours.starts_with("OK\tlen="),
+        "a foreign REGISTER displaced the session's pinned root: {still_ours}"
+    );
+    assert_eq!(payload, b"value-for-DEEL_API_KEY");
+    assert_eq!(
+        harness.sops_invocations(),
+        decrypts,
+        "the foreign REGISTER cost the session a fresh decrypt"
+    );
+    drop(harness);
 }

@@ -103,9 +103,12 @@ agent (OpenCode session)
    - `SECRETSD_HUMAN_DIR` is required daemon configuration and must be set to
      an explicit deployment-owned directory by the user service. The daemon
      refuses to start when it is absent.
-   - Restart semantics: grants are memory-only and lost on restart. This is
-     the correct security default. The shim reports "broker restarted;
-     re-approval required" clearly.
+   - Restart semantics: grants are memory-only and lost on restart, along with
+     the session registrations that scope them. This is the correct security
+     default. Because nothing notifies a harness, the version handshake also
+     reports a per-process `instance` id; a harness that sees it change
+     re-registers before its requests are allowed. The shim reports "broker
+     restarted; re-approval required" clearly.
 
 2. **OpenCode plugin** (`opencode/plugins/secretsd.ts`): the identity
    authority, shipped and tested with the `secretsd` release.
@@ -123,8 +126,11 @@ agent (OpenCode session)
     and child-environment logs never contain the bearer credential itself.
    - Token lifecycle: the token is persisted in the plugin's session state
      and **re-registered on broker or serve restart** before requests are
-     allowed. An unknown token is a hard identity error — it never falls
-     back to the tokenless path.
+     allowed. The plugin detects a restart from the `instance` id in the
+     handshake and re-registers in `shell.env`, which runs before every shell
+     command — so the plain `secrets` CLI recovers too, even though it cannot
+     register itself. An unknown token is a hard identity error — it never
+     falls back to the tokenless path.
    - Registers PTYs it allocates for sessions, letting the broker reject
      tokenless requests from known agent ttys (best effort; see residuals).
    - On session delete: notifies the broker → grants revoked,
@@ -183,11 +189,19 @@ with — enforcement is cryptographic.
 A grant is `(session_token, key)`, held in broker memory.
 
 - Requests carry the session token, read by the shim from the file named in
-  `SECRETSD_SESSION_TOKEN_FILE`. Authorization is a constant-time token
-  comparison. No trust in claimed session IDs, process names, or ancestry.
-- The token-file path is inherited by everything the session spawns (env),
-  so session-owned background jobs (`setsid` etc.) keep working — scope
-  follows the token, not the process tree.
+  `SECRETSD_SESSION_TOKEN_FILE`, and authorization is a constant-time token
+  comparison **plus** a process-ancestry check. A claimed session ID or process
+  name is never an input, but ancestry is: the token names a session without
+  proving the caller belongs to it, because every same-uid process can read the
+  token file. `REGISTER` pins the registering caller from the kernel
+  (`SO_PEERPIDFD`), and a later request carrying that token is refused with
+  `FOREIGN_CALLER` unless it descends from that pinned root. Re-registering a
+  live session therefore cannot replace its root, or a caller that read the
+  token file could inherit its grants without a touch.
+- The token-file path is inherited by everything the session spawns (env), so
+  session-owned jobs keep working as long as they remain inside the session's
+  process tree. A job that escapes it (reparented after `setsid`, for example)
+  is refused: scope follows the token *and* the pinned tree.
 - A sibling session in the same `opencode serve` process has a different
   token and cannot match another session's grant. Stealing a token requires
   actively reading another session's 0600 token file or memory — the

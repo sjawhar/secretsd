@@ -45,6 +45,8 @@ const MAX_AUDIT_VALUE_BYTES: usize = 256;
 
 #[derive(Debug)]
 struct State {
+    /// Identifies this daemon process so a harness can notice a restart.
+    instance: String,
     registry: Registry,
     grants: GrantTable,
     queue: Queue,
@@ -67,7 +69,9 @@ impl State {
         let boot_id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")?
             .trim()
             .to_owned();
+        let instance = random_instance_id()?;
         Ok(Self {
+            instance,
             registry: Registry::new(boot_id),
             grants: GrantTable::default(),
             queue: Queue::new(QueueLimits {
@@ -111,6 +115,26 @@ fn wait_state<'a>(
         .wait_timeout(guard, duration)
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .0
+}
+
+/// Generate an identifier unique to this daemon process.
+///
+/// Grants and registrations are memory-only, so a restart silently invalidates
+/// every registration a harness is holding. Reporting this value in the
+/// handshake lets the harness detect that and re-register before its requests
+/// start failing. It is an identity marker, not a credential: it authorizes
+/// nothing, and a touch is still required for every new grant.
+fn random_instance_id() -> std::io::Result<String> {
+    use std::fmt::Write as _;
+
+    let mut bytes = [0_u8; 16];
+    std::fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+    Ok(bytes
+        .iter()
+        .fold(String::with_capacity(32), |mut id, byte| {
+            let _ = write!(id, "{byte:02x}");
+            id
+        }))
 }
 
 fn socket_activated() -> bool {
@@ -673,11 +697,14 @@ mod tests {
         let shared = Arc::new((Mutex::new(State::new(config).unwrap()), Condvar::new()));
         let token_hex = "ab".repeat(32);
         let token = SessionToken::parse_hex(&token_hex).unwrap();
-        lock_state(&shared.0).registry.register(Registration {
-            token,
-            session: "opencode-session".to_owned(),
-            root: crate::peer::PeerIdentity::current_for_test(),
-        });
+        lock_state(&shared.0)
+            .registry
+            .register(Registration {
+                token,
+                session: "opencode-session".to_owned(),
+                root: crate::peer::PeerIdentity::current_for_test(),
+            })
+            .unwrap();
         let worker_shared = Arc::clone(&shared);
         let _worker = thread::spawn(move || worker(&worker_shared));
         let (mut client, server) = UnixStream::pair().unwrap();
@@ -723,11 +750,14 @@ mod tests {
         ));
         let token_hex = "cd".repeat(32);
         let token = SessionToken::parse_hex(&token_hex).unwrap();
-        lock_state(&shared.0).registry.register(Registration {
-            token,
-            session: "opencode-session".to_owned(),
-            root: crate::peer::PeerIdentity::current_for_test(),
-        });
+        lock_state(&shared.0)
+            .registry
+            .register(Registration {
+                token,
+                session: "opencode-session".to_owned(),
+                root: crate::peer::PeerIdentity::current_for_test(),
+            })
+            .unwrap();
         let (mut client, server) = UnixStream::pair().unwrap();
         let key = format!("KEY\rINJECT\0{}", "X".repeat(MAX_AUDIT_VALUE_BYTES + 1));
         client

@@ -44,8 +44,6 @@ pub enum ClientError {
     Broker(ErrCode),
     /// The inherited session token file could not be safely read as UTF-8.
     TokenFile,
-    /// The Rust CLI skeleton has no subcommands until the next task.
-    CliUnavailable,
 }
 
 impl PartialEq for ClientError {
@@ -57,7 +55,6 @@ impl PartialEq for ClientError {
             Self::VersionHandshake => matches!(other, Self::VersionHandshake),
             Self::Broker(left) => matches!(other, Self::Broker(right) if left == right),
             Self::TokenFile => matches!(other, Self::TokenFile),
-            Self::CliUnavailable => matches!(other, Self::CliUnavailable),
         }
     }
 }
@@ -81,8 +78,9 @@ impl fmt::Display for ClientError {
             Self::Broker(ErrCode::UnknownOp) => {
                 formatter.write_str("this client requested an unsupported secretsd operation")
             }
-            Self::Broker(ErrCode::UnknownToken) => formatter
-                .write_str("the session token is no longer registered; restart the agent session"),
+            Self::Broker(ErrCode::UnknownToken) => formatter.write_str(
+                "this session's registration was lost, usually to a broker restart; the OpenCode plugin re-registers it on the next command",
+            ),
             Self::Broker(ErrCode::NoScope) => {
                 formatter.write_str("no session token or interactive terminal scope is available")
             }
@@ -108,9 +106,6 @@ impl fmt::Display for ClientError {
                 formatter.write_str("secretsd could not complete the request")
             }
             Self::TokenFile => formatter.write_str("could not safely read the session token file"),
-            Self::CliUnavailable => {
-                formatter.write_str("the Rust secrets CLI commands are not available yet")
-            }
         }
     }
 }
@@ -123,8 +118,7 @@ impl std::error::Error for ClientError {
             | Self::InvalidResponse
             | Self::VersionHandshake
             | Self::Broker(_)
-            | Self::TokenFile
-            | Self::CliUnavailable => None,
+            | Self::TokenFile => None,
         }
     }
 }

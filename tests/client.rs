@@ -66,7 +66,7 @@ fn client_rejects_wrong_hello_field_name() {
         let mut reader = BufReader::new(stream);
         let mut hello = String::new();
         reader.read_line(&mut hello).unwrap();
-        assert_eq!(hello, "HELLO\tversion=1\n");
+        assert_eq!(hello, "HELLO\tversion=2\n");
         let mut stream = reader.into_inner();
         stream.write_all(b"OK\tv=1\n").unwrap();
     });
@@ -85,9 +85,9 @@ fn client_handshakes_before_sending_a_request() {
         let mut reader = BufReader::new(stream);
         let mut hello = String::new();
         reader.read_line(&mut hello).unwrap();
-        assert_eq!(hello, "HELLO\tversion=1\n");
+        assert_eq!(hello, "HELLO\tversion=2\n");
         let mut stream = reader.into_inner();
-        stream.write_all(b"OK\tversion=1\n").unwrap();
+        stream.write_all(b"OK\tversion=2\n").unwrap();
         drop(stream);
 
         let (stream, _) = listener.accept().unwrap();

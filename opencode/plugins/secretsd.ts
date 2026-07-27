@@ -30,6 +30,8 @@ type ShellOutput = { env: Record<string, string> };
 
 const decoder = new TextDecoder();
 const CONTROL_TIMEOUT_MS = 2_000;
+const PROTOCOL_VERSION = 2;
+const HELLO = `HELLO\tversion=${PROTOCOL_VERSION}`;
 const SESSION_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
 
 export const REQUEST_TIMEOUT_MS = 100_000;
@@ -41,6 +43,7 @@ export const DAEMON_ERROR_CODES = [
   "UNKNOWN_TOKEN",
   "NO_SCOPE",
   "AGENT_TTY",
+  "FOREIGN_CALLER",
   "NOT_HUMAN_KEY",
   "DENIED",
   "TIMEOUT",
@@ -55,10 +58,11 @@ const DAEMON_ERROR_GUIDANCE = {
   BAD_REQUEST: "error: secretsd rejected this request as malformed; verify the key name and report the request if it persists.",
   UNKNOWN_OP: "error: secretsd does not support the requested operation; update OpenCode and secretsd to matching versions.",
   VERSION_MISMATCH: "error: secretsd protocol version mismatch; restart or update secretsd and OpenCode before requesting a secret.",
-  UNKNOWN_TOKEN: "error: secretsd lost this session's registration after automatic re-registration; start a new OpenCode session and retry.",
+  UNKNOWN_TOKEN: "error: secretsd still does not know this session, even after an automatic re-registration; ask the human to check `systemctl --user status secretsd`, because a daemon that keeps restarting cannot hold a grant.",
   NO_SCOPE: "error: secretsd cannot attribute this request to a session because no session token or tty was provided; start it from a registered OpenCode session.",
   AGENT_TTY: "error: secretsd rejected a tokenless request from a tty already assigned to an agent session; use the registered session token.",
-  NOT_HUMAN_KEY: "not human-tier: no approval is needed for this key; read it directly with `secrets get <KEY>`. If that read fails, the key is not configured.",
+  FOREIGN_CALLER: "error: secretsd refused this request because the session token was presented from outside that session's process tree; run the request from the session that owns the token.",
+  NOT_HUMAN_KEY: "not human-tier: no approval is needed for this key. Run the command that needs it with `secrets <KEY> -- <command>`, or read the bytes with `secrets get <KEY> --value`; plain `secrets get <KEY>` prints status, not the value. If that fails, the key is not configured.",
   DENIED: "denied: human approval was refused; do not retry unless the human asks you to.",
   TIMEOUT: "timed out: no one approved the request in time; make a new request only if approval is still needed.",
   YUBIKEY_UNREACHABLE: "error: the YubiKey or its tunnel is unreachable; restore the hardware or tunnel connection and retry.",
@@ -156,8 +160,42 @@ export function removeTokenFile(state: SessionState): void {
   rmSync(state.tokenFile, { force: true });
 }
 
+/// Validate a handshake reply and return the answering daemon's instance id.
+///
+/// Fields are space-separated because the daemon's formatter collapses tabs.
+/// A missing instance id is a protocol error, not something to work around: it
+/// means the daemon predates restart reporting, so restarts would go unnoticed.
+function parseHandshake(reply: string): string {
+  if (reply === "ERR\tVERSION_MISMATCH" || reply.startsWith("ERR\tVERSION_MISMATCH\t")) {
+    throw new ProtocolVersionMismatch();
+  }
+  if (!reply.startsWith("OK\t")) {
+    throw new BrokerProtocolError("broker rejected HELLO");
+  }
+  let version: string | undefined;
+  let instance: string | undefined;
+  for (const field of reply.slice("OK\t".length).split(" ")) {
+    if (field.startsWith("version=")) {
+      version = field.slice("version=".length);
+    }
+    if (field.startsWith("instance=")) {
+      instance = field.slice("instance=".length);
+    }
+  }
+  if (version !== String(PROTOCOL_VERSION)) {
+    throw new ProtocolVersionMismatch();
+  }
+  if (!instance) {
+    throw new BrokerProtocolError("broker handshake omitted its instance id");
+  }
+  return instance;
+}
+
 class BrokerClient {
-  constructor(private readonly socketPath: string) {}
+  constructor(
+    private readonly socketPath: string,
+    private readonly onInstance: (instance: string) => void = () => {},
+  ) {}
 
   private async line(command: string, timeoutMs: number, signal?: AbortSignal): Promise<string> {
     return new Promise((resolve, reject) => {
@@ -226,14 +264,23 @@ class BrokerClient {
     });
   }
 
+  /// Complete the version handshake and report which daemon process answered.
+  private async handshake(signal?: AbortSignal): Promise<string> {
+    const instance = parseHandshake(await this.line(HELLO, CONTROL_TIMEOUT_MS, signal));
+    this.onInstance(instance);
+    return instance;
+  }
+
+  /// Learn whether the daemon is still the one this plugin registered with.
+  ///
+  /// Registrations are memory-only, so a restart silently invalidates every one
+  /// of them and nothing notifies the plugin. Asking is the only way to find out.
+  async probe(signal?: AbortSignal): Promise<void> {
+    await this.handshake(signal);
+  }
+
   private async command(message: string, timeoutMs = CONTROL_TIMEOUT_MS, signal?: AbortSignal): Promise<string> {
-    const hello = await this.line("HELLO\tversion=1", CONTROL_TIMEOUT_MS, signal);
-    if (hello === "ERR\tVERSION_MISMATCH" || hello.startsWith("ERR\tVERSION_MISMATCH\t")) {
-      throw new ProtocolVersionMismatch();
-    }
-    if (hello !== "OK\tversion=1") {
-      throw new BrokerProtocolError("broker rejected HELLO");
-    }
+    await this.handshake(signal);
     const response = await this.line(message, timeoutMs, signal);
     if (response === "ERR\tVERSION_MISMATCH" || response.startsWith("ERR\tVERSION_MISMATCH\t")) {
       throw new ProtocolVersionMismatch();
@@ -269,7 +316,7 @@ function guidance(outcome: RequestOutcome): string {
     case "daemon-error":
       return DAEMON_ERROR_GUIDANCE[outcome.code];
     case "granted":
-      return "granted: read the value with `secrets get <KEY>`.";
+      return "granted: run the command that needs it with `secrets <KEY> -- <command>`, or read the bytes with `secrets get <KEY> --value`; plain `secrets get <KEY>` prints status, not the value.";
     case "request-cancelled":
       return "error: the secretsd request was cancelled because the OpenCode session ended.";
     case "runtime-unavailable":
@@ -304,6 +351,8 @@ function responseCode(response: string): DaemonErrorCode | undefined {
       return "NO_SCOPE";
     case "AGENT_TTY":
       return "AGENT_TTY";
+    case "FOREIGN_CALLER":
+      return "FOREIGN_CALLER";
     case "NOT_HUMAN_KEY":
       return "NOT_HUMAN_KEY";
     case "DENIED":
@@ -379,12 +428,24 @@ type SessionEventInput = {
 
 export function createSecretsdPlugin(options: PluginOptions = {}) {
   const runtimeDir = options.runtimeDir ?? process.env.XDG_RUNTIME_DIR;
-  const broker = new BrokerClient(options.socketPath ?? (runtimeDir ? join(runtimeDir, "secretsd.sock") : ""));
   const pid = options.pid ?? process.pid;
   const states = new Map<string, SessionState>();
   const registered = new Set<string>();
   const registrations = new Map<string, Promise<SessionState | undefined>>();
   const requestAbort = new AbortController();
+  let brokerInstance: string | undefined;
+  const broker = new BrokerClient(
+    options.socketPath ?? (runtimeDir ? join(runtimeDir, "secretsd.sock") : ""),
+    (instance) => {
+      if (brokerInstance !== undefined && brokerInstance !== instance) {
+        // A different daemon process answered, so it holds no registrations at
+        // all: every session must register again before its requests can be
+        // scoped to it. design.md requires this before requests are allowed.
+        registered.clear();
+      }
+      brokerInstance = instance;
+    },
+  );
 
   function ensureState(sessionID: string): SessionState | undefined {
     if (!runtimeDir) {
@@ -405,7 +466,21 @@ export function createSecretsdPlugin(options: PluginOptions = {}) {
       return undefined;
     }
     if (registered.has(sessionID)) {
-      return state;
+      // `registered` is only a belief about a daemon that may since have
+      // restarted, dropping every registration without telling the plugin. Ask
+      // who is answering now: the raw `secrets` CLI cannot register itself, so
+      // this is the only thing that can heal that path before the next command.
+      // no-excuse-ok: catch — an unreachable broker must not stop the token path
+      // from being exported; the request itself reports the real failure.
+      try {
+        await broker.probe();
+      } catch {
+        // Detection failed. Keep the existing registration rather than churn.
+      }
+      // A restart clears `registered`, so re-check before trusting it.
+      if (registered.has(sessionID)) {
+        return state;
+      }
     }
     const inFlight = registrations.get(sessionID);
     if (inFlight) {

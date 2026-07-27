@@ -30,7 +30,7 @@ impl StallingBroker {
             let mut hello = BufReader::new(hello);
             let mut request = String::new();
             hello.read_line(&mut request).unwrap();
-            hello.get_mut().write_all(b"OK\tversion=1\n").unwrap();
+            hello.get_mut().write_all(b"OK\tversion=2\n").unwrap();
 
             let Some(request) = accept(&listener, &worker_stop) else {
                 return;
