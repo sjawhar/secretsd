@@ -77,6 +77,23 @@ describe("secretsd token issuance", () => {
     broker.stop();
   });
 
+test("registers its bundled skills directory through the config hook", async () => {
+    // A plugin contributes skills by adding its directory to config.skills.paths;
+    // this is what ships the `secrets` CLI guidance with the tool that needs it.
+    const plugin = createSecretsdPlugin({ runtimeDir: root() });
+    const config: { skills?: { paths?: string[] } } = {};
+
+    await plugin.hooks.config(config);
+
+    const paths = config.skills?.paths ?? [];
+    expect(paths.some((entry) => entry.endsWith("/skills"))).toBe(true);
+    expect(existsSync(join(paths[0]!, "using-secrets", "SKILL.md"))).toBe(true);
+
+    // Re-running a hook must not duplicate the entry.
+    await plugin.hooks.config(config);
+    expect(config.skills?.paths?.length).toBe(1);
+  });
+
   test("session end unregisters the session and removes its token file", async () => {
     // Without this, a finished session's token file and broker grant survive
     // until the whole serve process exits or the daemon's backstop expires.

@@ -1,7 +1,8 @@
 import { randomBytes } from "crypto";
 import { chmodSync, mkdirSync, renameSync, rmSync, writeFileSync } from "fs";
 import { tool } from "@opencode-ai/plugin";
-import { join } from "path";
+import { dirname, join } from "path";
+import { fileURLToPath } from "url";
 
 // allow: SIZE_OK — one closure must own a session's token, broker lifecycle, and cancellation state.
 export type SessionState = {
@@ -13,6 +14,15 @@ type PluginOptions = {
   readonly runtimeDir?: string;
   readonly socketPath?: string;
   readonly pid?: number;
+};
+
+/// Skills shipped beside this plugin. Registering the directory through the
+/// config hook is how a plugin contributes skills; it needs no symlink and no
+/// edit to the user's config.
+const SKILLS_DIRECTORY = join(dirname(fileURLToPath(import.meta.url)), "..", "skills");
+
+type ConfigInput = {
+  skills?: { paths?: string[] };
 };
 
 type ShellInput = { readonly sessionID?: string };
@@ -425,6 +435,16 @@ export function createSecretsdPlugin(options: PluginOptions = {}) {
   }
 
   const hooks = {
+    config: async (config: ConfigInput): Promise<void> => {
+      // The CLI's contract is easy to misread -- `secrets get KEY` prints status,
+      // not the secret -- so the skill explaining it ships with the plugin rather
+      // than living in whichever dotfiles checkout happens to be present.
+      config.skills ??= {};
+      config.skills.paths ??= [];
+      if (!config.skills.paths.includes(SKILLS_DIRECTORY)) {
+        config.skills.paths.push(SKILLS_DIRECTORY);
+      }
+    },
     "shell.env": async (input: ShellInput, output: ShellOutput): Promise<void> => {
       // no-excuse-ok: catch — plugin hooks must not prevent a shell from starting.
       try {
