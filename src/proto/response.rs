@@ -22,7 +22,23 @@ pub enum Response<'a> {
 pub fn format_response(response: &Response<'_>) -> String {
     match response {
         Response::Ok => "OK\n".to_owned(),
-        Response::OkFields(fields) => format!("OK\t{}\n", sanitize(fields)),
+        Response::OkFields(fields) => {
+            let sanitized = sanitize(fields);
+            // Fields are space-separated, and `sanitize` does not defend that
+            // separator -- it only rewrites CR, LF and tab. So a value carrying
+            // a space (or a tab, which becomes one here) would reach a client as
+            // an extra field. Every value emitted today is a literal or hex, so
+            // this is a tripwire for whoever adds the next field, not a runtime
+            // guard: it is compiled out of release builds, and the invariant is
+            // structural rather than something to branch on at run time.
+            debug_assert!(
+                sanitized
+                    .split(' ')
+                    .all(|field| !field.is_empty() && field.contains('=')),
+                "OkFields payload is not space-separated k=v: {sanitized}"
+            );
+            format!("OK\t{sanitized}\n")
+        }
         Response::OkBytes(len) => format!("OK\tlen={len}\n"),
         Response::Failed(code, message) => {
             format!("ERR\t{}\t{}\n", code.wire(), sanitize(message))

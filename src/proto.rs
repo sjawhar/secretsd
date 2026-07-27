@@ -297,6 +297,34 @@ mod tests {
     }
 
     #[test]
+    fn every_ok_fields_payload_is_space_separated_key_values() {
+        // A space separates fields on the wire, and `sanitize` does not protect
+        // it, so a value containing one would reach a client as an extra field.
+        // Pin the shape of every payload this daemon emits.
+        let instance = "ab".repeat(16);
+        let handshake = format!("version={PROTOCOL_VERSION} instance={instance}");
+        for fields in [handshake.as_str(), "status=granted"] {
+            let line = format_response(&Response::OkFields(fields));
+            let body = line
+                .strip_prefix("OK\t")
+                .and_then(|rest| rest.strip_suffix('\n'))
+                .unwrap();
+            assert!(
+                body.split(' ')
+                    .all(|field| !field.is_empty() && field.contains('=')),
+                "payload is not space-separated k=v: {body}"
+            );
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "not space-separated")]
+    fn a_field_value_containing_a_space_is_caught() {
+        // The tripwire above must actually fire, or it documents nothing.
+        let _ = format_response(&Response::OkFields("note=hello world"));
+    }
+
+    #[test]
     fn formats_error_with_code_and_message() {
         assert_eq!(
             format_response(&Response::Failed(ErrCode::UnknownToken, "no such session")),

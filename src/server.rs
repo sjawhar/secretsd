@@ -585,6 +585,26 @@ mod tests {
     }
 
     #[test]
+    fn instance_id_is_lowercase_hex_so_it_cannot_forge_a_handshake_field() {
+        // The handshake reports this in a space-separated field. It is the only
+        // non-literal value the daemon puts there, so its alphabet is what keeps
+        // a client from reading an extra field.
+        let id = random_instance_id().unwrap();
+
+        assert_eq!(id.len(), 32, "instance id changed length: {id}");
+        assert!(
+            id.chars()
+                .all(|character| character.is_ascii_digit() || ('a'..='f').contains(&character)),
+            "instance id is not lowercase hex: {id}"
+        );
+        assert_ne!(
+            random_instance_id().unwrap(),
+            id,
+            "instance id is not random"
+        );
+    }
+
+    #[test]
     fn serves_lock_when_slow_connections_exceed_admission_capacity() {
         // Given a listening socket and more newline-less clients than admission permits.
         let directory = tempfile::tempdir().unwrap();
