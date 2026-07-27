@@ -150,3 +150,9 @@ audit, not hard isolation between processes that share a Unix UID.
 
 The wire protocol is the contract between client and daemon: it carries a
 version in the handshake, and a mismatch must fail loudly rather than degrade.
+Changing the shape of a request or a reply — including adding a field — bumps
+`PROTOCOL_VERSION`. A strict peer rejects the new shape, so the version is what
+turns that into a clear "update both" instead of a puzzling parse failure. That
+the two halves ship in one release is not a reason to skip the bump: the plugin
+is loaded when `opencode serve` starts, so it lags a daemon that has already
+restarted, and mixed peers therefore occur during a normal upgrade.
