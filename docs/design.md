@@ -79,7 +79,8 @@ agent (OpenCode session)
         │  human-tier keys: request over unix socket, sending the
         ▼  session token (read from a file referenced in env)
    secretsd  — Rust daemon, systemd user service, socket-activated,
-        │     one per machine ($XDG_RUNTIME_DIR/secretsd.sock, 0600)
+        │     one per machine (<runtime>/secretsd.sock, 0600; <runtime> is
+        │     $XDG_RUNTIME_DIR, else /run/user/<uid>)
         │     plaintext cached only in daemon memory (mlockall, zeroize);
         │     clients and `-- cmd` children necessarily receive the
         │     plaintext of keys granted to them
@@ -119,11 +120,20 @@ agent (OpenCode session)
      not a symlink into a dotfiles checkout.
    - On session create: generates a random 256-bit token, registers
     `(token, session_id, serve_pid)` with the broker, writes the token to
-    `$XDG_RUNTIME_DIR/secretsd/<session>.token` (inside a `0700` directory,
+    `<runtime>/secretsd/<session>.token` (inside a `0700` directory,
     with mode `0600`), and injects only
     `SECRETSD_SESSION_TOKEN_FILE=<path>` into the session's bash environment.
     The token value never enters the environment, so `env` dumps, transcripts,
     and child-environment logs never contain the bearer credential itself.
+    `<runtime>` is `$XDG_RUNTIME_DIR`, or `/run/user/<uid>` when it is unset or
+    empty, matching how the CLI resolves the socket; without that fallback a
+    serve process that inherited no `XDG_RUNTIME_DIR` issues no token at all.
+    The plugin verifies the directory it resolved — it must exist, be a
+    directory this uid owns, and exclude other writers, and the token directory
+    must be a real directory, since `chmod` and the token write both follow
+    symlinks. It never creates the runtime root: a missing `/run/user/<uid>`
+    means there is no systemd user session, and creating it would place tokens
+    where the daemon does not look while reporting success.
    - Token lifecycle: the token is persisted in the plugin's session state
      and **re-registered on broker or serve restart** before requests are
      allowed. The plugin detects a restart from the `instance` id in the
@@ -131,6 +141,12 @@ agent (OpenCode session)
      command — so the plain `secrets` CLI recovers too, even though it cannot
      register itself. An unknown token is a hard identity error — it never
      falls back to the tokenless path.
+     The token *file* has its own lifetime: `logind` removes `/run/user/<uid>`
+     when the user's last login ends unless lingering is enabled, so a serve
+     process inside a long-lived tmux server outlives it. `shell.env` rewrites a
+     missing token file with the same token, since the daemon still has that one
+     registered and a fresh token would displace it and revoke the session's
+     grants.
    - Registers PTYs it allocates for sessions, letting the broker reject
      tokenless requests from known agent ttys (best effort; see residuals).
    - On session delete: notifies the broker → grants revoked,

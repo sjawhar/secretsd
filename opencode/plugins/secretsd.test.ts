@@ -1,8 +1,24 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import type { ToolContext, ToolResult } from "@opencode-ai/plugin";
-import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync } from "fs";
+import {
+  chmodSync,
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+} from "fs";
 import { join } from "path";
-import secretsdPlugin, { DAEMON_ERROR_CODES, REQUEST_TIMEOUT_MS, createSecretsdPlugin, issueTokenFile } from "./secretsd";
+import secretsdPlugin, {
+  DAEMON_ERROR_CODES,
+  REQUEST_TIMEOUT_MS,
+  createSecretsdPlugin,
+  issueTokenFile,
+  resolveRuntimeDir,
+  resolveSocketPath,
+} from "./secretsd";
 
 // allow: SIZE_OK — the plan requires all fake-broker protocol scenarios in this single test file.
 const roots: string[] = [];
@@ -539,4 +555,191 @@ test("re-registers a live session when the daemon reports a new instance", async
   await plugin.hooks["shell.env"]({ sessionID: "session-restarted" }, { env: {} });
   expect(registrations()).toBe(2);
   server.stop(true);
+});
+
+describe("runtime directory resolution", () => {
+  // Mirrors `socket_path_is_lazy_and_has_the_documented_fallback` in
+  // tests/client.rs so both halves of the release resolve the same directory.
+  // Without the per-user fallback a serve process that inherited no
+  // XDG_RUNTIME_DIR -- from a tmux server started without it, or from
+  // non-interactive ssh -- could never issue a token, while the `secrets` CLI
+  // beside it resolved the socket fine.
+  test("prefers an explicit directory, then the environment, then the per-user default", () => {
+    expect(resolveRuntimeDir("/tmp/override", "/tmp/environment", 42)).toBe("/tmp/override");
+    expect(resolveRuntimeDir(undefined, "/tmp/environment", 42)).toBe("/tmp/environment");
+    expect(resolveRuntimeDir(undefined, undefined, 42)).toBe("/run/user/42");
+  });
+
+  test("treats an empty environment value as absent, as the daemon does", () => {
+    expect(resolveRuntimeDir(undefined, "", 42)).toBe("/run/user/42");
+  });
+
+  test("reports no directory when there is no uid to derive one from", () => {
+    // Refusing beats guessing, and it must not throw during plugin construction.
+    expect(resolveRuntimeDir(undefined, undefined, undefined)).toBeUndefined();
+  });
+});
+
+/// Run `work` with `console.error` captured, so the plugin's one-line report for
+/// the human does not masquerade as a failure in the test output.
+async function capturingStderr<T>(work: () => Promise<T>): Promise<{ result: T; lines: string[] }> {
+  const lines: string[] = [];
+  const original = console.error;
+  console.error = (...args: unknown[]) => {
+    lines.push(args.map(String).join(" "));
+  };
+  try {
+    return { result: await work(), lines };
+  } finally {
+    console.error = original;
+  }
+}
+
+test("refuses a missing runtime directory instead of creating one", async () => {
+  // A missing /run/user/<uid> means there is no systemd user session. Creating
+  // it would put session tokens somewhere the daemon never looks while
+  // reporting success, so this must fail closed -- and say how to fix it,
+  // because the agent that hits this cannot read the plugin's source.
+  const runtimeDir = join(root(), "absent-runtime");
+  const plugin = createSecretsdPlugin({
+    runtimeDir,
+    socketPath: join(runtimeDir, "broker.sock"),
+    pid: 11,
+  });
+
+  const { result: raw, lines } = await capturingStderr(async () =>
+    plugin.hooks.tool.secrets_request.execute({ key: "DEEL_API_KEY" }, toolContext("session-no-runtime")),
+  );
+  const result = toolOutput(raw);
+
+  expect(result).toContain("XDG_RUNTIME_DIR");
+  expect(result).toContain(runtimeDir);
+  expect(existsSync(runtimeDir)).toBe(false);
+  expect(/[0-9a-f]{64}/.test(result)).toBe(false);
+  expect(lines).toEqual([`secretsd: no session token can be issued: ${runtimeDir} does not exist`]);
+  await plugin.hooks.dispose();
+});
+
+test("refuses a token directory that is a symlink rather than a real directory", async () => {
+  // chmodSync and writeFileSync both follow symlinks, so a pre-planted link
+  // would steer token files -- and the 0700 chmod -- at a directory this plugin
+  // never chose.
+  const runtimeDir = root();
+  const elsewhere = root();
+  symlinkSync(elsewhere, join(runtimeDir, "secretsd"));
+  const plugin = createSecretsdPlugin({
+    runtimeDir,
+    socketPath: join(runtimeDir, "broker.sock"),
+    pid: 12,
+  });
+
+  const { result: raw } = await capturingStderr(async () =>
+    plugin.hooks.tool.secrets_request.execute({ key: "DEEL_API_KEY" }, toolContext("session-symlinked")),
+  );
+  const result = toolOutput(raw);
+
+  expect(result).toContain("XDG_RUNTIME_DIR");
+  expect(readdirSync(elsewhere)).toEqual([]);
+  expect(/[0-9a-f]{64}/.test(result)).toBe(false);
+  await plugin.hooks.dispose();
+});
+
+test("refuses a runtime directory other users can write to", async () => {
+  // This is the reachable half of the runtime-root check: a directory other
+  // users can write to lets them replace this session's token file, so the
+  // per-user fallback must verify what it derived rather than assume it.
+  const runtimeDir = root();
+  chmodSync(runtimeDir, 0o777);
+  const plugin = createSecretsdPlugin({
+    runtimeDir,
+    socketPath: join(runtimeDir, "broker.sock"),
+    pid: 13,
+  });
+
+  const { result: raw } = await capturingStderr(async () =>
+    plugin.hooks.tool.secrets_request.execute({ key: "DEEL_API_KEY" }, toolContext("session-open-runtime")),
+  );
+  const result = toolOutput(raw);
+
+  expect(result).toContain("writable by other users");
+  expect(existsSync(join(runtimeDir, "secretsd"))).toBe(false);
+  await plugin.hooks.dispose();
+});
+
+describe("socket path resolution", () => {
+  // The plugin registers the token and the CLI presents it, so both must reach
+  // the same daemon. `BrokerClient::from_environment` in src/client.rs honours
+  // SECRETSD_SOCK; if the plugin ignored it, a redirected CLI would present its
+  // token to a daemon that never registered it and get UNKNOWN_TOKEN.
+  test("prefers an explicit path, then SECRETSD_SOCK, then the runtime directory", () => {
+    expect(resolveSocketPath("/tmp/explicit.sock", "/tmp/env.sock", "/tmp/runtime")).toBe("/tmp/explicit.sock");
+    expect(resolveSocketPath(undefined, "/tmp/env.sock", "/tmp/runtime")).toBe("/tmp/env.sock");
+    expect(resolveSocketPath(undefined, undefined, "/tmp/runtime")).toBe("/tmp/runtime/secretsd.sock");
+  });
+
+  test("treats an empty SECRETSD_SOCK as absent", () => {
+    expect(resolveSocketPath(undefined, "", "/tmp/runtime")).toBe("/tmp/runtime/secretsd.sock");
+  });
+
+  test("has no socket to offer when there is no runtime directory either", () => {
+    expect(resolveSocketPath(undefined, undefined, undefined)).toBe("");
+  });
+});
+
+test("rewrites a token file that vanished under a long-running process", async () => {
+  // logind removes /run/user/<uid> when the user's last session ends unless
+  // lingering is enabled, so a tmux server -- and the opencode serve process
+  // inside it -- outlives its own token file. The plugin cached the state and
+  // kept exporting a path to a file that was no longer there, leaving the
+  // session unable to get a secret until opencode restarted.
+  const runtimeDir = root();
+  const socketPath = join(runtimeDir, "broker.sock");
+  const plugin = createSecretsdPlugin({ runtimeDir, socketPath, pid: 14 });
+  const broker = fakeBroker(socketPath);
+
+  const first: { env: Record<string, string> } = { env: {} };
+  await plugin.hooks["shell.env"]({ sessionID: "ses_longLived" }, first);
+  const tokenPath = first.env.SECRETSD_SESSION_TOKEN_FILE!;
+  const originalToken = readFileSync(tokenPath, "utf8");
+
+  rmSync(join(runtimeDir, "secretsd"), { recursive: true, force: true });
+  expect(existsSync(tokenPath)).toBe(false);
+
+  const second: { env: Record<string, string> } = { env: {} };
+  await plugin.hooks["shell.env"]({ sessionID: "ses_longLived" }, second);
+
+  expect(second.env.SECRETSD_SESSION_TOKEN_FILE).toBe(tokenPath);
+  expect(existsSync(tokenPath)).toBe(true);
+  // The same token, not a fresh one: registering a new token for a session
+  // displaces the old one and revokes its grants (src/grants.rs:153), which
+  // would cost the human another touch for a file this plugin lost.
+  expect(readFileSync(tokenPath, "utf8")).toBe(originalToken);
+  expect(statSync(tokenPath).mode & 0o777).toBe(0o600);
+  expect(statSync(join(runtimeDir, "secretsd")).mode & 0o777).toBe(0o700);
+  expect(broker.received.filter((line) => line.startsWith("REGISTER")).length).toBe(1);
+  broker.stop();
+  await plugin.hooks.dispose();
+});
+
+test("tells the human once why no token can be issued, without per-command noise", async () => {
+  // The agent sees the refusal in its tool result, but the human who has to
+  // repair the directory only reads the serve log -- and `shell.env` swallows the
+  // failure so shells keep starting. `shell.env` runs before every command, so
+  // this must be deduplicated rather than repeated.
+  const runtimeDir = join(root(), "absent-runtime");
+  const plugin = createSecretsdPlugin({
+    runtimeDir,
+    socketPath: join(runtimeDir, "broker.sock"),
+    pid: 15,
+  });
+  const { lines } = await capturingStderr(async () => {
+    await plugin.hooks["shell.env"]({ sessionID: "ses_logOnce" }, { env: {} });
+    await plugin.hooks["shell.env"]({ sessionID: "ses_logOnce" }, { env: {} });
+    await plugin.hooks.tool.secrets_request.execute({ key: "DEEL_API_KEY" }, toolContext("ses_logOnce"));
+  });
+
+  expect(lines.length).toBe(1);
+  expect(lines[0]).toContain(runtimeDir);
+  expect(/[0-9a-f]{64}/.test(lines[0]!)).toBe(false);
+  await plugin.hooks.dispose();
 });

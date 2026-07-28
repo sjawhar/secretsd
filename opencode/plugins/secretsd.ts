@@ -1,5 +1,5 @@
 import { randomBytes } from "crypto";
-import { chmodSync, mkdirSync, renameSync, rmSync, writeFileSync } from "fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, renameSync, rmSync, statSync, writeFileSync } from "fs";
 import { tool } from "@opencode-ai/plugin";
 import { dirname, join } from "path";
 import { fileURLToPath } from "url";
@@ -76,7 +76,7 @@ type RequestOutcome =
   | { readonly kind: "daemon-error"; readonly code: DaemonErrorCode }
   | { readonly kind: "granted" }
   | { readonly kind: "request-cancelled" }
-  | { readonly kind: "runtime-unavailable" }
+  | { readonly kind: "runtime-unavailable"; readonly reason: string }
   | { readonly kind: "unexpected-broker-response" }
   | { readonly kind: "unexpected-error" };
 type SecretRequest = {
@@ -124,6 +124,20 @@ class ProtocolVersionMismatch extends Error {
   }
 }
 
+/// A refusal to use the runtime directory, carrying operator-facing detail.
+///
+/// The reason names directories and errno codes only -- never token bytes, which
+/// must never reach a tool result.
+class RuntimeUnavailableError extends Error {
+  readonly name = "RuntimeUnavailableError";
+  readonly reason: string;
+
+  constructor(reason: string) {
+    super(`secretsd runtime directory unusable: ${reason}`);
+    this.reason = reason;
+  }
+}
+
 function validateSessionID(sessionID: string): void {
   if (!SESSION_ID_PATTERN.test(sessionID)) {
     throw new InvalidSessionIDError();
@@ -139,21 +153,155 @@ function tokenFile(runtimeDir: string, sessionID: string): string {
   return join(tokenDirectory(runtimeDir), `${sessionID}.token`);
 }
 
-export function issueTokenFile(runtimeDir: string, sessionID: string): SessionState {
+function errnoCode(error: unknown): string {
+  return typeof error === "object" && error !== null && "code" in error && typeof error.code === "string"
+    ? error.code
+    : "unknown error";
+}
+
+/// Resolve the directory holding the broker socket and this session's token.
+///
+/// Mirrors `SocketPath::resolve` in `src/client.rs`: an explicit path wins, then
+/// `XDG_RUNTIME_DIR`, then the per-user directory systemd would have named. The
+/// fallback is what keeps the two halves of a release agreeing -- without it a
+/// serve process that inherited no `XDG_RUNTIME_DIR`, from a tmux server started
+/// without one or from non-interactive ssh, could never issue a token while the
+/// `secrets` CLI beside it resolved the same socket fine.
+export function resolveRuntimeDir(
+  override: string | undefined,
+  environmentValue: string | undefined,
+  uid: number | undefined,
+): string | undefined {
+  // An empty value is absent, matching how the daemon reads its own environment.
+  if (override) {
+    return override;
+  }
+  if (environmentValue) {
+    return environmentValue;
+  }
+  return uid === undefined ? undefined : `/run/user/${uid}`;
+}
+
+/// Resolve the broker socket the plugin registers with.
+///
+/// Mirrors `BrokerClient::from_environment` in `src/client.rs`: an explicit path
+/// wins, then `SECRETSD_SOCK`, then the resolved runtime directory. The plugin
+/// mints the token and the CLI presents it, so the two must reach the same
+/// daemon; a plugin that ignored `SECRETSD_SOCK` while the CLI honoured it would
+/// register the token with one daemon and present it to another, and the request
+/// would fail `UNKNOWN_TOKEN` for no visible reason.
+export function resolveSocketPath(
+  override: string | undefined,
+  environmentValue: string | undefined,
+  runtimeDir: string | undefined,
+): string {
+  if (override) {
+    return override;
+  }
+  if (environmentValue) {
+    return environmentValue;
+  }
+  return runtimeDir ? join(runtimeDir, "secretsd.sock") : "";
+}
+
+/// Stat the runtime root, turning a missing or unreadable directory into a
+/// refusal that names it.
+function runtimeRootStats(runtimeDir: string) {
+  try {
+    return statSync(runtimeDir);
+  } catch (error) {
+    const code = errnoCode(error);
+    throw new RuntimeUnavailableError(
+      code === "ENOENT" ? `${runtimeDir} does not exist` : `${runtimeDir} is unusable (${code})`,
+    );
+  }
+}
+
+/// Refuse a runtime root that is absent, foreign, or open to other users.
+///
+/// The directory is never created. A missing `/run/user/<uid>` means there is no
+/// systemd user session, and fabricating it would put session tokens somewhere
+/// the daemon never looks while reporting success.
+function assertRuntimeRoot(runtimeDir: string, uid: number | undefined): void {
+  const stats = runtimeRootStats(runtimeDir);
+  if (!stats.isDirectory()) {
+    throw new RuntimeUnavailableError(`${runtimeDir} is not a directory`);
+  }
+  if (uid !== undefined && stats.uid !== uid) {
+    throw new RuntimeUnavailableError(`${runtimeDir} is not owned by this user`);
+  }
+  if ((stats.mode & 0o022) !== 0) {
+    throw new RuntimeUnavailableError(`${runtimeDir} is writable by other users`);
+  }
+}
+
+/// Create or adopt the `0700` token directory, accepting only a real directory
+/// this user owns.
+///
+/// `chmodSync` and `writeFileSync` both follow symlinks, so a pre-planted link
+/// would otherwise steer token files -- and the `0700` chmod -- at a directory
+/// this plugin never chose.
+function prepareTokenDirectory(runtimeDir: string): string {
+  const uid = process.getuid?.();
+  assertRuntimeRoot(runtimeDir, uid);
   const directory = tokenDirectory(runtimeDir);
-  mkdirSync(directory, { recursive: true, mode: 0o700 });
+  try {
+    // Deliberately not recursive: the runtime root must already exist.
+    mkdirSync(directory, { mode: 0o700 });
+  } catch (error) {
+    const code = errnoCode(error);
+    if (code !== "EEXIST") {
+      throw new RuntimeUnavailableError(`${directory} could not be created (${code})`);
+    }
+    const stats = lstatSync(directory);
+    if (!stats.isDirectory()) {
+      throw new RuntimeUnavailableError(`${directory} is not a directory`);
+    }
+    if (uid !== undefined && stats.uid !== uid) {
+      throw new RuntimeUnavailableError(`${directory} is not owned by this user`);
+    }
+  }
+  // Set the mode explicitly: a restrictive umask can strip owner bits from the
+  // create above, and an adopted directory may carry any mode at all.
   chmodSync(directory, 0o700);
+  return directory;
+}
+
+/// Write `token` to this session's token path, atomically and privately.
+function writeTokenFile(runtimeDir: string, sessionID: string, token: string): string {
+  const directory = prepareTokenDirectory(runtimeDir);
 
   const tokenPath = tokenFile(runtimeDir, sessionID);
-  const token = randomBytes(32).toString("hex");
   // Stage then rename: a concurrent reader sees either no file or the whole
   // token, never a truncated one. `wx` refuses to write through a pre-planted
   // path, and the mode is fixed before the token is reachable at its real name.
   const stagingPath = `${tokenPath}.${randomBytes(6).toString("hex")}.tmp`;
-  writeFileSync(stagingPath, token, { encoding: "utf8", mode: 0o600, flag: "wx" });
-  chmodSync(stagingPath, 0o600);
-  renameSync(stagingPath, tokenPath);
-  return { token, tokenFile: tokenPath };
+  try {
+    writeFileSync(stagingPath, token, { encoding: "utf8", mode: 0o600, flag: "wx" });
+    chmodSync(stagingPath, 0o600);
+    renameSync(stagingPath, tokenPath);
+  } catch (error) {
+    // Name the directory, never the staging path: its random suffix reads like
+    // token material.
+    throw new RuntimeUnavailableError(`${directory} rejected a token file (${errnoCode(error)})`);
+  }
+  return tokenPath;
+}
+
+export function issueTokenFile(runtimeDir: string, sessionID: string): SessionState {
+  const token = randomBytes(32).toString("hex");
+  return { token, tokenFile: writeTokenFile(runtimeDir, sessionID, token) };
+}
+
+/// Put a known session's token back on disk after its file disappeared.
+///
+/// Reuses the same token rather than minting one: it is still the token the
+/// daemon has registered, so the session keeps its grants. Registering a fresh
+/// token for a session displaces the old one and revokes its grants
+/// (`Registry::register`, `src/grants.rs:153`), which would charge the human
+/// another touch for a file this plugin failed to keep.
+export function restoreTokenFile(runtimeDir: string, sessionID: string, state: SessionState): void {
+  writeTokenFile(runtimeDir, sessionID, state.token);
 }
 
 export function removeTokenFile(state: SessionState): void {
@@ -320,7 +468,7 @@ function guidance(outcome: RequestOutcome): string {
     case "request-cancelled":
       return "error: the secretsd request was cancelled because the OpenCode session ended.";
     case "runtime-unavailable":
-      return "error: the secretsd runtime directory is unavailable, so this session cannot be registered.";
+      return `error: secretsd cannot use its runtime directory, so this session has no token and no secret can be granted: ${outcome.reason}. OpenCode takes that directory from XDG_RUNTIME_DIR and otherwise derives /run/user/<uid>; ask the human to restart OpenCode with XDG_RUNTIME_DIR=/run/user/$(id -u), or to repair that directory.`;
     case "unexpected-broker-response":
       return "error: secretsd returned an unrecognized protocol response; restart or update secretsd and OpenCode.";
     case "unexpected-error":
@@ -382,6 +530,9 @@ function responseOutcome(response: string): RequestOutcome {
 }
 
 function failureOutcome(error: unknown): RequestOutcome {
+  if (error instanceof RuntimeUnavailableError) {
+    return { kind: "runtime-unavailable", reason: error.reason };
+  }
   if (error instanceof ProtocolVersionMismatch) {
     return { kind: "daemon-error", code: "VERSION_MISMATCH" };
   }
@@ -427,15 +578,15 @@ type SessionEventInput = {
 };
 
 export function createSecretsdPlugin(options: PluginOptions = {}) {
-  const runtimeDir = options.runtimeDir ?? process.env.XDG_RUNTIME_DIR;
+  const runtimeDir = resolveRuntimeDir(options.runtimeDir, process.env.XDG_RUNTIME_DIR, process.getuid?.());
   const pid = options.pid ?? process.pid;
   const states = new Map<string, SessionState>();
   const registered = new Set<string>();
-  const registrations = new Map<string, Promise<SessionState | undefined>>();
+  const registrations = new Map<string, Promise<SessionState>>();
   const requestAbort = new AbortController();
   let brokerInstance: string | undefined;
   const broker = new BrokerClient(
-    options.socketPath ?? (runtimeDir ? join(runtimeDir, "secretsd.sock") : ""),
+    resolveSocketPath(options.socketPath, process.env.SECRETSD_SOCK, runtimeDir),
     (instance) => {
       if (brokerInstance !== undefined && brokerInstance !== instance) {
         // A different daemon process answered, so it holds no registrations at
@@ -447,12 +598,36 @@ export function createSecretsdPlugin(options: PluginOptions = {}) {
     },
   );
 
-  function ensureState(sessionID: string): SessionState | undefined {
+  /// Record, once per distinct cause, that this process can issue no token.
+  ///
+  /// The agent gets the actionable text in its tool result, but the human who has
+  /// to repair the directory only ever sees the serve log, and `shell.env`
+  /// otherwise swallows this to keep shells starting. Deduplicated by reason
+  /// because `shell.env` runs before every single command. Reasons name
+  /// directories and errno codes only, never token bytes.
+  const reportedRuntimeFailures = new Set<string>();
+  function noteRuntimeUnavailable(error: unknown): void {
+    if (!(error instanceof RuntimeUnavailableError) || reportedRuntimeFailures.has(error.reason)) {
+      return;
+    }
+    reportedRuntimeFailures.add(error.reason);
+    console.error(`secretsd: no session token can be issued: ${error.reason}`);
+  }
+
+  function ensureState(sessionID: string): SessionState {
     if (!runtimeDir) {
-      return undefined;
+      throw new RuntimeUnavailableError("neither XDG_RUNTIME_DIR nor a uid was available to locate it");
     }
     const existing = states.get(sessionID);
     if (existing) {
+      // logind removes `/run/user/<uid>` when the user's last session ends unless
+      // lingering is enabled, so a long-lived serve process -- one inside a tmux
+      // server that outlives every login -- can outlive its own token file. The
+      // cached state alone would keep exporting a path to a file that is gone,
+      // and the `secrets` CLI reads the file, not this memory.
+      if (!existsSync(existing.tokenFile)) {
+        restoreTokenFile(runtimeDir, sessionID, existing);
+      }
       return existing;
     }
     const state = issueTokenFile(runtimeDir, sessionID);
@@ -460,11 +635,8 @@ export function createSecretsdPlugin(options: PluginOptions = {}) {
     return state;
   }
 
-  async function ensureRegistered(sessionID: string): Promise<SessionState | undefined> {
+  async function ensureRegistered(sessionID: string): Promise<SessionState> {
     const state = ensureState(sessionID);
-    if (!state) {
-      return undefined;
-    }
     if (registered.has(sessionID)) {
       // `registered` is only a belief about a daemon that may since have
       // restarted, dropping every registration without telling the plugin. Ask
@@ -525,11 +697,10 @@ export function createSecretsdPlugin(options: PluginOptions = {}) {
       try {
         if (input.sessionID) {
           const state = await ensureRegistered(input.sessionID);
-          if (state) {
-            output.env.SECRETSD_SESSION_TOKEN_FILE = state.tokenFile;
-          }
+          output.env.SECRETSD_SESSION_TOKEN_FILE = state.tokenFile;
         }
-      } catch {
+      } catch (error) {
+        noteRuntimeUnavailable(error);
         return;
       }
     },
@@ -562,9 +733,6 @@ export function createSecretsdPlugin(options: PluginOptions = {}) {
         async execute({ key }, context) {
           try {
             const state = await ensureRegistered(context.sessionID);
-            if (!state) {
-              return guidance({ kind: "runtime-unavailable" });
-            }
             return guidance(
               await requestSecret(broker, {
                 state,
@@ -580,6 +748,7 @@ export function createSecretsdPlugin(options: PluginOptions = {}) {
             );
           } catch (error) {
             // no-excuse-ok: catch — tool results must not surface broker failures.
+            noteRuntimeUnavailable(error);
             return guidance(failureOutcome(error));
           }
         },

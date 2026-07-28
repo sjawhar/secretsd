@@ -43,6 +43,17 @@ starting it, create the deployment-owned drop-in described in
 [`docs/dotfiles-cutover.md`](docs/dotfiles-cutover.md); it supplies the human
 secret directory and the real helper-binary paths for that machine.
 
+On a machine you drive over ssh, enable lingering as well:
+
+```bash
+loginctl enable-linger "$USER"
+```
+
+Without it, `logind` removes `$XDG_RUNTIME_DIR` when your last login ends, taking
+the socket, the daemon, every grant, and every session token file with it — even
+though a tmux server and the agent sessions inside it keep running. Check it with
+`loginctl show-user "$USER" -p Linger`.
+
 Grants exist only in daemon memory. Any daemon restart—including a release
 upgrade or a drop-in change—removes every grant and requires a fresh YubiKey
 touch before a human-tier secret can be used again.

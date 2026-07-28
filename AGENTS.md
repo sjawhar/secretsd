@@ -23,12 +23,23 @@ model, and several "obvious improvements" were already tried and rejected.
 
 ```
 client (secrets shim / opencode plugin)
-   │  line protocol over $XDG_RUNTIME_DIR/secretsd.sock (0600)
+   │  line protocol over <runtime>/secretsd.sock (0600)
    ▼
 secretsd ── grants: (scope, key) → SecretBytes, memory only
    │        scope = token-verified session | (tty, boot-id)
    └──► sops + age + YubiKey       (blink = physical prompt; touch = authorization)
 ```
+
+`<runtime>` is `$XDG_RUNTIME_DIR`, or `/run/user/<uid>` when that is unset or
+empty. Both halves of the release resolve it by the same rule — `SocketPath::resolve`
+(`src/client.rs:33`) and `resolveRuntimeDir` (`opencode/plugins/secretsd.ts`) —
+because a client that resolves a different directory than the plugin that minted
+its token is refused, not degraded.
+
+The socket is resolved separately by both halves, honouring `SECRETSD_SOCK`
+first (`BrokerClient::from_environment`, `src/client.rs:89`; `resolveSocketPath`,
+`opencode/plugins/secretsd.ts`), so redirecting one half never leaves the token
+registered with a daemon the other half is not talking to.
 
 One binary. `secrets serve` is the daemon; every other argv is the client
 (`src/bin/secrets.rs`). Both halves live in this crate, so a protocol change
@@ -61,6 +72,9 @@ Agent-tier keys never reach the daemon at all: the client decrypts
 | Add or change a protocol op | `src/proto.rs:93` (requests), `src/proto/response.rs` |
 | Change what the audit line records | `src/server.rs:336`, context built at `:200` |
 | Change how sops is invoked | `src/decrypt.rs:202`; failure classes at `:28` |
+| Change how the runtime directory is resolved | `resolveRuntimeDir`, `opencode/plugins/secretsd.ts`; `SocketPath::resolve`, `src/client.rs:33` |
+| Change which socket either half connects to | `resolveSocketPath`, `opencode/plugins/secretsd.ts`; `BrokerClient::from_environment`, `src/client.rs:89` |
+| Change the session token file's lifetime | `restoreTokenFile`, `opencode/plugins/secretsd.ts`; `ensureState` beside it |
 | Change the approval lifecycle | `src/server/worker.rs:26` |
 | Change the CLI surface | `src/client/cli.rs:17` |
 | Change grant lifetime or revocation | `GrantTable`, `src/grants.rs:218` |
@@ -142,11 +156,16 @@ ref so updates never arrive. The dotfiles installer derives the tag from the
 installed release rather than hard-coding one.
 
 The plugin issues a random token per OpenCode session at
-`${XDG_RUNTIME_DIR}/secretsd/<sessionID>.token`, ensures the directory is
-`0700` and the file is `0600`, and exports only
-`SECRETSD_SESSION_TOKEN_FILE=<path>` to that session. The token value must
-never enter the environment. Per-session tokens provide workflow scoping and
-audit, not hard isolation between processes that share a Unix UID.
+`<runtime>/secretsd/<sessionID>.token`, ensures the directory is `0700` and the
+file is `0600`, and exports only `SECRETSD_SESSION_TOKEN_FILE=<path>` to that
+session. The token value must never enter the environment. Per-session tokens
+provide workflow scoping and audit, not hard isolation between processes that
+share a Unix UID. The plugin verifies `<runtime>` rather than trusting it: it
+must exist, be a directory this uid owns, and be closed to other writers, and
+the token directory must be a real directory rather than a symlink. It never
+creates `<runtime>` itself — a missing `/run/user/<uid>` means there is no
+systemd user session, so writing tokens there would report a success the daemon
+cannot see.
 
 The wire protocol is the contract between client and daemon: it carries a
 version in the handshake, and a mismatch must fail loudly rather than degrade.

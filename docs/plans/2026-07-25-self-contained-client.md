@@ -656,6 +656,10 @@ Expected: unit syntax is valid and Rust formatting remains clean; no command dec
 **Interfaces:**
 - `Config::from_env() -> Result<Config, ConfigError>` requires `SECRETSD_HUMAN_DIR` for the daemon; it no longer defaults to `%h/.dotfiles/secrets.human.d`.
 - `SECRETSD_SOCKET` remains daemon-only test/deployment configuration; `SECRETSD_SOCK` remains the lazy CLI override.
+  - Superseded: the OpenCode plugin honours `SECRETSD_SOCK` as well, so redirecting
+    the CLI cannot leave the token registered with a daemon the CLI is not talking
+    to. `SECRETSD_SOCKET` is still daemon-only. See `resolveSocketPath` in
+    `opencode/plugins/secretsd.ts` and the socket note in `AGENTS.md`.
 
 - [ ] **Step 1: Write configuration and control-operation regression tests**
 
