@@ -11,6 +11,7 @@ struct Harness {
     socket: PathBuf,
     sops_log: PathBuf,
     sops_args_log: PathBuf,
+    hang_marker: PathBuf,
     _fake_sops_env_lock: MutexGuard<'static, ()>,
 }
 
@@ -35,6 +36,16 @@ impl Harness {
         // SAFETY: nextest executes every integration test in a separate process. This
         // test owns the harness environment lock and has not started daemon threads yet.
         unsafe { std::env::set_var("FAKE_SOPS_ARGS_LOG", &sops_args_log) };
+        // The hanging fixture is killed by the test that uses it, so it can never
+        // clean up after itself. Keeping its marker inside this TempDir means the
+        // file dies with the harness on every path, including a panic, instead of
+        // accumulating one `/tmp` entry per run -- and it is no longer at a shared,
+        // predictable path another user could create first to steer the pid the
+        // test kills.
+        let hang_marker = dir.path().join("fake-sops-hang.pid");
+        // SAFETY: nextest executes every integration test in a separate process. This
+        // test owns the harness environment lock and has not started daemon threads yet.
+        unsafe { std::env::set_var("FAKE_SOPS_HANG_MARKER", &hang_marker) };
         let human = dir.path().join("human.d");
         std::fs::create_dir(&human).unwrap();
         for key in keys {
@@ -65,6 +76,7 @@ impl Harness {
             socket,
             sops_log,
             sops_args_log,
+            hang_marker,
             _fake_sops_env_lock: fake_sops_env_lock,
         }
     }
@@ -87,6 +99,10 @@ impl Harness {
 
     const fn socket(&self) -> &PathBuf {
         &self.socket
+    }
+
+    const fn hang_marker(&self) -> &PathBuf {
+        &self.hang_marker
     }
 
     fn sops_invocations(&self) -> usize {

@@ -2,5 +2,12 @@
 if [ -n "${FAKE_SOPS_LOG:-}" ]; then
   printf '%s\n' "fake-sops-hang $*" >> "$FAKE_SOPS_LOG"
 fi
-echo "$$" > "/tmp/secretsd-fake-sops-hang-$PPID"
+# Only the test that has to kill this process group asks for the pid, and it owns
+# the path: a TempDir the harness drops on every exit path, panic included. This
+# process is killed by that test, so it can never clean up after itself -- the
+# previous fixed `/tmp` path leaked one file per run and let any user create it
+# first to choose the pid the test killed. The other consumer just needs a hang.
+if [ -n "${FAKE_SOPS_HANG_MARKER:-}" ]; then
+  echo "$$" > "$FAKE_SOPS_HANG_MARKER"
+fi
 sleep 300

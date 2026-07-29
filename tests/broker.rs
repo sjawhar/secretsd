@@ -253,12 +253,8 @@ fn tokenless_request_from_a_learned_agent_tty_is_rejected() {
 
 #[test]
 fn deny_kills_the_hanging_sops_process_group() {
-    let marker = PathBuf::from(format!(
-        "/tmp/secretsd-fake-sops-hang-{}",
-        std::process::id()
-    ));
-    let _ = std::fs::remove_file(&marker);
     let harness = Harness::start_with_sops(&["DEEL_API_KEY"], "fake-sops-hang");
+    let marker = harness.hang_marker().clone();
     harness.send(&format!(
         "REGISTER\ttoken={}\tsession=ses_a\tpid=1",
         token(TOKEN_A)
