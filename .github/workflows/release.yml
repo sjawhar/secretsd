@@ -172,8 +172,23 @@ jobs:
           else
             git commit -m "chore: release v${VERSION} [skip ci]"
           fi
-          git tag "v${VERSION}"
-          git push origin main --tags
+          # A re-run after a partial failure (e.g. the release-create step hit a
+          # GitHub 502) finds the tag already pushed. That tag is this same
+          # workflow's own work, so reuse it if it points at a commit whose
+          # version files already carry VERSION; refuse if it points anywhere
+          # else, because then it was not created by this release.
+          if git rev-parse -q --verify "refs/tags/v${VERSION}" >/dev/null; then
+            if git grep -q "version = \"${VERSION}\"" "v${VERSION}" -- Cargo.toml; then
+              echo "tag v${VERSION} already exists and matches; reusing it"
+              git checkout "v${VERSION}"
+            else
+              echo "tag v${VERSION} exists but does not carry version ${VERSION}" >&2
+              exit 1
+            fi
+          else
+            git tag "v${VERSION}"
+            git push origin main --tags
+          fi
 
       - uses: actions/download-artifact@v4
 
@@ -192,8 +207,16 @@ jobs:
         run: |
           set -euo pipefail
           VERSION="${{ needs.version.outputs.version }}"
-          gh release create "v${VERSION}" \
-            --title "v${VERSION}" \
-            --generate-notes \
-            secretsd-linux-x86_64/secretsd-*-linux-x86_64.tar.gz \
-            SHA256SUMS
+          # Idempotent for the same partial-failure re-run: if the release
+          # object already exists, upload any missing assets instead of failing.
+          if gh release view "v${VERSION}" >/dev/null 2>&1; then
+            gh release upload "v${VERSION}" --clobber \
+              secretsd-linux-x86_64/secretsd-*-linux-x86_64.tar.gz \
+              SHA256SUMS
+          else
+            gh release create "v${VERSION}" \
+              --title "v${VERSION}" \
+              --generate-notes \
+              secretsd-linux-x86_64/secretsd-*-linux-x86_64.tar.gz \
+              SHA256SUMS
+          fi
