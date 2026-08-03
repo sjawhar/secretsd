@@ -125,7 +125,8 @@ impl BrokerClient {
 
     fn request(&self, request: &str) -> Result<BrokerResponse, ClientError> {
         let mut stream = UnixStream::connect(&self.socket_path).map_err(ClientError::Io)?;
-        let timeout = if request.starts_with("GET\t") {
+        let waits_for_approval = request.starts_with("GET\t") || request.starts_with("REQUEST\t");
+        let timeout = if waits_for_approval {
             self.get_timeout
         } else {
             self.control_timeout
@@ -137,7 +138,18 @@ impl BrokerClient {
             .set_write_timeout(Some(timeout))
             .map_err(ClientError::Io)?;
         write_request(&mut stream, request)?;
-        response::read_response(stream)
+        match response::read_response(stream) {
+            Err(ClientError::Io(error))
+                if waits_for_approval
+                    && matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+            {
+                Err(ClientError::ApprovalTimeout)
+            }
+            other => other,
+        }
     }
 }
 

@@ -59,7 +59,7 @@ impl Harness {
             sops_bin: fixtures.join(sops),
             pcsc_socket: None,
             yubikey_probe_argv: Vec::new(),
-            max_grant: Duration::from_secs(43200),
+            max_grant: Duration::from_hours(12),
             cooldown: Duration::from_secs(16),
             request_ttl: Duration::from_secs(20),
             max_pending_per_scope: 2,

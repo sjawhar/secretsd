@@ -34,6 +34,8 @@ impl fmt::Debug for BrokerResponse {
 pub enum ClientError {
     /// The Unix socket could not be contacted or read.
     Io(std::io::Error),
+    /// An approval-waiting operation got no answer in time; the daemon is likely healthy.
+    ApprovalTimeout,
     /// The caller attempted to send an invalid protocol request.
     InvalidRequest,
     /// The broker emitted malformed or unsafe framed data.
@@ -50,6 +52,7 @@ impl PartialEq for ClientError {
     fn eq(&self, other: &Self) -> bool {
         match self {
             Self::Io(left) => matches!(other, Self::Io(right) if left.kind() == right.kind()),
+            Self::ApprovalTimeout => matches!(other, Self::ApprovalTimeout),
             Self::InvalidRequest => matches!(other, Self::InvalidRequest),
             Self::InvalidResponse => matches!(other, Self::InvalidResponse),
             Self::VersionHandshake => matches!(other, Self::VersionHandshake),
@@ -65,6 +68,9 @@ impl fmt::Display for ClientError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Io(error) => write!(formatter, "could not communicate with secretsd: {error}"),
+            Self::ApprovalTimeout => formatter.write_str(
+                "timed out waiting for approval; the human may still need to touch the key, and the daemon waits out the hardware cooldown between decrypts",
+            ),
             Self::InvalidRequest => {
                 formatter.write_str("refusing to send an invalid broker request")
             }
@@ -114,7 +120,8 @@ impl std::error::Error for ClientError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Io(error) => Some(error),
-            Self::InvalidRequest
+            Self::ApprovalTimeout
+            | Self::InvalidRequest
             | Self::InvalidResponse
             | Self::VersionHandshake
             | Self::Broker(_)

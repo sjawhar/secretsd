@@ -694,11 +694,11 @@ mod tests {
     fn backstop_expires_old_grants_only() {
         let mut table = GrantTable::default();
         let now = Instant::now();
-        let old = now.checked_sub(Duration::from_secs(13 * 3600)).unwrap();
+        let old = now.checked_sub(Duration::from_hours(13)).unwrap();
         table.insert(Scope::Session(token(0xaa)), name("OLD"), secret("v"), old);
         table.insert(Scope::Session(token(0xbb)), name("NEW"), secret("v"), now);
 
-        let removed = table.revoke_expired(now, Duration::from_secs(12 * 3600));
+        let removed = table.revoke_expired(now, Duration::from_hours(12));
         assert_eq!(removed, 1);
         assert!(
             table
