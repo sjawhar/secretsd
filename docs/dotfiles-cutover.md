@@ -1,5 +1,8 @@
 # Dotfiles cutover contract
 
+> **Historical record:** superseded by `config.toml` in v2. This document
+> preserves the pre-v2 cutover procedure and is not current deployment guidance.
+
 This package owns generic user units. The consuming dotfiles own every
 machine-specific secret-store path and hardware connection in a systemd
 drop-in.

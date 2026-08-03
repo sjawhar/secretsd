@@ -13,6 +13,7 @@ import {
 import { join } from "path";
 import secretsdPlugin, {
   DAEMON_ERROR_CODES,
+  PROTOCOL_VERSION,
   REQUEST_TIMEOUT_MS,
   createSecretsdPlugin,
   issueTokenFile,
@@ -22,6 +23,8 @@ import secretsdPlugin, {
 
 // allow: SIZE_OK — the plan requires all fake-broker protocol scenarios in this single test file.
 const roots: string[] = [];
+const HELLO = `HELLO\tversion=${PROTOCOL_VERSION}`;
+const HANDSHAKE = `OK\tversion=${PROTOCOL_VERSION} instance=test-instance\n`;
 
 function root(): string {
   const value = mkdtempSync("/tmp/secretsd-plugin-");
@@ -55,6 +58,17 @@ afterEach(() => {
 test("exports a V1 server plugin despite its testable named helpers", () => {
   expect(secretsdPlugin).toHaveProperty("id", "secretsd");
   expect(secretsdPlugin).toHaveProperty("server");
+});
+
+test("keeps the Rust and plugin protocol versions in lockstep", () => {
+  const proto = readFileSync(join(import.meta.dir, "../../src/proto.rs"), "utf8");
+  const rustVersion = /pub const PROTOCOL_VERSION: u32 = (\d+)/.exec(proto)?.[1];
+
+  if (rustVersion === undefined) {
+    throw new Error("src/proto.rs does not define PROTOCOL_VERSION");
+  }
+
+  expect(rustVersion).toBe(PROTOCOL_VERSION.toString());
 });
 
 describe("secretsd token issuance", () => {
@@ -190,7 +204,7 @@ function fakeBroker(socketPath: string) {
           const line = buffered.slice(0, newline);
           buffered = buffered.slice(newline + 1);
           received.push(line);
-          socket.write(line === "HELLO\tversion=2" ? "OK\tversion=2 instance=test-instance\n" : "OK\n");
+          socket.write(line === HELLO ? HANDSHAKE : "OK\n");
         }
       },
     },
@@ -228,9 +242,9 @@ test("shell.env registers a new session once before injecting its token-file pat
   // this session was registered, so it asks which daemon is answering before
   // trusting that belief. It still registers only once.
   expect(redactFrames(broker.received)).toEqual([
-    "HELLO\tversion=2",
+    HELLO,
     "REGISTER\ttoken=<TOKEN>\tsession=session-restart\tpid=77",
-    "HELLO\tversion=2",
+    HELLO,
   ]);
   expect(firstOutput.env.SECRETSD_SESSION_TOKEN_FILE).toBe(join(runtimeDir, "secretsd", "session-restart.token"));
   expect(secondOutput.env.SECRETSD_SESSION_TOKEN_FILE).toBe(join(runtimeDir, "secretsd", "session-restart.token"));
@@ -247,9 +261,9 @@ test("dispose unregisters every live session and removes its token file", async 
   await plugin.hooks.dispose();
 
   expect(redactFrames(broker.received)).toEqual([
-    "HELLO\tversion=2",
+    HELLO,
     "REGISTER\ttoken=<TOKEN>\tsession=session-dispose\tpid=88",
-    "HELLO\tversion=2",
+    HELLO,
     "UNREGISTER\tsession=session-dispose",
   ]);
   expect(existsSync(join(runtimeDir, "secretsd", "session-dispose.token"))).toBe(false);
@@ -276,8 +290,8 @@ test("re-registers once after UNKNOWN_TOKEN and returns value-free granted guida
           const line = buffered.slice(0, newline);
           buffered = buffered.slice(newline + 1);
           received.push(line);
-          if (line === "HELLO\tversion=2") {
-            socket.write("OK\tversion=2 instance=test-instance\n");
+          if (line === HELLO) {
+            socket.write(HANDSHAKE);
           } else if (line.startsWith("REGISTER\t")) {
             registrations += 1;
             socket.write("OK\n");
@@ -303,13 +317,13 @@ test("re-registers once after UNKNOWN_TOKEN and returns value-free granted guida
   expect(/[0-9a-f]{64}/.test(result)).toBe(false);
   expect(result.includes("synthetic-secret-value")).toBe(false);
   expect(redactFrames(received)).toEqual([
-    "HELLO\tversion=2",
+    HELLO,
     "REGISTER\ttoken=<TOKEN>\tsession=session-d\tpid=99",
-    "HELLO\tversion=2",
+    HELLO,
     "REQUEST\tkey=FLEET_LICENSE_KEY\ttoken=<TOKEN>",
-    "HELLO\tversion=2",
+    HELLO,
     "REGISTER\ttoken=<TOKEN>\tsession=session-d\tpid=99",
-    "HELLO\tversion=2",
+    HELLO,
     "REQUEST\tkey=FLEET_LICENSE_KEY\ttoken=<TOKEN>",
   ]);
   await plugin.hooks.dispose();
@@ -333,8 +347,8 @@ async function requestGuidanceFor(responseFrame: string): Promise<string> {
           }
           const line = buffered.slice(0, newline);
           buffered = buffered.slice(newline + 1);
-          if (line === "HELLO\tversion=2") {
-            socket.write("OK\tversion=2 instance=test-instance\n");
+          if (line === HELLO) {
+            socket.write(HANDSHAKE);
           } else if (line.startsWith("REGISTER\t")) {
             registrations += 1;
             socket.write("OK\n");
@@ -391,7 +405,11 @@ test("maps every daemon ErrCode to distinct actionable guidance", async () => {
     ],
     [
       "ERR\tNOT_HUMAN_KEY\tnot human",
-      "not human-tier: no approval is needed for this key. Run the command that needs it with `secrets <KEY> -- <command>`, or read the bytes with `secrets get <KEY> --value`; plain `secrets get <KEY>` prints status, not the value. If that fails, the key is not configured.",
+      "not human-tier: no approval is needed for this key. Run the command that needs it with `secrets <KEY> -- <command>`, or read the bytes with `secrets get <KEY> --value`; plain `secrets get <KEY>` prints status, not the value. If that fails, the key is not configured. If config.toml just gained a new source root, restart secretsd (systemctl --user restart secretsd.service).",
+    ],
+    [
+      "ERR\tAMBIGUOUS_KEY\tambiguous key",
+      "error: the key exists in more than one human-tier location; ask the human to remove one of the duplicate files.",
     ],
     ["ERR\tDENIED\tdenied", "denied: human approval was refused; do not retry unless the human asks you to."],
     [
@@ -480,8 +498,8 @@ test("dispose aborts a live REQUEST instead of waiting for its 100-second deadli
           }
           const line = buffered.slice(0, newline);
           buffered = buffered.slice(newline + 1);
-          if (line === "HELLO\tversion=2") {
-            socket.write("OK\tversion=2 instance=test-instance\n");
+          if (line === HELLO) {
+            socket.write(HANDSHAKE);
           } else if (line.startsWith("REGISTER\t")) {
             registrations += 1;
             socket.write("OK\n");
@@ -528,7 +546,7 @@ test("re-registers a live session when the daemon reports a new instance", async
           const line = buffered.slice(0, newline);
           buffered = buffered.slice(newline + 1);
           received.push(line);
-          socket.write(line === "HELLO\tversion=2" ? `OK\tversion=2 instance=${instance}\n` : "OK\n");
+          socket.write(line === HELLO ? `OK\tversion=${PROTOCOL_VERSION} instance=${instance}\n` : "OK\n");
         }
       },
     },

@@ -10,7 +10,7 @@ use std::path::Path;
 use std::process::Command;
 
 #[test]
-fn real_sops_harness_exercises_the_built_dual_mode_binary_when_prerequisites_exist() {
+fn e2e_real_sops_harness_exercises_the_built_dual_mode_binary_when_prerequisites_exist() {
     // Given the built dual-mode binary plus the permanent standalone harness.
     let script = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/e2e-client-harness.sh");
     assert!(

@@ -14,14 +14,16 @@ const CONTROL_TIMEOUT: Duration = Duration::from_secs(5);
 
 mod agent;
 pub mod cli;
+mod edit;
 mod error;
 mod human;
 mod response;
+mod sources;
 mod status;
 
 pub use agent::AgentStore;
 pub use error::CliError;
-pub use human::{HumanClient, HumanNames};
+pub use human::{HumanClient, HumanLocation, HumanNames};
 pub use response::{BrokerResponse, ClientError, parse_response};
 
 /// A lazily resolved path to the broker's Unix socket.

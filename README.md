@@ -17,9 +17,7 @@ happens once per session instead of once every few minutes.
   overnight never touch this daemon; they keep decrypting with a disk-resident
   key, exactly as before.
 
-Status: **design complete, implementation in progress.** See
-[`docs/design.md`](docs/design.md) for the design and
-[`docs/plans/`](docs/plans/) for the implementation plan.
+See [`docs/design.md`](docs/design.md) for the current architecture.
 
 ## Install
 
@@ -33,15 +31,36 @@ cd secretsd-vX.Y.Z-linux-x86_64
 install -Dm755 bin/secrets "$HOME/.local/bin/secrets"
 install -Dm644 systemd/secretsd.socket "$HOME/.config/systemd/user/secretsd.socket"
 install -Dm644 systemd/secretsd.service "$HOME/.config/systemd/user/secretsd.service"
+install -Dm644 share/secretsd/opencode/plugins/secretsd.ts \
+    "$HOME/.local/share/secretsd/opencode/plugins/secretsd.ts"
+install -Dm644 share/secretsd/opencode/skills/using-secrets/SKILL.md \
+    "$HOME/.local/share/secretsd/opencode/skills/using-secrets/SKILL.md"
 systemctl --user daemon-reload
 systemctl --user enable --now secretsd.socket
 ```
 
+The plugin speaks a versioned wire protocol to the daemon, so the two must
+come from the same release: install the packaged plugin (or, if OpenCode
+loads it from a git pin such as
+`secretsd@git+https://github.com/sjawhar/secretsd.git#vX.Y.Z`, update that
+tag to the installed version) and restart OpenCode after upgrading the
+daemon. A stale plugin fails loudly at the version handshake.
+
 Enable the **socket**, not the service. The first client connection to
 `$XDG_RUNTIME_DIR/secretsd.sock` causes systemd to spawn the daemon. Before
-starting it, create the deployment-owned drop-in described in
-[`docs/dotfiles-cutover.md`](docs/dotfiles-cutover.md); it supplies the human
-secret directory and the real helper-binary paths for that machine.
+starting it, declare the source roots in `~/.config/secretsd/config.toml`:
+
+```toml
+[source.dotfiles]
+path = "~/.dotfiles"
+
+[source.private]
+path = "~/src/secrets-private"
+```
+
+Each root may contain `secrets.env`, `secrets.local.env`, and
+`secrets.human.d/`. Set the daemon's helper-binary and hardware connection
+paths in its deployment-owned systemd drop-in.
 
 On a machine you drive over ssh, enable lingering as well:
 

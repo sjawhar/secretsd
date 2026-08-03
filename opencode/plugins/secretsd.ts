@@ -30,7 +30,7 @@ type ShellOutput = { env: Record<string, string> };
 
 const decoder = new TextDecoder();
 const CONTROL_TIMEOUT_MS = 2_000;
-const PROTOCOL_VERSION = 2;
+export const PROTOCOL_VERSION = 3;
 const HELLO = `HELLO\tversion=${PROTOCOL_VERSION}`;
 const SESSION_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
 
@@ -45,6 +45,7 @@ export const DAEMON_ERROR_CODES = [
   "AGENT_TTY",
   "FOREIGN_CALLER",
   "NOT_HUMAN_KEY",
+  "AMBIGUOUS_KEY",
   "DENIED",
   "TIMEOUT",
   "YUBIKEY_UNREACHABLE",
@@ -62,7 +63,8 @@ const DAEMON_ERROR_GUIDANCE = {
   NO_SCOPE: "error: secretsd cannot attribute this request to a session because no session token or tty was provided; start it from a registered OpenCode session.",
   AGENT_TTY: "error: secretsd rejected a tokenless request from a tty already assigned to an agent session; use the registered session token.",
   FOREIGN_CALLER: "error: secretsd refused this request because the session token was presented from outside that session's process tree; run the request from the session that owns the token.",
-  NOT_HUMAN_KEY: "not human-tier: no approval is needed for this key. Run the command that needs it with `secrets <KEY> -- <command>`, or read the bytes with `secrets get <KEY> --value`; plain `secrets get <KEY>` prints status, not the value. If that fails, the key is not configured.",
+  NOT_HUMAN_KEY: "not human-tier: no approval is needed for this key. Run the command that needs it with `secrets <KEY> -- <command>`, or read the bytes with `secrets get <KEY> --value`; plain `secrets get <KEY>` prints status, not the value. If that fails, the key is not configured. If config.toml just gained a new source root, restart secretsd (systemctl --user restart secretsd.service).",
+  AMBIGUOUS_KEY: "error: the key exists in more than one human-tier location; ask the human to remove one of the duplicate files.",
   DENIED: "denied: human approval was refused; do not retry unless the human asks you to.",
   TIMEOUT: "timed out: no one approved the request in time; make a new request only if approval is still needed.",
   YUBIKEY_UNREACHABLE: "error: the YubiKey or its tunnel is unreachable; restore the hardware or tunnel connection and retry.",
@@ -298,7 +300,7 @@ export function issueTokenFile(runtimeDir: string, sessionID: string): SessionSt
 /// Reuses the same token rather than minting one: it is still the token the
 /// daemon has registered, so the session keeps its grants. Registering a fresh
 /// token for a session displaces the old one and revokes its grants
-/// (`Registry::register`, `src/grants.rs:153`), which would charge the human
+/// (`Registry::register`, `src/grants.rs:139`), which would charge the human
 /// another touch for a file this plugin failed to keep.
 export function restoreTokenFile(runtimeDir: string, sessionID: string, state: SessionState): void {
   writeTokenFile(runtimeDir, sessionID, state.token);
@@ -503,6 +505,8 @@ function responseCode(response: string): DaemonErrorCode | undefined {
       return "FOREIGN_CALLER";
     case "NOT_HUMAN_KEY":
       return "NOT_HUMAN_KEY";
+    case "AMBIGUOUS_KEY":
+      return "AMBIGUOUS_KEY";
     case "DENIED":
       return "DENIED";
     case "TIMEOUT":

@@ -99,6 +99,9 @@ impl fmt::Display for ClientError {
             Self::Broker(ErrCode::NotHumanKey) => {
                 formatter.write_str("the requested key is not managed by secretsd")
             }
+            Self::Broker(ErrCode::AmbiguousKey) => {
+                formatter.write_str("the requested key is managed by more than one human-tier file")
+            }
             Self::Broker(ErrCode::Denied) => formatter.write_str("the secret request was denied"),
             Self::Broker(ErrCode::Timeout) => {
                 formatter.write_str("the secret request timed out before approval")

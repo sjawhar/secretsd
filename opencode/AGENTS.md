@@ -51,7 +51,7 @@ a serve process inside a long-lived tmux server outlives its own token file, and
 the CLI reads that file rather than this plugin's memory. `shell.env` therefore
 re-checks and calls `restoreTokenFile`, which rewrites **the same** token:
 registering a fresh one for a session displaces the old token and revokes its
-grants (`Registry::register`, `src/grants.rs:153`), which would charge the human
+grants (`Registry::register`, `src/grants.rs:139`), which would charge the human
 another touch to recover from a file the plugin lost.
 
 `secrets_request` sends `REQUEST`, never `GET`. Its result is a status string,

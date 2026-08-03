@@ -32,32 +32,42 @@ secretsd ── grants: (scope, key) → SecretBytes, memory only
 
 `<runtime>` is `$XDG_RUNTIME_DIR`, or `/run/user/<uid>` when that is unset or
 empty. Both halves of the release resolve it by the same rule — `SocketPath::resolve`
-(`src/client.rs:33`) and `resolveRuntimeDir` (`opencode/plugins/secretsd.ts`) —
+(`src/client.rs:35`) and `resolveRuntimeDir` (`opencode/plugins/secretsd.ts`) —
 because a client that resolves a different directory than the plugin that minted
 its token is refused, not degraded.
 
-The socket is resolved separately by both halves, honouring `SECRETSD_SOCK`
-first (`BrokerClient::from_environment`, `src/client.rs:89`; `resolveSocketPath`,
-`opencode/plugins/secretsd.ts`), so redirecting one half never leaves the token
-registered with a daemon the other half is not talking to.
+Both halves resolve the socket path by the same rule (`SocketPath::resolve`,
+`src/client.rs:35`) but honour **different override variables**: the client and
+plugin connect through `SECRETSD_SOCK` (`BrokerClient::from_environment`,
+`src/client.rs:91`; `resolveSocketPath`, `opencode/plugins/secretsd.ts`), while a
+standalone `secrets serve` listens on `SECRETSD_SOCKET` (`Config::from_env`,
+`src/lib.rs:98`). The split is deliberate — a test harness redirects the daemon's
+listener without silently redirecting every client on the machine — so
+redirecting one half never leaves the token registered with a daemon the other
+half is not talking to. Under socket activation systemd owns the listener and
+neither variable applies.
 
 One binary. `secrets serve` is the daemon; every other argv is the client
 (`src/bin/secrets.rs`). Both halves live in this crate, so a protocol change
 touches both sides in one commit.
 
-Agent-tier keys never reach the daemon at all: the client decrypts
-`secrets.env` locally. Only the filenames in `secrets.human.d/` are brokered.
+Agent-tier keys never reach the daemon at all: the client decrypts each
+configured root's `secrets.local.env` or `secrets.env` locally. Only the
+filenames in configured `secrets.human.d/` directories are brokered.
 
 | Module | Owns |
 |---|---|
 | `src/proto.rs` | Wire protocol parse/format. Hand-rolled; no serde. |
+| `src/config.rs` | Source-root configuration, config-path resolution, and root validation. |
 | `src/hardening.rs` | `mlockall`, `PR_SET_DUMPABLE=0`, `RLIMIT_CORE=0`. Fail-closed. |
 | `src/secret.rs` | `SecretBytes` (zeroize on drop), key-name validation, single-assignment dotenv parse. |
 | `src/decrypt.rs` | Spawning sops, timeout, killing the process group on cancel. |
 | `src/grants.rs` | Scopes, session registrations, grant table, revocation. |
 | `src/requests.rs` | Request state machine, single-flight YubiKey queue, cooldown, pending limits. |
+| `src/audit.rs` | Sanitizes values shared by audit-log surfaces. |
 | `src/server.rs` | Socket activation, three connection lanes, per-connection `handle`, audit line. |
-| `src/server/dispatch.rs` | Op routing, `resolve_access`, `await_approval`. |
+| `src/server/dispatch.rs` | Protocol-op routing and request/response decisions. |
+| `src/server/approval.rs` | Access resolution and the approval wait lifecycle. |
 | `src/server/worker.rs` | The single approval worker: dequeue → decrypt → insert grant. |
 | `src/peer.rs` | `SO_PEERPIDFD` peer pinning and `/proc` ancestry walk. |
 | `src/store.rs` | Human-tier ciphertext files; opens by inode, not path. |
@@ -67,17 +77,18 @@ Agent-tier keys never reach the daemon at all: the client decrypts
 
 | Task | Go to |
 |---|---|
-| Change how a request is authorized | `Registry::resolve`, `src/grants.rs:165` |
+| Change how a request is authorized | `Registry::resolve`, `src/grants.rs:188`; `src/server/approval.rs:29` |
 | Change ancestry / peer identity | `src/peer.rs:46` (`from_stream`), `:97` (`descends_from`) |
-| Add or change a protocol op | `src/proto.rs:93` (requests), `src/proto/response.rs` |
-| Change what the audit line records | `src/server.rs:336`, context built at `:200` |
-| Change how sops is invoked | `src/decrypt.rs:202`; failure classes at `:28` |
-| Change how the runtime directory is resolved | `resolveRuntimeDir`, `opencode/plugins/secretsd.ts`; `SocketPath::resolve`, `src/client.rs:33` |
-| Change which socket either half connects to | `resolveSocketPath`, `opencode/plugins/secretsd.ts`; `BrokerClient::from_environment`, `src/client.rs:89` |
+| Add or change a protocol op | `src/proto.rs:97` (requests), `src/proto/response.rs` |
+| Change source-root configuration | `Sources::config_path`, `src/config.rs:54`; `Sources::load`, `src/config.rs:70` |
+| Change what the audit line records | `src/server.rs:294`, context built at `:167`; sanitization in `src/audit.rs:19` |
+| Change how sops is invoked | `src/decrypt.rs:223`; failure classes at `:28` |
+| Change how the runtime directory is resolved | `resolveRuntimeDir`, `opencode/plugins/secretsd.ts`; `SocketPath::resolve`, `src/client.rs:35` |
+| Change which socket either half connects to | `resolveSocketPath`, `opencode/plugins/secretsd.ts`; `BrokerClient::from_environment`, `src/client.rs:91` |
 | Change the session token file's lifetime | `restoreTokenFile`, `opencode/plugins/secretsd.ts`; `ensureState` beside it |
-| Change the approval lifecycle | `src/server/worker.rs:26` |
+| Change the approval lifecycle | `src/server/approval.rs:49`; `src/server/worker.rs:27` |
 | Change the CLI surface | `src/client/cli.rs:17` |
-| Change grant lifetime or revocation | `GrantTable`, `src/grants.rs:218` |
+| Change grant lifetime or revocation | `GrantTable`, `src/grants.rs:241` |
 
 ## Non-negotiables
 
@@ -118,12 +129,12 @@ of them is a bug even if tests pass:
 cargo +nightly fmt --all -- --check   # nightly: imports_granularity, group_imports
 cargo clippy --all-targets --all-features -- -D warnings
 cargo nextest run --all-targets --all-features --workspace
-cargo +nightly miri nextest run --all-features -E 'test(/^(secret|grants|requests|proto|client)::tests::/)'
+cargo +nightly miri nextest run --all-features -E 'test(/^(secret|grants|requests|proto|client|config)::tests::/)'
 cargo machete && cargo deny check all
 bun install --frozen-lockfile && bun run test:secretsd-plugin
 ```
 
-Miri covers the pure `secret`, `grants`, `requests`, `proto`, and `client`
+Miri covers the pure `secret`, `grants`, `requests`, `proto`, `client`, and `config`
 modules. It cannot cover the `unsafe` fd-3 adoption in `server.rs`: that code
 requires a real socket. Guard it through review, the `LISTEN_PID`/`LISTEN_FDS`
 validation, and the integration tests in `tests/broker.rs`.
@@ -135,8 +146,8 @@ the major, anything else does not release. Never tag by hand. The version lands
 in `Cargo.toml` and `package.json` in the same commit so plugin and daemon match.
 
 Tests must not require a real YubiKey. Inject a fake decryptor with
-`SECRETSD_SOPS_BIN`, set the required `SECRETSD_HUMAN_DIR`, and use a scratch
-socket with `SECRETSD_SOCKET`. All are read from the **daemon's own
+`SECRETSD_SOPS_BIN`, set `SECRETSD_CONFIG` to a scratch source-root
+configuration, and use a scratch socket with `SECRETSD_SOCKET`. All are read from the **daemon's own
 environment**, never from a client request, since clients are untrusted.
 
 ## Consumers

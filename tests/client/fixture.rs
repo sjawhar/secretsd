@@ -7,7 +7,8 @@ use std::process::{Command, Output};
 use tempfile::TempDir;
 
 struct Fixture {
-    _directory: TempDir,
+    directory: TempDir,
+    config_path: PathBuf,
     dotfiles_dir: PathBuf,
     sops_log: PathBuf,
     sops_args_log: PathBuf,
@@ -18,11 +19,20 @@ impl Fixture {
     fn agent(contents: &str) -> Self {
         let directory = tempfile::tempdir().unwrap();
         let dotfiles_dir = directory.path().join("dotfiles");
+        let config_path = directory.path().join("config.toml");
         let bin_dir = directory.path().join("bin");
         let sops_log = directory.path().join("sops.log");
         let sops_args_log = directory.path().join("sops-args.log");
         fs::create_dir_all(&dotfiles_dir).unwrap();
         fs::create_dir_all(&bin_dir).unwrap();
+        fs::write(
+            &config_path,
+            format!(
+                "[source.dotfiles]\npath = \"{}\"\n",
+                dotfiles_dir.display()
+            ),
+        )
+        .unwrap();
         fs::write(dotfiles_dir.join("secrets.env"), contents).unwrap();
         symlink(
             Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-sops-ok"),
@@ -37,7 +47,8 @@ impl Fixture {
         .unwrap();
 
         Self {
-            _directory: directory,
+            directory,
+            config_path,
             dotfiles_dir,
             sops_log,
             sops_args_log,
@@ -56,9 +67,32 @@ impl Fixture {
     }
 
     fn write_human_name(&self, name: &str) {
-        let human_dir = self.dotfiles_dir.join("secrets.human.d");
+        self.write_human_name_in("dotfiles", &format!("{name}.env"));
+    }
+
+    fn add_root(&self, name: &str) {
+        let root_dir = self.root_dir(name);
+        fs::create_dir_all(&root_dir).unwrap();
+        let mut config = fs::OpenOptions::new()
+            .append(true)
+            .open(&self.config_path)
+            .unwrap();
+        writeln!(
+            config,
+            "\n[source.{name}]\npath = \"{}\"",
+            root_dir.display()
+        )
+        .unwrap();
+    }
+
+    fn write_human_name_in(&self, root: &str, file_name: &str) {
+        let human_dir = self.root_dir(root).join("secrets.human.d");
         fs::create_dir_all(&human_dir).unwrap();
-        fs::write(human_dir.join(format!("{name}.env")), b"ciphertext").unwrap();
+        fs::write(human_dir.join(file_name), b"ciphertext").unwrap();
+    }
+
+    fn write_agent_in(&self, root: &str, file_name: &str, contents: &str) {
+        fs::write(self.root_dir(root).join(file_name), contents).unwrap();
     }
 
     fn write_token(&self, token: &str) -> PathBuf {
@@ -76,7 +110,8 @@ impl Fixture {
             .args(arguments)
             .env_clear()
             .env("PATH", &self.path)
-            .env("DOTFILES_DIR", &self.dotfiles_dir)
+            .env("SECRETSD_CONFIG", &self.config_path)
+            .env("HOME", self.directory.path())
             .env("FAKE_SOPS_LOG", &self.sops_log)
             .env("FAKE_SOPS_ARGS_LOG", &self.sops_args_log)
             .env("FAKE_SOPS_PASSTHROUGH", "1")
@@ -100,7 +135,8 @@ impl Fixture {
             .args(arguments)
             .env_clear()
             .env("PATH", &self.path)
-            .env("DOTFILES_DIR", &self.dotfiles_dir)
+            .env("SECRETSD_CONFIG", &self.config_path)
+            .env("HOME", self.directory.path())
             .env("SECRETSD_SOCK", socket)
             .env("FAKE_SOPS_LOG", &self.sops_log)
             .env("FAKE_SOPS_ARGS_LOG", &self.sops_args_log)
@@ -128,5 +164,13 @@ impl Fixture {
 
     fn dotfiles_dir(&self) -> &Path {
         &self.dotfiles_dir
+    }
+
+    fn root_dir(&self, root: &str) -> PathBuf {
+        if root == "dotfiles" {
+            self.dotfiles_dir.clone()
+        } else {
+            self.directory.path().join(root)
+        }
     }
 }

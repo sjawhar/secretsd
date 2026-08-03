@@ -3,10 +3,14 @@ use std::time::{Duration, Instant};
 use secretsd::client::{
     BrokerClient, BrokerResponse, CliError, ClientError, HumanClient, read_token_file,
 };
-use secretsd::proto::ErrCode;
+use secretsd::proto::{ErrCode, PROTOCOL_VERSION};
 use secretsd::secret::SecretName;
 
 use super::{FakeBroker, Fixture, Reply};
+
+fn hello() -> String {
+    format!("HELLO\tversion={PROTOCOL_VERSION}")
+}
 
 #[test]
 fn broker_client_reads_an_exact_length_payload_from_a_fake_socket() {
@@ -15,7 +19,7 @@ fn broker_client_reads_an_exact_length_payload_from_a_fake_socket() {
     let result = BrokerClient::new(broker.socket()).call("GRANTS");
 
     assert_eq!(result, Ok(BrokerResponse::Bytes(b"abc".to_vec())));
-    assert_eq!(broker.frames(), ["HELLO\tversion=2", "GRANTS"]);
+    assert_eq!(broker.frames(), [hello(), "GRANTS".to_owned()]);
 }
 
 #[test]
@@ -30,7 +34,7 @@ fn broker_client_rejects_short_trailing_and_nul_payloads_from_a_fake_socket() {
         let result = BrokerClient::new(broker.socket()).call("GRANTS");
 
         assert_eq!(result, Err(ClientError::InvalidResponse));
-        assert_eq!(broker.frames(), ["HELLO\tversion=2", "GRANTS"]);
+        assert_eq!(broker.frames(), [hello(), "GRANTS".to_owned()]);
     }
 }
 
@@ -63,7 +67,7 @@ fn human_get_sends_the_callers_tty_once_without_a_software_gate() {
     assert_eq!(result.unwrap().as_slice(), b"human-value");
     assert_eq!(
         broker.frames(),
-        ["HELLO\tversion=2", "GET\tkey=HUMAN\ttty=/dev/pts/test"]
+        [hello(), "GET\tkey=HUMAN\ttty=/dev/pts/test".to_owned()]
     );
 }
 
@@ -89,7 +93,7 @@ fn human_get_reads_the_token_from_its_file_not_the_environment() {
     assert!(broker.saw_expected_token());
     assert_eq!(
         broker.frames(),
-        ["HELLO\tversion=2", "GET\tkey=HUMAN\ttoken=<redacted>"]
+        [hello(), "GET\tkey=HUMAN\ttoken=<redacted>".to_owned()]
     );
 }
 
@@ -104,7 +108,7 @@ fn human_get_routes_to_the_broker_when_the_agent_tier_is_absent() {
     assert_eq!(output.status.code(), Some(0));
     assert_eq!(output.stdout, b"human-value\n");
     assert_eq!(fixture.sops_calls(), 0);
-    assert_eq!(broker.frames(), ["HELLO\tversion=2", "GET\tkey=HUMAN"]);
+    assert_eq!(broker.frames(), [hello(), "GET\tkey=HUMAN".to_owned()]);
 }
 
 #[test]
@@ -125,7 +129,7 @@ fn get_with_no_request_lists_grants_without_sending_get() {
         b"{\"key\":\"HUMAN\",\"tier\":\"human\",\"grant\":false}\n"
     );
     assert_eq!(fixture.sops_calls(), 0);
-    assert_eq!(broker.frames(), ["HELLO\tversion=2", "GRANTS"]);
+    assert_eq!(broker.frames(), [hello(), "GRANTS".to_owned()]);
 }
 
 #[test]
@@ -150,7 +154,7 @@ fn get_with_no_request_reports_an_active_session_grant() {
         output.stdout,
         b"{\"key\":\"HUMAN\",\"tier\":\"human\",\"grant\":true}\n"
     );
-    assert_eq!(broker.frames(), ["HELLO\tversion=2", "GRANTS"]);
+    assert_eq!(broker.frames(), [hello(), "GRANTS".to_owned()]);
 }
 
 #[test]
@@ -202,7 +206,8 @@ fn every_daemon_error_has_distinct_retry_safe_guidance() {
             "non-interactive ssh host 'secrets get KEY'",
         ),
         (ErrCode::AgentTty, "known agent terminal"),
-        (ErrCode::NotHumanKey, "missing or was moved"),
+        (ErrCode::NotHumanKey, "restart secretsd"),
+        (ErrCode::AmbiguousKey, "remove or rename"),
         (ErrCode::Denied, "declined"),
         (ErrCode::Timeout, "expired"),
         (ErrCode::YubikeyUnreachable, "hardware path"),
@@ -237,12 +242,12 @@ fn control_operations_use_the_broker_without_a_token_or_tty() {
     assert_eq!(
         broker.frames(),
         [
-            "HELLO\tversion=2",
-            "GRANTS",
-            "HELLO\tversion=2",
-            "DENY\tid=7",
-            "HELLO\tversion=2",
-            "LOCK",
+            hello(),
+            "GRANTS".to_owned(),
+            hello(),
+            "DENY\tid=7".to_owned(),
+            hello(),
+            "LOCK".to_owned(),
         ]
     );
 }
@@ -268,7 +273,7 @@ fn bare_human_get_requests_a_grant_without_receiving_the_value() {
     );
     assert_eq!(
         broker.frames(),
-        ["HELLO\tversion=2", "REQUEST\tkey=HUMAN\ttoken=<redacted>"]
+        [hello(), "REQUEST\tkey=HUMAN\ttoken=<redacted>".to_owned()]
     );
     assert!(!String::from_utf8_lossy(&output.stdout).contains("human-value"));
 }

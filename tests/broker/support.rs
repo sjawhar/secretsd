@@ -4,11 +4,13 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 
+use secretsd::store::HumanSource;
 use secretsd::Config;
 
 struct Harness {
     _dir: tempfile::TempDir,
     socket: PathBuf,
+    human_sources: Vec<(String, PathBuf)>,
     sops_log: PathBuf,
     sops_args_log: PathBuf,
     hang_marker: PathBuf,
@@ -22,10 +24,18 @@ fn fake_sops_env_lock() -> &'static Mutex<()> {
 
 impl Harness {
     fn start(keys: &[&str]) -> Self {
-        Self::start_with_sops(keys, "fake-sops-ok")
+        Self::start_with_sources(&[("test", keys)])
     }
 
     fn start_with_sops(keys: &[&str], sops: &str) -> Self {
+        Self::start_with_sources_and_sops(&[("test", keys)], sops)
+    }
+
+    fn start_with_sources(sources: &[(&str, &[&str])]) -> Self {
+        Self::start_with_sources_and_sops(sources, "fake-sops-ok")
+    }
+
+    fn start_with_sources_and_sops(sources: &[(&str, &[&str])], sops: &str) -> Self {
         let fake_sops_env_lock = fake_sops_env_lock().lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
         let sops_log = dir.path().join("fake-sops-invocations.log");
@@ -46,16 +56,25 @@ impl Harness {
         // SAFETY: nextest executes every integration test in a separate process. This
         // test owns the harness environment lock and has not started daemon threads yet.
         unsafe { std::env::set_var("FAKE_SOPS_HANG_MARKER", &hang_marker) };
-        let human = dir.path().join("human.d");
-        std::fs::create_dir(&human).unwrap();
-        for key in keys {
-            std::fs::write(human.join(format!("{key}.env")), b"ciphertext").unwrap();
+        let mut human_sources = Vec::with_capacity(sources.len());
+        let mut configured_sources = Vec::with_capacity(sources.len());
+        for (label, keys) in sources {
+            let human = dir.path().join(format!("{label}.human.d"));
+            std::fs::create_dir(&human).unwrap();
+            for key in *keys {
+                std::fs::write(human.join(format!("{key}.env")), b"ciphertext").unwrap();
+            }
+            human_sources.push(((*label).to_owned(), human.clone()));
+            configured_sources.push(HumanSource {
+                label: (*label).to_owned(),
+                dir: human,
+            });
         }
         let socket = dir.path().join("secretsd.sock");
         let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
         let config = Config {
             socket_path: socket.clone(),
-            human_dir: human,
+            human_sources: configured_sources,
             sops_bin: fixtures.join(sops),
             pcsc_socket: None,
             yubikey_probe_argv: Vec::new(),
@@ -74,6 +93,7 @@ impl Harness {
         Self {
             _dir: dir,
             socket,
+            human_sources,
             sops_log,
             sops_args_log,
             hang_marker,
@@ -99,6 +119,14 @@ impl Harness {
 
     const fn socket(&self) -> &PathBuf {
         &self.socket
+    }
+
+    fn human_dir(&self, label: &str) -> &Path {
+        self.human_sources
+            .iter()
+            .find(|(configured_label, _)| configured_label == label)
+            .map(|(_, path)| path.as_path())
+            .unwrap()
     }
 
     const fn hang_marker(&self) -> &PathBuf {

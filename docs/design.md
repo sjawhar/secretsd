@@ -93,17 +93,21 @@ agent (OpenCode session)
 1. **`secrets`** (Rust, single binary): `secrets serve` holds grants and
    decrypted human-tier values in memory; runs the approval state machine;
    performs sops decrypts; and logs everything to journald.
-   - Deps: std + `nix` (SO_PEERCRED for logging/UID check) + `zeroize`.
-     No serde/dotenv crates on the plaintext path.
+   - Deps: std + `nix` (SO_PEERCRED for logging/UID check) + `zeroize` +
+     `tracing`/`tracing-subscriber` + `subtle` + `toml`/`serde`. Serde parses only source-roots
+     configuration (paths, never secret values); no serde/dotenv crates are on
+     the plaintext path.
    - Hardening: `mlockall(MCL_CURRENT|MCL_FUTURE)` (fail closed if it
      fails), `PR_SET_DUMPABLE=0`, no core dumps, plaintext never in
      logs/errors, zeroized buffers, `Restart=on-failure`.
-   - Input validation: key names must match `[A-Z][A-Z0-9_]*`; human-tier
+   - Input validation: key names must match `[A-Za-z_][A-Za-z0-9_]*`; human-tier
      files opened via `openat` against the `secrets.human.d` directory with
      `O_NOFOLLOW`, regular files only.
-   - `SECRETSD_HUMAN_DIR` is required daemon configuration and must be set to
-     an explicit deployment-owned directory by the user service. The daemon
-     refuses to start when it is absent.
+   - Source roots are loaded from daemon-owned `config.toml`, by default at
+     `~/.config/secretsd/config.toml`; `SECRETSD_CONFIG` selects an explicit
+     configuration path. Each root contributes `secrets.env`,
+     `secrets.local.env`, and `secrets.human.d`; missing files and human-tier
+     directories simply contribute no keys.
    - Restart semantics: grants are memory-only and lost on restart, along with
      the session registrations that scope them. This is the correct security
      default. Because nothing notifies a harness, the version handshake also
@@ -157,14 +161,14 @@ agent (OpenCode session)
      must not enter the transcript).
 
 3. **`secrets` client mode** (every invocation other than `secrets serve`):
-   preserves the CLI. The human-key set is derived from
-   `secrets.human.d/*.env` filenames: those keys **always** route through the
-   broker — a duplicate of a human key appearing in an agent-tier file is a
-   fail-closed error, never a silent broker bypass. All other keys use local
-   agent-tier sops decryption without contacting the daemon. Human-tier
-   operations connect to the socket, send the session token when present, and
-   block for the touch flow. No client-controlled daemon file-path overrides
-   exist.
+   preserves the CLI. The human-key set is derived from all configured source
+   roots' `secrets.human.d/<KEY>.env` and `<KEY>.local.env` filenames: those
+   keys **always** route through the broker — a duplicate human key in another
+   human location or an agent-tier file is a fail-closed error, never a silent
+   broker bypass. All other keys use local agent-tier sops decryption without
+   contacting the daemon. Human-tier operations connect to the socket, send
+   the session token when present, and block for the touch flow. No
+   client-controlled daemon file-path overrides exist.
    `serve` is a reserved first argument, so a key literally named `serve` is not
    usable in the `secrets KEY -- cmd` shorthand. The match is exact, so
    conventional SCREAMING_SNAKE names (including `SERVE`) are unaffected.
@@ -175,28 +179,26 @@ The "tier" concept reduces to: **a key's sops recipient set is its access
 class.** No policy file exists, so there is nothing for an agent to tamper
 with — enforcement is cryptographic.
 
-- **Auto (agent tier)**: `secrets.env` (committed), `secrets.local.env`
-  (devbox, gitignored) — unchanged files, unchanged recipients (agent keys +
-  YubiKey + recovery), unchanged zero-interaction consumers (voxtype, legion,
-  skill MCPs, `dojo/.env` infrastructure).
-- **Grant-required (human tier)**: `secrets.human.d/<KEY>.env` — one sops
-  dotenv file per key, recipients: YubiKey + recovery **only**. Per-key files
-  mean a grant decrypts only that key; broker memory never holds ungranted
-  values. Key names remain listable without decryption (sops encrypts
-  values, not names) — this also structurally fixes the known stray-blink
-  bug in `secrets list`.
+- **Auto (agent tier)**: every configured root contributes `secrets.local.env`
+  before `secrets.env`. These remain unattended, agent-recipient encrypted
+  dotenv files.
+- **Grant-required (human tier)**: each configured source root contributes
+  `secrets.human.d/<KEY>.env` or `<KEY>.local.env` — one sops dotenv file per
+  key, recipients: YubiKey + recovery **only**. Per-key files mean a grant
+  decrypts only that key; broker memory never holds ungranted values. Key names
+  remain listable without decryption (sops encrypts values, not names) — this
+  also structurally fixes the known stray-blink bug in `secrets list`.
 - Moving a key between classes = a deliberate re-encryption ceremony
   performed by the human (requires decrypting, which requires touch).
 - An agent can corrupt or swap ciphertext files (same-UID write access) but
   cannot weaken access: after decrypt, the broker requires the file to
   contain **exactly one assignment whose name equals the requested key**,
   and rejects symlinks. Corruption is DoS only, visible in jj diffs.
-- `.sops.yaml` **must gain a creation rule for `secrets\.human\.d/[^/]+\.env$`
-  (YubiKey + recovery only) ordered before the default rule** — today the
-  default rule carries agent recipients, so without this rule a new per-key
-  file would silently be agent-decryptable, bypassing the broker entirely.
-  The ceremony includes verifying that the agent key **fails** to decrypt
-  every `secrets.human.d/*.env`.
+- `.sops.yaml` needs a `secrets\.human\.d/[^/]+\.env$` creation rule (YubiKey
+  + recovery only) before the default rule. It already covers both
+  `<KEY>.env` and `<KEY>.local.env`; without it, a new per-key file would be
+  agent-decryptable and bypass the broker. Verify that the agent key fails to
+  decrypt every `secrets.human.d/*.env`.
 - Key *names* are visible in the public repo (filenames). This is not new —
   sops never encrypted dotenv names in `secrets.human.env` either. Accepted.
 
@@ -289,6 +291,11 @@ secrets get KEY --value                prints the secret; the only form that doe
 secrets get KEY --no-request           status without asking, so it never triggers a touch
 secrets KEY -- cmd                     injects into a child environment, never prints
 secrets list                            names only; never decrypts
+secrets sources                         lists configured source roots
+secrets edit [--source NAME]            edits an agent-tier source file
+secrets edit-local [--source NAME]      edits an agent-tier local source file
+secrets edit-human KEY [--source NAME] [--local]
+                                        edits a human-tier key file
 secrets grants                          active grants + pending requests
 secrets deny [id]                       reject a pending request
 secrets lock                            wipe all plaintext, revoke all grants
@@ -296,26 +303,12 @@ secrets approve [id]                    reserved for explicit-approve mode
 MCP: secrets_request(key)               grant flow trigger; no values returned
 ```
 
-## Migration
+## Migration status
 
-1. Add the `secrets.human.d/` creation rule to `.sops.yaml` (YubiKey +
-   recovery only, ordered before the default rule) and a
-   recipient-verification check (agent key must fail to decrypt any file
-   under `secrets.human.d/`). **This precedes any file creation.**
-2. Build + install `secrets` and the plugin on both machines (installer +
-   systemd user units; binary fits the `bin/` convention; `cargo-deny` in CI
-   posture per mise setup).
-3. One-time ceremony **on the laptop**: split `secrets.human.env` into
-   `secrets.human.d/<KEY>.env` (YubiKey decrypts; re-encrypt to YubiKey +
-   recovery only; recovery key stays in 1Password and never transits the
-   devbox). Run the recipient-verification check. Confirm no human key
-   also exists in an agent-tier file. `dojo/.env` is agent-tier and
-   untouched — no key ceremony.
-4. Install the Rust `secrets` client and route human-key requests by filename
-   through the broker; agent-tier reads remain local and daemon-independent.
-5. Verify (section below), then remove `secrets.human.env`.
-6. sops files never merge textually (existing rule; per-key files also
-   shrink conflict surface).
+The per-key human-secret migration is complete. Deployments configure all
+secret roots in `config.toml`; duplicate human keys across roots, or between
+`<KEY>.env` and `<KEY>.local.env`, are rejected as `AMBIGUOUS_KEY` rather than
+resolved by precedence.
 
 ## Verification
 

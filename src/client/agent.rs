@@ -14,20 +14,20 @@ use crate::secret::{SecretBytes, SecretName};
 /// Decrypts the unattended agent tier without connecting to `secretsd`.
 #[derive(Debug, Clone)]
 pub struct AgentStore {
-    dotfiles_dir: PathBuf,
+    files: Vec<PathBuf>,
     sops_bin: OsString,
 }
 
 impl AgentStore {
-    /// Construct an agent-tier store rooted at `dotfiles_dir`.
-    pub fn new(dotfiles_dir: impl AsRef<Path>, sops_bin: impl Into<OsString>) -> Self {
+    /// Decrypts an ordered list of sops dotenv files; earlier files win on duplicate names.
+    pub fn new(files: Vec<PathBuf>, sops_bin: impl Into<OsString>) -> Self {
         Self {
-            dotfiles_dir: dotfiles_dir.as_ref().to_path_buf(),
+            files,
             sops_bin: sops_bin.into(),
         }
     }
 
-    /// Return a named agent-tier value, with the local overlay taking precedence.
+    /// Return a named agent-tier value, with earlier files taking precedence.
     pub fn value(&self, name: &SecretName) -> Result<SecretBytes, CliError> {
         self.all()?
             .remove(name)
@@ -36,26 +36,21 @@ impl AgentStore {
 
     /// Check encrypted dotenv key names without decrypting their values.
     pub fn contains(&self, name: &SecretName) -> Result<bool, CliError> {
-        let local = self.dotfiles_dir.join("secrets.local.env");
-        let shared = self.dotfiles_dir.join("secrets.env");
-        for path in [&local, &shared] {
-            if path.is_file() && Self::contains_name(path, name)? {
+        for path in &self.files {
+            if path.is_file() && Self::names_in(path)?.contains(name) {
                 return Ok(true);
             }
         }
         Ok(false)
     }
 
-    /// Decrypt every agent-tier assignment with local values winning on conflicts.
+    /// Decrypt every agent-tier assignment with earlier files winning on conflicts.
     pub fn all(&self) -> Result<BTreeMap<SecretName, SecretBytes>, CliError> {
         let mut values = BTreeMap::new();
-        let local = self.dotfiles_dir.join("secrets.local.env");
-        if local.is_file() {
-            Self::merge_first_values(&mut values, self.decrypt_all(&local)?);
-        }
-        let shared = self.dotfiles_dir.join("secrets.env");
-        if shared.is_file() {
-            Self::merge_first_values(&mut values, self.decrypt_all(&shared)?);
+        for path in &self.files {
+            if path.is_file() {
+                Self::merge_first_values(&mut values, self.decrypt_all(path)?);
+            }
         }
         Ok(values)
     }
@@ -87,8 +82,10 @@ impl AgentStore {
         parsed
     }
 
-    fn contains_name(path: &Path, target: &SecretName) -> Result<bool, CliError> {
+    /// Read non-metadata agent-tier key names without decrypting their values.
+    pub(crate) fn names_in(path: &Path) -> Result<Vec<SecretName>, CliError> {
         let encrypted = fs::read(path).map_err(CliError::AgentKeySet)?;
+        let mut names = Vec::new();
         for line in encrypted.split(|byte| *byte == b'\n') {
             let line = line.strip_suffix(b"\r").unwrap_or(line);
             if line.is_empty() || line.first() == Some(&b'#') {
@@ -100,11 +97,11 @@ impl AgentStore {
             let raw_name = line.get(..separator).ok_or(CliError::InvalidDotenv)?;
             let name = std::str::from_utf8(raw_name).map_err(|_| CliError::InvalidDotenv)?;
             let name = SecretName::parse(name).map_err(|_| CliError::InvalidSecretName)?;
-            if !name.as_str().starts_with("sops_") && name == *target {
-                return Ok(true);
+            if !name.as_str().starts_with("sops_") {
+                names.push(name);
             }
         }
-        Ok(false)
+        Ok(names)
     }
 }
 
@@ -132,4 +129,68 @@ fn parse_dotenv(plaintext: &[u8]) -> Result<BTreeMap<SecretName, SecretBytes>, C
             .or_insert_with(|| SecretBytes::from_vec(value.to_vec()));
     }
     Ok(values)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::PathBuf;
+
+    use super::{AgentStore, CliError};
+    use crate::secret::SecretName;
+
+    fn name(raw: &str) -> SecretName {
+        SecretName::parse(raw).unwrap()
+    }
+
+    fn fake_sops(directory: &tempfile::TempDir) -> PathBuf {
+        let path = directory.path().join("fake-sops");
+        fs::write(&path, b"#!/bin/bash\ncat \"${!#}\"\n").unwrap();
+        let mut permissions = fs::metadata(&path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&path, permissions).unwrap();
+        path
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn earlier_file_wins_when_a_key_reappears_in_a_later_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = directory.path().join("first.env");
+        let second = directory.path().join("second.env");
+        let third = directory.path().join("third.env");
+        fs::write(&first, b"KEY=first\n").unwrap();
+        fs::write(&second, b"OTHER=second\n").unwrap();
+        fs::write(&third, b"KEY=third\n").unwrap();
+        let store = AgentStore::new(vec![first, second, third], fake_sops(&directory));
+
+        let value = store.value(&name("KEY")).unwrap();
+
+        assert_eq!(value.as_slice(), b"first");
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn listed_but_absent_file_is_skipped() {
+        let directory = tempfile::tempdir().unwrap();
+        let absent = directory.path().join("absent.env");
+        let present = directory.path().join("present.env");
+        fs::write(&present, b"KEY=present\n").unwrap();
+        let store = AgentStore::new(vec![absent, present], fake_sops(&directory));
+
+        let value = store.value(&name("KEY")).unwrap();
+
+        assert_eq!(value.as_slice(), b"present");
+    }
+
+    #[test]
+    fn empty_file_list_reports_missing_secret() {
+        let name = name("KEY");
+        let store = AgentStore::new(Vec::new(), "sops");
+
+        let result = store.value(&name);
+
+        assert!(matches!(result, Err(CliError::MissingSecret(actual)) if actual == name));
+    }
 }

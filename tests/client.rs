@@ -10,6 +10,7 @@ use std::os::unix::net::UnixListener;
 use std::thread;
 
 use secretsd::client::{BrokerClient, BrokerResponse, ClientError, SocketPath, parse_response};
+use secretsd::proto::PROTOCOL_VERSION;
 
 #[path = "client/broker.rs"]
 mod fake_broker;
@@ -17,6 +18,12 @@ use fake_broker::{FakeBroker, Reply};
 include!("client/fixture.rs");
 #[path = "client/broker_transport.rs"]
 mod broker_transport;
+#[path = "client/edit.rs"]
+mod edit;
+#[path = "client/multi_source.rs"]
+mod multi_source;
+#[path = "client/sources.rs"]
+mod sources;
 
 #[test]
 fn exact_payload_accepts_declared_non_nul_bytes() {
@@ -66,7 +73,7 @@ fn client_rejects_wrong_hello_field_name() {
         let mut reader = BufReader::new(stream);
         let mut hello = String::new();
         reader.read_line(&mut hello).unwrap();
-        assert_eq!(hello, "HELLO\tversion=2\n");
+        assert_eq!(hello, format!("HELLO\tversion={PROTOCOL_VERSION}\n"));
         let mut stream = reader.into_inner();
         stream.write_all(b"OK\tv=1\n").unwrap();
     });
@@ -85,9 +92,11 @@ fn client_handshakes_before_sending_a_request() {
         let mut reader = BufReader::new(stream);
         let mut hello = String::new();
         reader.read_line(&mut hello).unwrap();
-        assert_eq!(hello, "HELLO\tversion=2\n");
+        assert_eq!(hello, format!("HELLO\tversion={PROTOCOL_VERSION}\n"));
         let mut stream = reader.into_inner();
-        stream.write_all(b"OK\tversion=2\n").unwrap();
+        stream
+            .write_all(format!("OK\tversion={PROTOCOL_VERSION}\n").as_bytes())
+            .unwrap();
         drop(stream);
 
         let (stream, _) = listener.accept().unwrap();
@@ -186,20 +195,6 @@ fn get_rejects_missing_extra_and_unknown_arguments() {
         );
     }
     assert_eq!(fixture.sops_calls(), 0);
-}
-
-#[test]
-fn list_uses_human_filenames_without_decrypting_human_files() {
-    let fixture = Fixture::agent("AGENT_ONLY=agent-value\n");
-    fixture.write_human_name("HUMAN");
-
-    let output = fixture.run_minimal(["list"]);
-
-    assert_eq!(output.status.code(), Some(0));
-    assert_eq!(output.stdout, b"AGENT_ONLY\nHUMAN  (human tier)\n");
-    assert_eq!(fixture.sops_calls(), 1);
-    assert!(fixture.sops_log().contains("secrets.env"));
-    assert!(!fixture.sops_log().contains("HUMAN.env"));
 }
 
 #[test]

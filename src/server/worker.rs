@@ -2,6 +2,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use super::{Shared, lock_state, wait_state};
+use crate::audit::sanitize_audit_value;
 use crate::decrypt::Decryptor;
 use crate::grants::Scope;
 use crate::requests::RequestId;
@@ -67,7 +68,7 @@ pub(super) fn worker(shared: &Shared) {
         let shared_for_start = Arc::clone(shared);
         let decrypted =
             job.decryptor
-                .decrypt_with_start(&job.store, &job.key, move |process_group| {
+                .decrypt_opened_with_start(&job.store, &job.key, move |process_group| {
                     let (mutex, _) = &*shared_for_start;
                     let mut state = lock_state(mutex);
                     if state.queue.state_of(job.id)
@@ -89,7 +90,7 @@ pub(super) fn worker(shared: &Shared) {
         let mut state = lock_state(mutex);
         state.kill_active(job.id);
         match decrypted {
-            Ok(value) => {
+            Ok(decrypted) => {
                 let session_is_active = match &job.scope {
                     Scope::Session(token) => state
                         .registry
@@ -104,9 +105,18 @@ pub(super) fn worker(shared: &Shared) {
                     state.queue.deny(job.id);
                 }
                 if state.queue.complete(job.id, job.generation, Instant::now()) {
-                    state
-                        .grants
-                        .insert(job.scope, job.key, value, Instant::now());
+                    state.grants.insert(
+                        job.scope,
+                        job.key,
+                        decrypted.value,
+                        Instant::now(),
+                        decrypted.source.clone(),
+                    );
+                    tracing::info!(
+                        source = %sanitize_audit_value(&decrypted.source),
+                        request_id = ?job.id,
+                        "grant inserted"
+                    );
                 }
             }
             Err(error) => {

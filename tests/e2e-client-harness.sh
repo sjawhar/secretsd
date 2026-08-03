@@ -6,9 +6,14 @@ readonly skip_status=77
 readonly token='aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
 readonly session='e2e-client'
 readonly human_key='E2E_KEY'
+readonly local_human_key='LOCAL_KEY'
+readonly root2_human_key='ROOT2_KEY'
 readonly agent_key='AGENT_KEY'
 readonly human_value='value-for-e2e-client'
+readonly local_human_value='value-for-local-human'
+readonly root2_human_value='value-for-root2-human'
 readonly agent_value='value-for-agent-client'
+readonly grants_pattern=$'^KEY\tSCOPE\tAGE\nE2E_KEY\tsession\t[0-9]+s\nLOCAL_KEY\tsession\t[0-9]+s\nROOT2_KEY\tsession\t[0-9]+s$'
 
 report() {
   printf 'e2e-client: %s\n' "$1"
@@ -80,11 +85,14 @@ else
 fi
 readonly dotfiles_dir="$scratch/dotfiles"
 readonly human_dir="$dotfiles_dir/secrets.human.d"
+readonly private_dir="$scratch/private"
+readonly private_human_dir="$private_dir/secrets.human.d"
 readonly socket="$scratch/secretsd.sock"
 readonly token_file="$scratch/session.token"
 readonly harness_bin="$scratch/bin"
 readonly sops_log="$scratch/real-sops-invocations.log"
 readonly daemon_log="$scratch/daemon.log"
+readonly daemon_config="$scratch/config.toml"
 
 cleanup() {
   local status=$?
@@ -122,7 +130,7 @@ run_client() {
   env -i \
     PATH="$harness_bin:$PATH" \
     HOME="$HOME" \
-    DOTFILES_DIR="$dotfiles_dir" \
+    SECRETSD_CONFIG="$daemon_config" \
     SECRETSD_SOCK="$socket" \
     SECRETSD_SESSION_TOKEN_FILE="$token_file" \
     SOPS_AGE_KEY_FILE="$age_key_file" \
@@ -132,9 +140,10 @@ run_client() {
 }
 
 if [[ "$after_register" == false ]]; then
-  report '1/10 preparing scratch files and real-sops wrapper'
+  report '1/12 preparing scratch files and real-sops wrapper'
   umask 077
-  mkdir -p "$human_dir" "$harness_bin"
+  mkdir -p "$human_dir" "$private_human_dir" "$harness_bin"
+  printf '[source.dotfiles]\npath = "%s"\n\n[source.private]\npath = "%s"\n' "$dotfiles_dir" "$private_dir" > "$daemon_config"
 
   # The wrapper only records argv and execs the real sops binary; fake-sops remains
   # reserved for unit fixtures that need deterministic fake plaintext.
@@ -159,31 +168,36 @@ creation_rules:
     age: $agent_recipient
 EOF
   printf '%s=%s\n' "$human_key" "$human_value" > "$scratch/p.env"
+  printf '%s=%s\n' "$local_human_key" "$local_human_value" > "$scratch/local.env"
+  printf '%s=%s\n' "$root2_human_key" "$root2_human_value" > "$scratch/root2.env"
   printf '%s=%s\n' "$agent_key" "$agent_value" > "$scratch/agent.env"
 
-  report '2/10 encrypting the human and agent fixtures with real sops'
+  report '2/12 encrypting the human and agent fixtures with real sops'
   (
     cd "$scratch"
     "$real_sops" --filename-override "$scratch/plain.env" --input-type dotenv --output-type dotenv -e "$scratch/p.env" > "$human_dir/$human_key.env"
+    "$real_sops" --filename-override "$scratch/plain.env" --input-type dotenv --output-type dotenv -e "$scratch/local.env" > "$human_dir/$local_human_key.local.env"
+    "$real_sops" --filename-override "$scratch/plain.env" --input-type dotenv --output-type dotenv -e "$scratch/root2.env" > "$private_human_dir/$root2_human_key.env"
     "$real_sops" --filename-override "$scratch/secrets.env" --input-type dotenv --output-type dotenv -e "$scratch/agent.env" > "$dotfiles_dir/secrets.env"
   )
 
-  report '3/10 confirming filename override chose the disk-age recipient'
+  report '3/12 confirming filename override chose the disk-age recipient'
   grep -F --quiet "$agent_recipient" "$human_dir/$human_key.env" || fail 'human fixture lacks the disk-age recipient'
   if grep -F --quiet "$unavailable_human_recipient" "$human_dir/$human_key.env"; then
     fail 'human fixture matched the unavailable human-recipient creation rule'
   fi
 
-  report '4/10 starting the built daemon on the scratch socket'
-  # The daemon consumes SECRETSD_HUMAN_DIR directly, while the client derives
-  # DOTFILES_DIR/secrets.human.d; both must name this same scratch directory.
+  report '4/12 starting the built daemon on the scratch socket'
+  # The daemon loads its source root from config.toml, while the client resolves
+  # the same root through SECRETSD_CONFIG.
   # Optional memlock is local-harness-only; production keeps the strict default.
   env -i \
     PATH="$harness_bin:$PATH" \
-    HOME="$HOME" \
+    HOME="$scratch" \
     SECRETSD_MEMLOCK=optional \
+    RUST_LOG=info \
     SECRETSD_SOCKET="$socket" \
-    SECRETSD_HUMAN_DIR="$human_dir" \
+    SECRETSD_CONFIG="$daemon_config" \
     SECRETSD_SOPS_BIN="$harness_bin/sops" \
     SOPS_AGE_KEY_FILE="$age_key_file" \
     REAL_SOPS_BIN="$real_sops" \
@@ -199,7 +213,7 @@ EOF
   done
   [[ -S "$socket" ]] || fail 'daemon did not create its scratch socket'
 
-  report '5/10 registering the session token over the real daemon protocol'
+  report '5/12 registering the session token over the real daemon protocol'
   # Replacing this shell preserves the registered pid for the client descendants.
   export E2E_CLIENT_HARNESS_SCRATCH="$scratch"
   export E2E_CLIENT_HARNESS_DAEMON_PID="$daemon_pid"
@@ -220,37 +234,50 @@ fi
 printf '%s' "$token" > "$token_file"
 chmod 600 "$token_file"
 
-report '6/10 fetching the human value through the real client'
+report '6/12 fetching the human value through the real client'
 first_get="$(run_client get "$human_key" --value)"
 [[ "$first_get" == "$human_value" ]] || fail 'first get returned an unexpected value'
 assert_sops_counts 2 1 'first get'
-report '6/10 get returned the expected value [redacted]; real-sops total=2 daemon=1'
+report '6/12 get returned the expected value [redacted]; real-sops total=2 daemon=1'
 
-report '7/10 fetching the cached human value through the real client'
+report '7/12 fetching the cached human value through the real client'
 second_get="$(run_client get "$human_key" --value)"
 [[ "$second_get" == "$human_value" ]] || fail 'cached get returned an unexpected value'
 assert_sops_counts 3 1 'cached get'
-report '7/10 cached get returned the expected value [redacted]; real-sops total=3 daemon=1'
+report '7/12 cached get returned the expected value [redacted]; real-sops total=3 daemon=1'
 
-report '8/10 injecting the cached value into a child environment'
+report '8/12 injecting the cached value into a child environment'
 injected="$(run_client "$human_key" -- sh -c 'printf %s "$E2E_KEY"')"
 [[ "$injected" == "$human_value" ]] || fail 'injection returned an unexpected child value'
 assert_sops_counts 4 1 'injection'
-report '8/10 injection returned the expected child value [redacted]; real-sops total=4 daemon=1'
+report '8/12 injection returned the expected value [redacted]; real-sops total=4 daemon=1'
 
-report '9/10 listing both tiers and active grants'
+report '9/12 fetching a root1 local human key and checking its audit source'
+local_get="$(run_client get "$local_human_key" --value)"
+[[ "$local_get" == "$local_human_value" ]] || fail 'local get returned an unexpected value'
+grep -E --quiet 'source.*dotfiles\.local' "$daemon_log" || fail 'local key audit did not record source=dotfiles.local'
+assert_sops_counts 6 2 'local human get'
+report '9/12 local human get returned the expected value [redacted]; real-sops total=6 daemon=2'
+
+report '10/12 fetching a human key that exists only in the second source root'
+root2_get="$(run_client get "$root2_human_key" --value)"
+[[ "$root2_get" == "$root2_human_value" ]] || fail 'root2 get returned an unexpected value'
+assert_sops_counts 8 3 'root2 human get'
+report '10/12 root2 human get returned the expected value [redacted]; real-sops total=8 daemon=3'
+
+report '11/12 listing both tiers and active grants'
 listing="$(run_client list)"
-[[ "$listing" == $'AGENT_KEY\nE2E_KEY  (human tier)' ]] || fail 'list returned unexpected tier names'
-assert_sops_counts 5 1 'list'
+[[ "$listing" == $'AGENT_KEY\nE2E_KEY  (human tier: dotfiles)\nLOCAL_KEY  (human tier: dotfiles.local)\nROOT2_KEY  (human tier: private)' ]] || fail 'list returned unexpected tier names'
+assert_sops_counts 9 3 'list'
 grants="$(run_client grants)"
-[[ "$grants" =~ ^$'KEY\tSCOPE\tAGE\nE2E_KEY\tsession\t'[0-9]+s$ ]] || fail 'grants did not show the session grant'
-assert_sops_counts 5 1 'grants'
-report '9/10 list and grants returned expected redacted state; real-sops total=5 daemon=1'
+[[ "$grants" =~ $grants_pattern ]] || fail 'grants did not show every session grant'
+assert_sops_counts 9 3 'grants'
+report '11/12 list and grants returned expected redacted state; real-sops total=9 daemon=3'
 
-report '10/10 locking the daemon and confirming the grant is cleared'
+report '12/12 locking the daemon and confirming every grant is cleared'
 run_client lock
-assert_sops_counts 5 1 'lock'
+assert_sops_counts 9 3 'lock'
 [[ "$(run_client grants)" == 'no active grants' ]] || fail 'lock did not clear the session grant'
-assert_sops_counts 5 1 'post-lock grants'
-report '10/10 lock cleared the grant; real-sops total=5 daemon=1'
+assert_sops_counts 9 3 'post-lock grants'
+report '12/12 lock cleared every grant; real-sops total=9 daemon=3'
 report 'PASS: real daemon, real client, and real sops completed on scratch state'

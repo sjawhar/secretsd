@@ -9,8 +9,11 @@ use std::sync::mpsc;
 
 use nix::sys::signal::killpg;
 use nix::unistd::Pid;
+use secretsd::proto::PROTOCOL_VERSION;
 #[path = "broker/grants.rs"]
 mod grants;
+#[path = "broker/sources.rs"]
+mod sources;
 include!("broker/support.rs");
 
 fn send_to(socket: &PathBuf, line: &str) -> (String, Vec<u8>) {
@@ -105,6 +108,7 @@ fn request_log_attributes_a_grant_without_secret_or_token_bytes() {
     let log = String::from_utf8(request_log().lock().unwrap().clone()).unwrap();
     assert!(log.contains("request handled"), "{log}");
     assert!(log.contains("key=DEEL_API_KEY"), "{log}");
+    assert!(log.contains("source=test"), "{log}");
     assert!(
         log.contains("untrusted_registered_session=Some(\"ses_a\")"),
         "{log}"
@@ -122,7 +126,7 @@ fn request_log_attributes_a_grant_without_secret_or_token_bytes() {
 #[test]
 fn hello_reports_protocol_version() {
     let harness = Harness::start(&[]);
-    let (header, _) = harness.send("HELLO\tversion=2");
+    let (header, _) = harness.send(&format!("HELLO\tversion={PROTOCOL_VERSION}"));
     assert!(header.starts_with("OK"), "{header}");
     drop(harness);
 }
@@ -151,7 +155,7 @@ fn stalled_connections_are_bounded_and_do_not_block_requests() {
         "stalled clients created unbounded handler threads: {baseline_threads} -> {threads_after_pressure}"
     );
 
-    let (header, _) = harness.send("HELLO\tversion=2");
+    let (header, _) = harness.send(&format!("HELLO\tversion={PROTOCOL_VERSION}"));
     assert!(
         header.starts_with("OK"),
         "request was blocked by stalled clients: {header}"

@@ -5,8 +5,8 @@ any argv that is not `serve`.
 
 ## Tier split
 
-`Context::value` (`cli.rs:159`) forks on one fact: is the key a filename in
-`secrets.human.d/`?
+`Context::value` forks on one fact: does the key appear in the configured
+source roots' `secrets.human.d/` directories?
 
 - **Agent tier** — decrypted here, in-process, by shelling out to sops. The
   daemon is never contacted, no grant exists, no touch happens.
@@ -19,6 +19,7 @@ preference for one.
 | File | Owns |
 |---|---|
 | `cli.rs` | argv dispatch, the `get`/`list`/`edit`/inject surface |
+| `../config.rs` | source-root loading and agent-file precedence shared with the daemon |
 | `agent.rs` | local sops decryption of `secrets.env` |
 | `human.rs` | broker transport; builds the scoped frame for `GET`/`REQUEST` |
 | `response.rs` | parsing broker replies, including exact-length payloads |

@@ -1,17 +1,29 @@
 //! Filename-only discovery for the human tier.
 
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
+use std::collections::btree_map::Entry;
 use std::fmt;
-use std::path::Path;
+use std::path::PathBuf;
 
 use zeroize::Zeroizing;
 
 use super::{BrokerClient, BrokerResponse, CliError, ClientError, caller_tty, read_token_file};
-use crate::secret::{SecretBytes, SecretName};
+use crate::config::SourceRoot;
+use crate::secret::{HumanFileName, SecretBytes, SecretName, parse_human_file_name};
 
 /// Validated human-tier key names discovered without reading ciphertext files.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct HumanNames(BTreeSet<SecretName>);
+pub struct HumanNames(BTreeMap<SecretName, HumanLocation>);
+
+/// A configured human-tier key file and the source label exposed by `secrets list`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct HumanLocation {
+    /// Source-root label, with a `.local` suffix for machine-local files.
+    pub label: String,
+    /// Configured ciphertext path for legacy edit commands.
+    pub path: PathBuf,
+}
 
 /// Broker-backed access to a human-tier secret for one caller scope.
 pub struct HumanClient {
@@ -95,21 +107,49 @@ impl HumanClient {
 }
 
 impl HumanNames {
-    /// Read validated `*.env` file stems from `directory` without opening the files.
-    pub fn load(directory: &Path) -> Result<Self, CliError> {
-        if !directory.is_dir() {
-            return Ok(Self(BTreeSet::new()));
-        }
-        let mut names = BTreeSet::new();
-        for entry in std::fs::read_dir(directory).map_err(CliError::HumanDirectory)? {
-            let entry = entry.map_err(CliError::HumanDirectory)?;
-            let path = entry.path();
-            if path.extension().is_some_and(|extension| extension == "env") {
-                let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+    /// Union configured human-tier directories without reading ciphertext files.
+    pub fn load(roots: &[SourceRoot]) -> Result<Self, CliError> {
+        let mut names = BTreeMap::new();
+        for root in roots {
+            let directory = root.human_dir();
+            if !directory.is_dir() {
+                continue;
+            }
+            let mut entries = std::fs::read_dir(directory)
+                .map_err(CliError::HumanDirectory)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(CliError::HumanDirectory)?;
+            entries.sort_by_key(std::fs::DirEntry::file_name);
+            for entry in entries {
+                let path = entry.path();
+                let Some(file_name) = path.file_name().and_then(|file_name| file_name.to_str())
+                else {
                     return Err(CliError::InvalidHumanFile);
                 };
-                let name = SecretName::parse(stem).map_err(|_| CliError::InvalidHumanFile)?;
-                names.insert(name);
+                match parse_human_file_name(file_name) {
+                    HumanFileName::Ignored => {}
+                    HumanFileName::Invalid => return Err(CliError::InvalidHumanFile),
+                    HumanFileName::Key { name, local } => {
+                        let label = if local {
+                            format!("{}.local", root.name)
+                        } else {
+                            root.name.clone()
+                        };
+                        let location = HumanLocation { label, path };
+                        match names.entry(name.clone()) {
+                            Entry::Vacant(entry) => {
+                                entry.insert(location);
+                            }
+                            Entry::Occupied(first) => {
+                                return Err(CliError::DuplicateHumanKey {
+                                    name,
+                                    first: first.get().label.clone(),
+                                    second: location.label,
+                                });
+                            }
+                        }
+                    }
+                }
             }
         }
         Ok(Self(names))
@@ -117,11 +157,16 @@ impl HumanNames {
 
     /// Test whether a key belongs to the human tier.
     pub fn contains(&self, name: &SecretName) -> bool {
-        self.0.contains(name)
+        self.0.contains_key(name)
     }
 
-    /// Iterate names in stable lexical order.
-    pub fn iter(&self) -> impl Iterator<Item = &SecretName> {
+    /// Find a human-tier key's configured location.
+    pub fn location(&self, name: &SecretName) -> Option<&HumanLocation> {
+        self.0.get(name)
+    }
+
+    /// Iterate key names and locations in stable lexical order.
+    pub fn iter(&self) -> impl Iterator<Item = (&SecretName, &HumanLocation)> {
         self.0.iter()
     }
 }

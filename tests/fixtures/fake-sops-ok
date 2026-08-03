@@ -45,5 +45,6 @@ if [ -n "${FAKE_SOPS_PASSTHROUGH:-}" ]; then
   cat "$path"
 else
   base=$(basename "$path" .env)
+  base=${base%.local}
   echo "${base}=value-for-${base}"
 fi

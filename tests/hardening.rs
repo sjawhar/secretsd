@@ -6,11 +6,21 @@ use std::time::Duration;
 
 use secretsd::hardening::{self, MemlockPolicy};
 
+fn write_source_config(directory: &tempfile::TempDir) -> std::io::Result<std::path::PathBuf> {
+    let path = directory.path().join("config.toml");
+    std::fs::write(
+        &path,
+        format!("[source.test]\npath = \"{}\"\n", directory.path().display()),
+    )?;
+    Ok(path)
+}
+
 fn start_daemon_with_memlock_limit(
     limit: &str,
     policy: Option<&str>,
 ) -> std::io::Result<(tempfile::TempDir, Child)> {
     let directory = tempfile::tempdir()?;
+    let config_path = write_source_config(&directory)?;
     let binary = env!("CARGO_BIN_EXE_secrets");
     let mut command = Command::new("bash");
     command
@@ -23,7 +33,8 @@ fn start_daemon_with_memlock_limit(
             "serve",
         ])
         .env("SECRETSD_SOCKET", directory.path().join("broker.sock"))
-        .env("SECRETSD_HUMAN_DIR", directory.path().join("human"))
+        .env("SECRETSD_CONFIG", config_path)
+        .env("HOME", directory.path())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     if let Some(policy) = policy {
@@ -103,6 +114,7 @@ fn required_memlock_fails_closed_when_locking_is_unavailable() {
 fn low_memlock_limit_exits_with_actionable_diagnostic_instead_of_sigabrt() {
     // Given a daemon process restricted to an 8 KiB memlock limit.
     let directory = tempfile::tempdir().expect("create temporary directory");
+    let config_path = write_source_config(&directory).expect("write source config");
     let binary = env!("CARGO_BIN_EXE_secrets");
 
     // When it starts before any threads are created.
@@ -115,7 +127,8 @@ fn low_memlock_limit_exits_with_actionable_diagnostic_instead_of_sigabrt() {
             "serve",
         ])
         .env("SECRETSD_SOCKET", directory.path().join("broker.sock"))
-        .env("SECRETSD_HUMAN_DIR", directory.path().join("human"))
+        .env("SECRETSD_CONFIG", config_path)
+        .env("HOME", directory.path())
         .output()
         .expect("start low-memlock daemon");
 

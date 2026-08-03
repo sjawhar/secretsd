@@ -14,7 +14,7 @@ use zeroize::Zeroize;
 
 use crate::proto::ErrCode;
 use crate::secret::{SecretBytes, SecretName, parse_single_assignment};
-use crate::store::HumanStore;
+use crate::store::{HumanStore, OpenedHumanFile};
 
 /// Polling period while a sops child is active.
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -163,6 +163,11 @@ pub struct Decryptor {
     reachability: PcscReachability,
 }
 
+pub(crate) struct DecryptedHumanFile {
+    pub(crate) source: String,
+    pub(crate) value: SecretBytes,
+}
+
 impl Decryptor {
     /// Build a decryptor.
     pub const fn new(sops_bin: PathBuf, timeout: Duration, reachability: PcscReachability) -> Self {
@@ -193,10 +198,26 @@ impl Decryptor {
     where
         F: FnOnce(i32),
     {
+        self.decrypt_opened_with_start(store, key, on_started)
+            .map(|decrypted| decrypted.value)
+    }
+
+    pub(crate) fn decrypt_opened_with_start<F>(
+        &self,
+        store: &HumanStore,
+        key: &SecretName,
+        on_started: F,
+    ) -> Result<DecryptedHumanFile, ErrCode>
+    where
+        F: FnOnce(i32),
+    {
         if !self.reachable() {
             return Err(ErrCode::YubikeyUnreachable);
         }
-        let validated = store.open(key)?;
+        let OpenedHumanFile {
+            label: source,
+            file: validated,
+        } = store.open(key)?;
         let inherited = duplicate_ciphertext_fd(validated.as_raw_fd())?;
         let fd_path = format!("/proc/self/fd/{}", inherited.as_raw_fd());
         let mut child = Command::new(&self.sops_bin)
@@ -252,7 +273,7 @@ impl Decryptor {
                     }
                     let result = parse_single_assignment(&stdout, key);
                     stdout.zeroize();
-                    return result;
+                    return result.map(|value| DecryptedHumanFile { source, value });
                 }
                 Ok(None) if Instant::now() >= deadline => {
                     let _ = killpg(Pid::from_raw(process_id), Signal::SIGKILL);

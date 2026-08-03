@@ -57,7 +57,7 @@ jobs:
       # Miri isolation cannot execute the filesystem and socket tests.
       - env:
           MIRIFLAGS: "-Zmiri-strict-provenance -Zmiri-symbolic-alignment-check"
-        run: cargo +nightly miri nextest run --all-features -E 'test(/^(secret|grants|requests|proto|client)::tests::/)'
+        run: cargo +nightly miri nextest run --all-features -E 'test(/^(secret|grants|requests|proto|client|config)::tests::/)'
 
   machete:
     runs-on: ubuntu-latest

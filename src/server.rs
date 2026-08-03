@@ -6,7 +6,9 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, mpsc};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(test)]
+use std::time::Instant;
 
 use nix::errno::Errno;
 use nix::sys::signal::{Signal, killpg};
@@ -16,13 +18,16 @@ use nix::sys::stat::{SFlag, fstat};
 use nix::unistd::{Pid, geteuid};
 
 use crate::Config;
+#[cfg(test)]
+use crate::audit::MAX_AUDIT_VALUE_BYTES;
+use crate::audit::sanitize_audit_value;
 use crate::decrypt::Decryptor;
-use crate::grants::{GrantTable, Registry, Scope, SessionToken};
+use crate::grants::{GrantTable, Registry, SessionToken};
 use crate::proto::{ErrCode, MAX_FRAME_BYTES, Request, Response, format_response, parse_request};
 use crate::requests::{Queue, QueueLimits, RequestId};
-use crate::secret::SecretName;
 use crate::store::HumanStore;
 
+mod approval;
 mod dispatch;
 mod worker;
 
@@ -41,7 +46,6 @@ const CONTROL_CONNECTION_QUEUE_DEPTH: usize = 8;
 const CONNECTION_CAPACITY: usize = CONNECTION_WORKERS + CONNECTION_QUEUE_DEPTH;
 const CONNECTION_READ_TIMEOUT: Duration = Duration::from_millis(250);
 const CONNECTION_CAPACITY_RESPONSE: &[u8] = b"ERR\tINTERNAL\tconnection capacity reached\n";
-const MAX_AUDIT_VALUE_BYTES: usize = 256;
 
 #[derive(Debug)]
 struct State {
@@ -79,7 +83,7 @@ impl State {
                 ttl: config.request_ttl,
                 max_pending_per_scope: config.max_pending_per_scope,
             }),
-            store: HumanStore::new(config.human_dir.clone()),
+            store: HumanStore::new(config.human_sources.clone()),
             decryptor: config.decryptor(),
             config,
             failures: Vec::new(),
@@ -153,48 +157,11 @@ const fn peer_uid_is_authorized(peer_uid: u32, daemon_uid: u32) -> bool {
     peer_uid == daemon_uid
 }
 
-fn append_audit_piece(rendered: &mut String, piece: &str) -> bool {
-    if rendered.len().saturating_add(piece.len()) > MAX_AUDIT_VALUE_BYTES {
-        while rendered.len() > MAX_AUDIT_VALUE_BYTES.saturating_sub('…'.len_utf8()) {
-            rendered.pop();
-        }
-        rendered.push('…');
-        return false;
-    }
-    rendered.push_str(piece);
-    true
-}
-
-fn sanitize_audit_value(value: &str) -> String {
-    let mut rendered = String::with_capacity(value.len().min(MAX_AUDIT_VALUE_BYTES));
-    for character in value.chars() {
-        let appended = match character {
-            '\r' => append_audit_piece(&mut rendered, r"\r"),
-            '\n' => append_audit_piece(&mut rendered, r"\n"),
-            '\t' => append_audit_piece(&mut rendered, r"\t"),
-            '\0' => append_audit_piece(&mut rendered, r"\0"),
-            control if control.is_control() => {
-                let escaped = format!(r"\u{{{:04X}}}", u32::from(control));
-                append_audit_piece(&mut rendered, &escaped)
-            }
-            printable => {
-                let mut encoded = [0; 4];
-                append_audit_piece(&mut rendered, printable.encode_utf8(&mut encoded))
-            }
-        };
-        if !appended {
-            return rendered;
-        }
-    }
-    rendered
-}
-
 #[derive(Debug)]
 struct AuditContext {
     key: String,
     untrusted_registered_session: Option<String>,
     registered_root_pid: Option<i32>,
-    request_id: Option<RequestId>,
 }
 
 fn audit_context(request: &Request, shared: &Shared) -> AuditContext {
@@ -202,12 +169,9 @@ fn audit_context(request: &Request, shared: &Shared) -> AuditContext {
         key: request_key(request).map_or_else(|| "-".to_owned(), sanitize_audit_value),
         untrusted_registered_session: None,
         registered_root_pid: None,
-        request_id: None,
     };
-    let (raw_key, token_hex) = match request {
-        Request::Get { key, token_hex, .. } | Request::RequestGrant { key, token_hex, .. } => {
-            (key, token_hex)
-        }
+    let token_hex = match request {
+        Request::Get { token_hex, .. } | Request::RequestGrant { token_hex, .. } => token_hex,
         Request::Register { session, .. } => {
             // The pid on the wire is not recorded: `caller_pid` on the log line
             // carries the kernel's view of who actually registered.
@@ -226,26 +190,14 @@ fn audit_context(request: &Request, shared: &Shared) -> AuditContext {
     else {
         return audit;
     };
-    let (mutex, condvar) = &**shared;
-    let mut state = lock_state(mutex);
+    let (mutex, _) = &**shared;
+    let state = lock_state(mutex);
     let Some(registration) = state.registry.registration(&token) else {
         return audit;
     };
     audit.untrusted_registered_session = Some(sanitize_audit_value(&registration.session));
     audit.registered_root_pid = registration.root.pid();
-    audit.request_id = SecretName::parse(raw_key).ok().and_then(|secret_name| {
-        let scope = Scope::Session(token);
-        if state.grants.lookup(&scope, &secret_name).is_none() && state.store.contains(&secret_name)
-        {
-            state.queue.enqueue(scope, secret_name, Instant::now()).ok()
-        } else {
-            None
-        }
-    });
     drop(state);
-    if audit.request_id.is_some() {
-        condvar.notify_all();
-    }
     audit
 }
 
@@ -329,18 +281,25 @@ fn handle(stream: UnixStream, shared: &Shared) -> std::io::Result<()> {
         |_| dispatch::Decision {
             outcome: Outcome::Failed(ErrCode::BadRequest, "invalid request frame"),
             scope_kind: None,
+            source: None,
+            request_id: None,
         },
         |request| {
             let audit = audit_context(&request, shared);
             let decision = dispatch(request, shared, &caller);
+            let source = decision
+                .source
+                .as_deref()
+                .map_or_else(|| "-".to_owned(), sanitize_audit_value);
             tracing::info!(
                 key = %audit.key,
-            peer_pid = ?peer_pid,
+                source = %source,
+                peer_pid = ?peer_pid,
                 caller_pid = ?caller.pid(),
                 scope_kind = ?decision.scope_kind,
                 untrusted_registered_session = ?audit.untrusted_registered_session,
                 registered_root_pid = ?audit.registered_root_pid,
-                request_id = ?audit.request_id,
+                request_id = ?decision.request_id,
                 decision = decision.outcome.decision(),
                 released_bytes = ?decision.outcome.released_bytes(),
                 "request handled"
@@ -513,6 +472,7 @@ mod tests {
 
     use super::*;
     use crate::grants::{Registration, SessionToken};
+    use crate::store::HumanSource;
 
     static REGISTER_HANDLER_DELAY: Mutex<Option<Duration>> = Mutex::new(None);
 
@@ -561,7 +521,10 @@ mod tests {
     fn test_config(directory: &Path) -> Config {
         Config {
             socket_path: directory.join("secretsd.sock"),
-            human_dir: directory.join("human"),
+            human_sources: vec![HumanSource {
+                label: "test".to_owned(),
+                dir: directory.join("human"),
+            }],
             sops_bin: "/bin/false".into(),
             pcsc_socket: None,
             yubikey_probe_argv: Vec::new(),
@@ -713,7 +676,10 @@ mod tests {
         std::fs::create_dir(&human_dir).unwrap();
         std::fs::write(human_dir.join("DEEL_API_KEY.env"), b"ciphertext").unwrap();
         let mut config = test_config(directory.path());
-        config.human_dir = human_dir;
+        config.human_sources = vec![HumanSource {
+            label: "test".to_owned(),
+            dir: human_dir,
+        }];
         let shared = Arc::new((Mutex::new(State::new(config).unwrap()), Condvar::new()));
         let token_hex = "ab".repeat(32);
         let token = SessionToken::parse_hex(&token_hex).unwrap();
@@ -758,6 +724,47 @@ mod tests {
         assert!(output.contains("request_id=Some(RequestId(1))"));
         assert!(output.contains("decision="));
         assert!(!output.contains(&token_hex));
+    }
+
+    #[test]
+    fn audit_context_never_enqueues_a_valid_key() {
+        // Given a source containing the requested key and a registered session.
+        let directory = tempfile::tempdir().unwrap();
+        let human_dir = directory.path().join("human");
+        std::fs::create_dir(&human_dir).unwrap();
+        std::fs::write(human_dir.join("DEEL_API_KEY.env"), b"ciphertext").unwrap();
+        let mut config = test_config(directory.path());
+        config.human_sources = vec![HumanSource {
+            label: "test".to_owned(),
+            dir: human_dir,
+        }];
+        let shared = Arc::new((Mutex::new(State::new(config).unwrap()), Condvar::new()));
+        let token_hex = "ef".repeat(32);
+        let token = SessionToken::parse_hex(&token_hex).unwrap();
+        lock_state(&shared.0)
+            .registry
+            .register(Registration {
+                token,
+                session: "opencode-session".to_owned(),
+                root: crate::peer::PeerIdentity::current_for_test(),
+            })
+            .unwrap();
+        let request = Request::Get {
+            key: "DEEL_API_KEY".to_owned(),
+            token_hex: Some(token_hex),
+            tty: None,
+        };
+
+        // When audit metadata is collected for the request.
+        let _audit = audit_context(&request, &shared);
+
+        // Then audit metadata collection leaves the approval queue untouched.
+        assert!(
+            lock_state(&shared.0)
+                .queue
+                .next_ready(Instant::now())
+                .is_none()
+        );
     }
 
     #[test]

@@ -123,6 +123,7 @@ jobs:
           for artifact in \
             "$staging/bin/secrets" \
             "$staging/share/secretsd/opencode/plugins/secretsd.ts" \
+            "$staging/share/secretsd/opencode/skills/using-secrets/SKILL.md" \
             "$staging/systemd/secretsd.service" \
             "$staging/systemd/secretsd.socket"; do
             if ! tar --list --gzip --file="$archive" | grep --fixed-strings --line-regexp -- "$artifact" >/dev/null; then

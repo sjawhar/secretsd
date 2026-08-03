@@ -233,6 +233,7 @@ struct Grant {
     scope: Scope,
     key: SecretName,
     value: SecretBytes,
+    source: String,
     created: Instant,
 }
 
@@ -244,21 +245,29 @@ pub struct GrantTable {
 
 impl GrantTable {
     /// Find a live grant.
-    pub fn lookup(&self, scope: &Scope, key: &SecretName) -> Option<&SecretBytes> {
+    pub fn lookup(&self, scope: &Scope, key: &SecretName) -> Option<(&SecretBytes, &str)> {
         self.grants
             .iter()
             .find(|grant| grant.scope == *scope && grant.key == *key)
-            .map(|grant| &grant.value)
+            .map(|grant| (&grant.value, grant.source.as_str()))
     }
 
     /// Install a grant, replacing any existing one for the same scope and key.
-    pub fn insert(&mut self, scope: Scope, key: SecretName, value: SecretBytes, created: Instant) {
+    pub fn insert(
+        &mut self,
+        scope: Scope,
+        key: SecretName,
+        value: SecretBytes,
+        created: Instant,
+        source: String,
+    ) {
         self.grants
             .retain(|grant| !(grant.scope == scope && grant.key == key));
         self.grants.push(Grant {
             scope,
             key,
             value,
+            source,
             created,
         });
     }
@@ -341,6 +350,55 @@ mod tests {
 
     fn secret(raw: &str) -> SecretBytes {
         SecretBytes::from_vec(raw.as_bytes().to_vec())
+    }
+
+    #[test]
+    fn lookup_returns_the_grant_source_label() {
+        // Given: a grant associated with the source file that supplied its plaintext.
+        let mut table = GrantTable::default();
+        let scope = Scope::Session(token(0xaa));
+        let key = name("K");
+        table.insert(
+            scope.clone(),
+            key.clone(),
+            secret("v"),
+            Instant::now(),
+            "test.local".to_owned(),
+        );
+
+        // When: the grant is looked up for a repeat request.
+        let (_, source) = table.lookup(&scope, &key).unwrap();
+
+        // Then: the label identifies the file that supplied the cached plaintext.
+        assert_eq!(source, "test.local");
+    }
+
+    #[test]
+    fn replacing_a_grant_replaces_its_source_label() {
+        // Given: a cached grant sourced from one human file.
+        let mut table = GrantTable::default();
+        let scope = Scope::Session(token(0xaa));
+        let key = name("K");
+        table.insert(
+            scope.clone(),
+            key.clone(),
+            secret("first"),
+            Instant::now(),
+            "test".to_owned(),
+        );
+
+        // When: a fresh grant replaces it after decrypting a differently labeled source.
+        table.insert(
+            scope.clone(),
+            key.clone(),
+            secret("second"),
+            Instant::now(),
+            "test.local".to_owned(),
+        );
+
+        // Then: repeat access observes the replacement's source label.
+        let (_, source) = table.lookup(&scope, &key).unwrap();
+        assert_eq!(source, "test.local");
     }
 
     fn registered() -> Registry {
@@ -508,6 +566,7 @@ mod tests {
             name("K"),
             secret("v"),
             Instant::now(),
+            "test".to_owned(),
         );
 
         // When: the same session identifier is registered with a new token.
@@ -549,6 +608,7 @@ mod tests {
             name("K"),
             secret("v"),
             Instant::now(),
+            "test".to_owned(),
         );
 
         // When: the same session re-registers with the identical token.
@@ -649,12 +709,18 @@ mod tests {
         let now = Instant::now();
         let scope_a = Scope::Session(token(0xaa));
         let scope_b = Scope::Session(token(0xbb));
-        table.insert(scope_a.clone(), name("K"), secret("v"), now);
+        table.insert(
+            scope_a.clone(),
+            name("K"),
+            secret("v"),
+            now,
+            "test".to_owned(),
+        );
 
         assert_eq!(
             table
                 .lookup(&scope_a, &name("K"))
-                .map(SecretBytes::as_slice),
+                .map(|(value, _)| value.as_slice()),
             Some(&b"v"[..])
         );
         assert!(
@@ -675,7 +741,13 @@ mod tests {
             tty: "/dev/pts/3".to_owned(),
             boot_id: "second-boot".to_owned(),
         };
-        table.insert(first.clone(), name("K"), secret("v"), now);
+        table.insert(
+            first.clone(),
+            name("K"),
+            secret("v"),
+            now,
+            "test".to_owned(),
+        );
 
         assert_ne!(first, second);
         assert!(table.lookup(&second, &name("K")).is_none());
@@ -685,7 +757,13 @@ mod tests {
     fn revoking_tokens_drops_their_grants() {
         let mut table = GrantTable::default();
         let now = Instant::now();
-        table.insert(Scope::Session(token(0xaa)), name("K"), secret("v"), now);
+        table.insert(
+            Scope::Session(token(0xaa)),
+            name("K"),
+            secret("v"),
+            now,
+            "test".to_owned(),
+        );
         table.revoke_tokens(&[token(0xaa)]);
         assert!(table.is_empty());
     }
@@ -695,8 +773,20 @@ mod tests {
         let mut table = GrantTable::default();
         let now = Instant::now();
         let old = now.checked_sub(Duration::from_hours(13)).unwrap();
-        table.insert(Scope::Session(token(0xaa)), name("OLD"), secret("v"), old);
-        table.insert(Scope::Session(token(0xbb)), name("NEW"), secret("v"), now);
+        table.insert(
+            Scope::Session(token(0xaa)),
+            name("OLD"),
+            secret("v"),
+            old,
+            "test".to_owned(),
+        );
+        table.insert(
+            Scope::Session(token(0xbb)),
+            name("NEW"),
+            secret("v"),
+            now,
+            "test".to_owned(),
+        );
 
         let removed = table.revoke_expired(now, Duration::from_hours(12));
         assert_eq!(removed, 1);
@@ -716,7 +806,13 @@ mod tests {
     fn lock_revokes_everything() {
         let mut table = GrantTable::default();
         let now = Instant::now();
-        table.insert(Scope::Session(token(0xaa)), name("K"), secret("v"), now);
+        table.insert(
+            Scope::Session(token(0xaa)),
+            name("K"),
+            secret("v"),
+            now,
+            "test".to_owned(),
+        );
         table.revoke_all();
         assert!(table.is_empty());
     }
@@ -730,6 +826,7 @@ mod tests {
             name("K"),
             secret("super-secret"),
             now,
+            "test".to_owned(),
         );
         let rendered = table.render(now);
         assert!(rendered.contains('K'));

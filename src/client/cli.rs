@@ -5,12 +5,12 @@ use std::ffi::{OsStr, OsString};
 use std::io::Write;
 use std::os::unix::ffi::OsStringExt;
 use std::os::unix::process::CommandExt;
-use std::path::PathBuf;
 use std::process::Command;
 
 use super::error::CliError;
 use super::status::{GetOutput, TierStatus, active_grant, get_arguments, write_status};
 use super::{AgentStore, BrokerClient, BrokerResponse, ClientError, HumanClient, HumanNames};
+use crate::config::{SourceRoot, Sources};
 use crate::secret::{SecretBytes, SecretName};
 
 /// Run a compatible `secrets` command.
@@ -19,6 +19,12 @@ pub fn run(arguments: impl IntoIterator<Item = OsString>) -> Result<(), CliError
     let _program = arguments.next();
     let arguments: Vec<OsString> = arguments.collect();
     let command = arguments.first().ok_or(CliError::Usage)?;
+    if command == OsStr::new("sources") {
+        if arguments.len() != 1 {
+            return Err(CliError::Usage);
+        }
+        return super::sources::run();
+    }
     let context = Context::from_environment()?;
     match command.as_os_str() {
         value if value == OsStr::new("get") => {
@@ -26,11 +32,14 @@ pub fn run(arguments: impl IntoIterator<Item = OsString>) -> Result<(), CliError
             context.get(name, output)
         }
         value if value == OsStr::new("list") => context.list(),
-        value if value == OsStr::new("edit") => Context::edit(context.agent_file()),
-        value if value == OsStr::new("edit-local") => Context::edit(context.local_file()),
+        value if value == OsStr::new("edit") => {
+            super::edit::agent(&context.sources, &arguments, false)
+        }
+        value if value == OsStr::new("edit-local") => {
+            super::edit::agent(&context.sources, &arguments, true)
+        }
         value if value == OsStr::new("edit-human") => {
-            let name = parse_name(argument_at(&arguments, 1)?)?;
-            Context::edit(context.human_file(&name))
+            super::edit::human(&context.sources, &context.human, &arguments)
         }
         value if value == OsStr::new("grants") => Context::grants(),
         value if value == OsStr::new("deny") => Context::deny(argument_at(&arguments, 1)?),
@@ -40,22 +49,23 @@ pub fn run(arguments: impl IntoIterator<Item = OsString>) -> Result<(), CliError
 }
 
 struct Context {
-    dotfiles_dir: PathBuf,
     agent: AgentStore,
     human: HumanNames,
+    sources: Sources,
 }
 
 impl Context {
     fn from_environment() -> Result<Self, CliError> {
-        let dotfiles_dir = std::env::var_os("DOTFILES_DIR")
-            .map(PathBuf::from)
-            .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".dotfiles")))
-            .ok_or(CliError::Usage)?;
-        let human = HumanNames::load(&dotfiles_dir.join("secrets.human.d"))?;
+        let sources = Sources::load().map_err(CliError::Config)?;
+        let agent_files = sources
+            .roots
+            .iter()
+            .flat_map(SourceRoot::agent_files)
+            .collect();
         Ok(Self {
-            agent: AgentStore::new(&dotfiles_dir, OsString::from("sops")),
-            dotfiles_dir,
-            human,
+            agent: AgentStore::new(agent_files, OsString::from("sops")),
+            human: HumanNames::load(&sources.roots)?,
+            sources,
         })
     }
 
@@ -122,8 +132,14 @@ impl Context {
         for name in agent.keys() {
             writeln!(stdout, "{}", name.as_str()).map_err(CliError::Stdout)?;
         }
-        for name in self.human.iter() {
-            writeln!(stdout, "{}  (human tier)", name.as_str()).map_err(CliError::Stdout)?;
+        for (name, location) in self.human.iter() {
+            writeln!(
+                stdout,
+                "{}  (human tier: {})",
+                name.as_str(),
+                location.label
+            )
+            .map_err(CliError::Stdout)?;
         }
         Ok(())
     }
@@ -171,7 +187,7 @@ impl Context {
     }
 
     fn reject_duplicates(&self, agent: &BTreeMap<SecretName, SecretBytes>) -> Result<(), CliError> {
-        for name in self.human.iter() {
+        for (name, _) in self.human.iter() {
             if agent.contains_key(name) {
                 return Err(CliError::AmbiguousKey(name.clone()));
             }
@@ -218,31 +234,12 @@ impl Context {
             }
         }
     }
-
-    fn agent_file(&self) -> PathBuf {
-        self.dotfiles_dir.join("secrets.env")
-    }
-
-    fn local_file(&self) -> PathBuf {
-        self.dotfiles_dir.join("secrets.local.env")
-    }
-
-    fn human_file(&self, name: &SecretName) -> PathBuf {
-        self.dotfiles_dir
-            .join("secrets.human.d")
-            .join(name.file_name())
-    }
-
-    fn edit(path: PathBuf) -> Result<(), CliError> {
-        Err(CliError::Exec(Command::new("sops").arg(path).exec()))
-    }
 }
-
 fn argument_at(arguments: &[OsString], index: usize) -> Result<&OsString, CliError> {
     arguments.get(index).ok_or(CliError::Usage)
 }
 
-fn parse_name(raw: &OsString) -> Result<SecretName, CliError> {
+pub(super) fn parse_name(raw: &OsString) -> Result<SecretName, CliError> {
     raw.to_str()
         .ok_or(CliError::InvalidSecretName)
         .and_then(|name| SecretName::parse(name).map_err(|_| CliError::InvalidSecretName))

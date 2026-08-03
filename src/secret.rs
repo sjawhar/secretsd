@@ -44,6 +44,47 @@ impl SecretName {
     pub fn file_name(&self) -> String {
         format!("{}.env", self.0)
     }
+
+    /// Local file name this key occupies inside the human-tier directory.
+    pub fn local_file_name(&self) -> String {
+        format!("{}.local.env", self.0)
+    }
+}
+
+/// Classification of a file name found in a human-tier directory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(
+    clippy::exhaustive_enums,
+    reason = "filename classifications are an explicit shared storage contract"
+)]
+pub enum HumanFileName {
+    /// A name that is not an `.env` file and can be skipped.
+    Ignored,
+    /// A committed or machine-local key file.
+    Key {
+        /// The validated secret key name.
+        name: SecretName,
+        /// Whether the file is machine-local rather than committed.
+        local: bool,
+    },
+    /// An `.env` name whose key portion is not a valid secret key name.
+    Invalid,
+}
+
+/// Classify a file name found in a human-tier directory.
+pub fn parse_human_file_name(file_name: &str) -> HumanFileName {
+    let Some(stem) = file_name.strip_suffix(".env") else {
+        return HumanFileName::Ignored;
+    };
+
+    let (raw_name, local) = stem
+        .strip_suffix(".local")
+        .map_or((stem, false), |raw_name| (raw_name, true));
+
+    SecretName::parse(raw_name).map_or(HumanFileName::Invalid, |name| HumanFileName::Key {
+        name,
+        local,
+    })
 }
 
 /// Plaintext bytes, wiped on drop.
@@ -146,8 +187,75 @@ mod tests {
     }
 
     #[test]
-    fn file_name_appends_env_suffix() {
+    fn file_names_distinguish_committed_and_local_files() {
         assert_eq!(name("DEEL_API_KEY").file_name(), "DEEL_API_KEY.env");
+        assert_eq!(
+            name("DEEL_API_KEY").local_file_name(),
+            "DEEL_API_KEY.local.env"
+        );
+    }
+
+    #[test]
+    fn classifies_committed_local_invalid_and_ignored() {
+        let key = |raw: &str, local: bool| HumanFileName::Key {
+            name: SecretName::parse(raw).unwrap(),
+            local,
+        };
+        assert_eq!(
+            parse_human_file_name("DEEL_API_KEY.env"),
+            key("DEEL_API_KEY", false)
+        );
+        assert_eq!(
+            parse_human_file_name("DEEL_API_KEY.local.env"),
+            key("DEEL_API_KEY", true)
+        );
+        assert_eq!(parse_human_file_name("key.env"), key("key", false));
+        assert_eq!(parse_human_file_name("local.env"), key("local", false));
+        for ignored in ["notes.txt", "README", "X.ENV", ".local", "env"] {
+            assert_eq!(
+                parse_human_file_name(ignored),
+                HumanFileName::Ignored,
+                "{ignored}"
+            );
+        }
+        for invalid in [
+            ".env",
+            ".local.env",
+            "BAD-NAME.env",
+            "a.b.local.env",
+            "1X.env",
+            "X.local.local.env",
+            "x.env.env",
+            "X.Local.env",
+        ] {
+            assert_eq!(
+                parse_human_file_name(invalid),
+                HumanFileName::Invalid,
+                "{invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn file_names_round_trip_through_classification() {
+        for raw in ["DEEL_API_KEY", "local", "env", "_A", &"A".repeat(128)] {
+            let name = name(raw);
+            assert_eq!(
+                parse_human_file_name(&name.file_name()),
+                HumanFileName::Key {
+                    name: name.clone(),
+                    local: false,
+                }
+            );
+            assert_eq!(
+                parse_human_file_name(&name.local_file_name()),
+                HumanFileName::Key { name, local: true }
+            );
+        }
+        assert_eq!(
+            parse_human_file_name(&format!("{}.env", "A".repeat(129))),
+            HumanFileName::Invalid
+        );
     }
 
     #[test]

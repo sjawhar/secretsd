@@ -1,6 +1,7 @@
 use std::fmt;
 
 use super::ClientError;
+use crate::config::ConfigError;
 use crate::proto::ErrCode;
 use crate::secret::SecretName;
 
@@ -12,6 +13,8 @@ const AGENT_NOTICE: &str = "AGENT NOTICE: ask the human; do not retry-loop.";
 pub enum CliError {
     /// The command line did not match the compatible CLI surface.
     Usage,
+    /// Source-root configuration could not be loaded.
+    Config(ConfigError),
     /// A key name does not satisfy `[A-Za-z_][A-Za-z0-9_]*`.
     InvalidSecretName,
     /// A requested agent-tier key was absent.
@@ -30,6 +33,31 @@ pub enum CliError {
     HumanDirectory(std::io::Error),
     /// A human-tier filename was not a valid key name.
     InvalidHumanFile,
+    /// A key occurs in more than one configured human-tier location.
+    DuplicateHumanKey {
+        /// Duplicated key name.
+        name: SecretName,
+        /// First source label in configuration order.
+        first: String,
+        /// Conflicting source label.
+        second: String,
+    },
+    /// An edit requires a source name because more than one root is configured.
+    EditSourceRequired(String),
+    /// An edit named no configured source root.
+    UnknownEditSource {
+        /// Operator-provided source-root name.
+        source: String,
+        /// Configured source-root names.
+        available: String,
+    },
+    /// An edit flag contradicted an existing human-tier key location.
+    EditConflict {
+        /// Existing key name.
+        name: SecretName,
+        /// Actual source label, including `.local` when applicable.
+        actual: String,
+    },
     /// The broker rejected the request with a stable protocol error code.
     Broker(ErrCode),
     /// Broker transport or framing failed before an error code was available.
@@ -59,8 +87,9 @@ impl fmt::Display for CliError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Usage => formatter.write_str(
-                "usage: secrets get KEY [--value|--no-request] | secrets list | secrets grants | secrets deny ID | secrets lock | secrets KEY1 [KEY2 ...] -- command [args...]",
+                "usage: secrets get KEY [--value|--no-request] | secrets list | secrets sources | secrets edit [--source NAME] | secrets edit-local [--source NAME] | secrets edit-human KEY [--source NAME] [--local] | secrets grants | secrets deny ID | secrets lock | secrets KEY1 [KEY2 ...] -- command [args...]",
             ),
+            Self::Config(error) => error.fmt(formatter),
             Self::InvalidSecretName => formatter.write_str("invalid secret key"),
             Self::MissingSecret(name) => write!(formatter, "secret '{}' not found", name.as_str()),
             Self::AmbiguousKey(name) => write!(
@@ -76,6 +105,28 @@ impl fmt::Display for CliError {
             Self::InvalidHumanFile => {
                 formatter.write_str("human-tier directory contains an invalid key filename")
             }
+            Self::DuplicateHumanKey {
+                name,
+                first,
+                second,
+            } => write!(
+                formatter,
+                "key '{}' exists in more than one human-tier location ({first}, {second}); remove or rename one file",
+                name.as_str()
+            ),
+            Self::EditSourceRequired(available) => write!(
+                formatter,
+                "multiple secrets sources are configured; pass --source NAME (available: {available})"
+            ),
+            Self::UnknownEditSource { source, available } => write!(
+                formatter,
+                "secrets source '{source}' is not configured (available: {available})"
+            ),
+            Self::EditConflict { name, actual } => write!(
+                formatter,
+                "edit flags conflict with key '{}' stored in source {actual}",
+                name.as_str()
+            ),
             Self::Broker(code) => write!(formatter, "{AGENT_NOTICE} {}", broker_guidance(*code)),
             Self::BrokerTransport(error) => write!(formatter, "{AGENT_NOTICE} {error}"),
             Self::Exec(error) => write!(formatter, "could not execute command: {error}"),
@@ -92,6 +143,7 @@ impl std::error::Error for CliError {
             | Self::HumanDirectory(error)
             | Self::Exec(error)
             | Self::Stdout(error) => Some(error),
+            Self::Config(error) => Some(error),
             Self::BrokerTransport(error) => Some(error),
             Self::Usage
             | Self::InvalidSecretName
@@ -100,6 +152,10 @@ impl std::error::Error for CliError {
             | Self::SopsFailed
             | Self::InvalidDotenv
             | Self::InvalidHumanFile
+            | Self::DuplicateHumanKey { .. }
+            | Self::EditSourceRequired(_)
+            | Self::UnknownEditSource { .. }
+            | Self::EditConflict { .. }
             | Self::Broker(_) => None,
         }
     }
@@ -129,7 +185,10 @@ const fn broker_guidance(code: ErrCode) -> &'static str {
             "this session's token was presented from outside that session's process tree, so it was refused; run the request from the session that owns the token."
         }
         ErrCode::NotHumanKey => {
-            "the requested human-tier key is missing or was moved; ask the human to check its encrypted file."
+            "the requested human-tier key is missing or was moved; ask the human to check its encrypted file. If config.toml just gained a new source root, restart secretsd (systemctl --user restart secretsd.service)."
+        }
+        ErrCode::AmbiguousKey => {
+            "the requested key exists in more than one human-tier location; ask the human to remove or rename one of the duplicate files -- run `secrets list` to see every source."
         }
         ErrCode::Denied => "the human declined the secret request.",
         ErrCode::Timeout => {

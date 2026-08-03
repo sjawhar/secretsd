@@ -7,6 +7,7 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use super::{BrokerClient, ClientError};
+use crate::proto::PROTOCOL_VERSION;
 
 struct StallingBroker {
     _directory: tempfile::TempDir,
@@ -30,7 +31,10 @@ impl StallingBroker {
             let mut hello = BufReader::new(hello);
             let mut request = String::new();
             hello.read_line(&mut request).unwrap();
-            hello.get_mut().write_all(b"OK\tversion=2\n").unwrap();
+            hello
+                .get_mut()
+                .write_all(format!("OK\tversion={PROTOCOL_VERSION}\n").as_bytes())
+                .unwrap();
             drop(hello);
 
             let Some(request) = accept(&listener, &worker_stop) else {
@@ -127,7 +131,10 @@ fn request_frames_use_the_approval_timeout() {
         let mut hello = BufReader::new(hello);
         let mut hello_frame = String::new();
         hello.read_line(&mut hello_frame).unwrap();
-        hello.get_mut().write_all(b"OK\tversion=2\n").unwrap();
+        hello
+            .get_mut()
+            .write_all(format!("OK\tversion={PROTOCOL_VERSION}\n").as_bytes())
+            .unwrap();
         drop(hello);
 
         let (request, _) = listener.accept().unwrap();
@@ -190,7 +197,10 @@ fn control_operations_keep_the_short_timeout() {
         let mut hello = BufReader::new(hello);
         let mut hello_frame = String::new();
         hello.read_line(&mut hello_frame).unwrap();
-        hello.get_mut().write_all(b"OK\tversion=2\n").unwrap();
+        hello
+            .get_mut()
+            .write_all(format!("OK\tversion={PROTOCOL_VERSION}\n").as_bytes())
+            .unwrap();
         drop(hello);
 
         let (request, _) = listener.accept().unwrap();

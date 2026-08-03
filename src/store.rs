@@ -3,62 +3,111 @@
 //! Listing reads file names only. Nothing in this module decrypts, so listing
 //! cannot cause a `YubiKey` interaction.
 
+use std::collections::BTreeSet;
+use std::ffi::OsString;
 use std::os::fd::{AsRawFd, FromRawFd};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use nix::fcntl::{OFlag, openat};
 use nix::sys::stat::{Mode, SFlag, fstat};
 
+use crate::audit::sanitize_audit_value;
 use crate::proto::ErrCode;
-use crate::secret::SecretName;
+use crate::secret::{HumanFileName, SecretName, parse_human_file_name};
+
+/// A named directory containing human-tier ciphertext files.
+#[derive(Debug, Clone)]
+#[allow(
+    clippy::exhaustive_structs,
+    reason = "source labels and paths are an explicit configuration data contract"
+)]
+pub struct HumanSource {
+    /// Stable label identifying the configured source root.
+    pub label: String,
+    /// Human-tier directory below the configured source root.
+    pub dir: PathBuf,
+}
+
+/// A human-tier ciphertext file and the source label derived from the same scan.
+///
+/// Two source labels exist on a granted request: the request audit line
+/// carries dispatch's pre-approval `locate` label, while the worker's
+/// `grant inserted` event carries this label, taken from the scan that
+/// opened the decrypted file. When the two disagree, the file moved between
+/// sources during the approval window -- trust this one for attribution.
+#[derive(Debug)]
+#[allow(
+    clippy::exhaustive_structs,
+    reason = "the source label must stay paired with the opened ciphertext file"
+)]
+pub struct OpenedHumanFile {
+    /// Label identifying the configured root, with `.local` for local files.
+    pub label: String,
+    /// Validated ciphertext file opened without following symlinks.
+    pub file: std::fs::File,
+}
+
+#[derive(Debug)]
+struct Candidate {
+    label: String,
+    dir: PathBuf,
+    file_name: String,
+}
 
 /// A directory of per-key sops files.
 #[derive(Debug, Clone)]
 pub struct HumanStore {
-    dir: PathBuf,
+    sources: Vec<HumanSource>,
 }
 
 impl HumanStore {
-    /// Point the store at a directory. The directory need not exist yet.
-    pub const fn new(dir: PathBuf) -> Self {
-        Self { dir }
+    /// Point the store at configured source directories. They need not exist yet.
+    pub const fn new(sources: Vec<HumanSource>) -> Self {
+        Self { sources }
     }
 
-    /// Key names present in the store, derived from file names only.
+    /// Key names present in configured sources, derived from file names only.
+    ///
+    /// This supports tests and a future LIST operation; access authorization must use `locate` so ambiguity is refused.
     pub fn key_names(&self) -> Result<Vec<SecretName>, ErrCode> {
-        let entries = match std::fs::read_dir(&self.dir) {
-            Ok(entries) => entries,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(_) => return Err(ErrCode::Internal),
-        };
-        let mut names = Vec::new();
-        for entry in entries {
-            let entry = entry.map_err(|_| ErrCode::Internal)?;
-            let file_name = entry.file_name();
-            let Some(text) = file_name.to_str() else {
+        let mut names = BTreeSet::new();
+        for source in &self.sources {
+            let Some(entries) = Self::directory_entries(&source.dir)? else {
                 continue;
             };
-            let Some(stem) = text.strip_suffix(".env") else {
-                continue;
-            };
-            if let Ok(name) = SecretName::parse(stem) {
-                names.push(name);
+            for entry in entries {
+                let entry = entry.map_err(|_| ErrCode::Internal)?;
+                let Some((name, _, _)) = Self::human_file_name(source, &entry.file_name())? else {
+                    continue;
+                };
+                names.insert(name);
             }
         }
-        Ok(names)
+        Ok(names.into_iter().collect())
     }
 
-    /// Whether a key exists in the store.
-    pub fn contains(&self, name: &SecretName) -> bool {
-        self.key_names().is_ok_and(|names| names.contains(name))
+    /// Locate the sole backing file for a key and return its audit label.
+    pub fn locate(&self, name: &SecretName) -> Result<String, ErrCode> {
+        let candidates = self.candidates(name)?;
+        match candidates.as_slice() {
+            [] => Err(ErrCode::NotHumanKey),
+            [candidate] => Ok(candidate.label.clone()),
+            [..] => Err(ErrCode::AmbiguousKey),
+        }
     }
 
     /// Open a key's ciphertext file without following symlinks.
-    pub fn open(&self, name: &SecretName) -> Result<std::fs::File, ErrCode> {
-        let dir = std::fs::File::open(&self.dir).map_err(|_| ErrCode::NotHumanKey)?;
+    pub fn open(&self, name: &SecretName) -> Result<OpenedHumanFile, ErrCode> {
+        let candidates = self.candidates(name)?;
+        let candidate = match candidates.as_slice() {
+            [] => return Err(ErrCode::NotHumanKey),
+            [candidate] => candidate,
+            [..] => return Err(ErrCode::AmbiguousKey),
+        };
+        let dir = std::fs::File::open(&candidate.dir).map_err(|_| ErrCode::NotHumanKey)?;
         let raw_fd = openat(
             Some(dir.as_raw_fd()),
-            name.file_name().as_str(),
+            candidate.file_name.as_str(),
             OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
             Mode::empty(),
         )
@@ -71,87 +120,70 @@ impl HumanStore {
         if !SFlag::from_bits_truncate(stat.st_mode).contains(SFlag::S_IFREG) {
             return Err(ErrCode::NotHumanKey);
         }
-        Ok(file)
+        Ok(OpenedHumanFile {
+            label: candidate.label.clone(),
+            file,
+        })
+    }
+
+    fn candidates(&self, requested: &SecretName) -> Result<Vec<Candidate>, ErrCode> {
+        let mut candidates = Vec::new();
+        for source in &self.sources {
+            let Some(entries) = Self::directory_entries(&source.dir)? else {
+                continue;
+            };
+            for entry in entries {
+                let entry = entry.map_err(|_| ErrCode::Internal)?;
+                let Some((name, local, file_name)) =
+                    Self::human_file_name(source, &entry.file_name())?
+                else {
+                    continue;
+                };
+                if &name == requested {
+                    candidates.push(Candidate {
+                        label: if local {
+                            format!("{}.local", source.label)
+                        } else {
+                            source.label.clone()
+                        },
+                        dir: source.dir.clone(),
+                        file_name,
+                    });
+                }
+            }
+        }
+        Ok(candidates)
+    }
+
+    fn directory_entries(dir: &Path) -> Result<Option<std::fs::ReadDir>, ErrCode> {
+        match std::fs::read_dir(dir) {
+            Ok(entries) => Ok(Some(entries)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(_) => Err(ErrCode::Internal),
+        }
+    }
+
+    fn human_file_name(
+        source: &HumanSource,
+        file_name: &OsString,
+    ) -> Result<Option<(SecretName, bool, String)>, ErrCode> {
+        let Some(text) = file_name.to_str() else {
+            return Ok(None);
+        };
+        match parse_human_file_name(text) {
+            HumanFileName::Ignored => Ok(None),
+            HumanFileName::Invalid => {
+                tracing::warn!(
+                    source = %sanitize_audit_value(&source.label),
+                    file_name = %sanitize_audit_value(text),
+                    "invalid human filename"
+                );
+                Err(ErrCode::Internal)
+            }
+            HumanFileName::Key { name, local } => Ok(Some((name, local, text.to_owned()))),
+        }
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use std::io::Read;
-
-    use super::*;
-
-    fn name(raw: &str) -> SecretName {
-        SecretName::parse(raw).unwrap()
-    }
-
-    fn fixture() -> (tempfile::TempDir, HumanStore) {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("DEEL_API_KEY.env"), b"ciphertext").unwrap();
-        std::fs::write(dir.path().join("FLEET_LICENSE_KEY.env"), b"ciphertext").unwrap();
-        std::fs::write(dir.path().join("notes.txt"), b"ignored").unwrap();
-        std::os::unix::fs::symlink("/etc/passwd", dir.path().join("EVIL_LINK.env")).unwrap();
-        std::fs::create_dir(dir.path().join("A_DIR.env")).unwrap();
-        let store = HumanStore::new(dir.path().to_path_buf());
-        (dir, store)
-    }
-
-    #[test]
-    fn lists_key_names_from_file_names_only() {
-        let (_dir, store) = fixture();
-        let mut names: Vec<String> = store
-            .key_names()
-            .unwrap()
-            .iter()
-            .map(|name| name.as_str().to_owned())
-            .collect();
-        names.sort();
-        assert_eq!(
-            names,
-            vec!["A_DIR", "DEEL_API_KEY", "EVIL_LINK", "FLEET_LICENSE_KEY"]
-        );
-    }
-
-    #[test]
-    fn listing_missing_directory_yields_no_keys() {
-        let store = HumanStore::new("/nonexistent/secretsd-test".into());
-        assert_eq!(store.key_names().unwrap(), Vec::new());
-    }
-
-    #[test]
-    fn opens_regular_file() {
-        let (_dir, store) = fixture();
-        let mut file = store.open(&name("DEEL_API_KEY")).unwrap();
-        let mut buffer = String::new();
-        file.read_to_string(&mut buffer).unwrap();
-        assert_eq!(buffer, "ciphertext");
-    }
-
-    #[test]
-    fn refuses_to_follow_symlink() {
-        let (_dir, store) = fixture();
-        assert_eq!(
-            store.open(&name("EVIL_LINK")).err(),
-            Some(ErrCode::NotHumanKey)
-        );
-    }
-
-    #[test]
-    fn refuses_directory() {
-        let (_dir, store) = fixture();
-        assert_eq!(store.open(&name("A_DIR")).err(), Some(ErrCode::NotHumanKey));
-    }
-
-    #[test]
-    fn refuses_absent_key() {
-        let (_dir, store) = fixture();
-        assert_eq!(store.open(&name("NOPE")).err(), Some(ErrCode::NotHumanKey));
-    }
-
-    #[test]
-    fn contains_reports_presence() {
-        let (_dir, store) = fixture();
-        assert!(store.contains(&name("DEEL_API_KEY")));
-        assert!(!store.contains(&name("NOPE")));
-    }
-}
+mod tests;

@@ -1,11 +1,11 @@
-//! Wire protocol v2: line-oriented, tab-separated, ASCII.
+//! Wire protocol v3: line-oriented, tab-separated, ASCII.
 //!
 //! Hand-rolled deliberately. Secret plaintext is written straight from a
 //! zeroizing buffer to the socket and never passes through a serializer whose
 //! internal buffers we cannot wipe.
 
 /// Protocol version. A mismatch is a hard error, never a downgrade.
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// Maximum accepted request frame. Requests never carry secret values.
 pub const MAX_FRAME_BYTES: usize = 4096;
@@ -34,6 +34,8 @@ pub enum ErrCode {
     ForeignCaller,
     /// Key is not present in the human-tier store.
     NotHumanKey,
+    /// Key resolves to more than one human-tier file, so access is refused.
+    AmbiguousKey,
     /// A human denied the request.
     Denied,
     /// The request expired before approval.
@@ -58,6 +60,7 @@ impl ErrCode {
             Self::AgentTty => "AGENT_TTY",
             Self::ForeignCaller => "FOREIGN_CALLER",
             Self::NotHumanKey => "NOT_HUMAN_KEY",
+            Self::AmbiguousKey => "AMBIGUOUS_KEY",
             Self::Denied => "DENIED",
             Self::Timeout => "TIMEOUT",
             Self::YubikeyUnreachable => "YUBIKEY_UNREACHABLE",
@@ -77,6 +80,7 @@ impl ErrCode {
             "AGENT_TTY" => Some(Self::AgentTty),
             "FOREIGN_CALLER" => Some(Self::ForeignCaller),
             "NOT_HUMAN_KEY" => Some(Self::NotHumanKey),
+            "AMBIGUOUS_KEY" => Some(Self::AmbiguousKey),
             "DENIED" => Some(Self::Denied),
             "TIMEOUT" => Some(Self::Timeout),
             "YUBIKEY_UNREACHABLE" => Some(Self::YubikeyUnreachable),
@@ -248,6 +252,15 @@ mod tests {
     #[test]
     fn rejects_unknown_op() {
         assert_eq!(parse_request(b"FROBNICATE\tx=1"), Err(ErrCode::UnknownOp));
+    }
+
+    #[test]
+    fn ambiguous_key_error_round_trips_its_wire_token() {
+        assert_eq!(
+            ErrCode::parse_wire("AMBIGUOUS_KEY"),
+            Some(ErrCode::AmbiguousKey)
+        );
+        assert_eq!(ErrCode::AmbiguousKey.wire(), "AMBIGUOUS_KEY");
     }
 
     #[test]

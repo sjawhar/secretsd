@@ -35,15 +35,21 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Constant-time comparison for session tokens.
 subtle = "2"
+# Config parsing only. Config carries directory paths, never secret values,
+# so serde is acceptable here; the plaintext-path ban below still stands.
+toml = { version = "0.8", features = ["preserve_order"] }
+serde = { version = "1", features = ["derive"] }
 
 [dev-dependencies]
 proptest = "1"
 tempfile = "3"
 
-# NOTE: deliberately NO serde / dotenv crate. Secret plaintext must never pass
-# through a general-purpose (de)serializer's internal buffers, which we cannot
-# zeroize. The wire protocol is hand-rolled in `src/proto.rs` and secret bytes
-# are written straight from a zeroizing buffer to the socket.
+# NOTE: deliberately NO serde / dotenv crate on the plaintext path. Secret
+# plaintext must never pass through a general-purpose (de)serializer's internal
+# buffers, which we cannot zeroize. The wire protocol is hand-rolled in
+# `src/proto.rs` and secret bytes are written straight from a zeroizing buffer
+# to the socket. `src/config.rs` parses the source-roots TOML with serde; it
+# carries paths, never secrets.
 
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
@@ -101,7 +107,7 @@ missing_errors_doc = "allow"
 mod_module_files = "warn"
 empty_drop = "warn"
 empty_structs_with_brackets = "warn"
-empty_enum = "warn"
+empty_enums = "warn"
 exhaustive_enums = "warn"
 exhaustive_structs = "warn"
 

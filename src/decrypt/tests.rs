@@ -8,7 +8,7 @@ use std::time::Duration;
 use super::*;
 use crate::proto::ErrCode;
 use crate::secret::SecretName;
-use crate::store::HumanStore;
+use crate::store::{HumanSource, HumanStore};
 
 fn direct_pcsc() -> PcscReachability {
     PcscReachability::new(None, None)
@@ -23,7 +23,10 @@ fn fixture_bin(name: &str) -> PathBuf {
 fn store_with_key(key: &str) -> (tempfile::TempDir, HumanStore) {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join(format!("{key}.env")), b"ciphertext").unwrap();
-    let store = HumanStore::new(dir.path().to_path_buf());
+    let store = HumanStore::new(vec![HumanSource {
+        label: "test".to_owned(),
+        dir: dir.path().to_path_buf(),
+    }]);
     (dir, store)
 }
 
@@ -60,7 +63,10 @@ fn decrypts_the_inode_validated_before_its_path_is_replaced() {
     .unwrap();
     std::fs::set_permissions(&sops_path, std::fs::Permissions::from_mode(0o700)).unwrap();
 
-    let store = HumanStore::new(dir.path().to_path_buf());
+    let store = HumanStore::new(vec![HumanSource {
+        label: "test".to_owned(),
+        dir: dir.path().to_path_buf(),
+    }]);
     let decryptor = Decryptor::new(sops_path, Duration::from_secs(5), direct_pcsc());
     let key = SecretName::parse("DEEL_API_KEY").unwrap();
 
