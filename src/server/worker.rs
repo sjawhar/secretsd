@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 use super::{Shared, lock_state, wait_state};
 use crate::audit::sanitize_audit_value;
 use crate::decrypt::Decryptor;
-use crate::grants::Scope;
+use crate::grants::{GrantOrigin, Scope};
 use crate::requests::RequestId;
 use crate::secret::SecretName;
 use crate::store::HumanStore;
@@ -110,7 +110,10 @@ pub(super) fn worker(shared: &Shared) {
                         job.key,
                         decrypted.value,
                         Instant::now(),
-                        decrypted.source.clone(),
+                        GrantOrigin {
+                            source: decrypted.source.clone(),
+                            identity: decrypted.identity,
+                        },
                     );
                     tracing::info!(
                         source = %sanitize_audit_value(&decrypted.source),

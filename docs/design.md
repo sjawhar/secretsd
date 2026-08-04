@@ -52,6 +52,19 @@ secrets keep working unattended with zero interaction, exactly as today.
   hardening: the plugin registers PTYs it allocates and the broker rejects
   tokenless requests from them; ttys the plugin cannot see (for example,
   agent-created tmux panes) remain an accepted same-UID residual.
+- **Plaintext temp file while creating a new secret**: `secrets edit-human KEY`
+  on a key that does not exist yet runs the editor on a `0600` plaintext file
+  in the runtime directory, then encrypts it into place. The value therefore
+  touches the disk once, briefly, before any ciphertext exists. The file is
+  scrubbed and unlinked on every exit path. The production systemd runtime
+  directory (`/run/user/<uid>`) is a `0700` tmpfs, so unlinking frees the pages
+  rather than leaving them on a persistent filesystem. This client path does
+  not independently verify the ownership or mode of an arbitrary
+  `XDG_RUNTIME_DIR`; that production property remains a deployment assumption.
+  This buys a creation flow that needs no `YubiKey` touch at all -- encryption
+  is public-key only, so only *reading* a secret requires the hardware. Editing
+  an *existing* secret never takes this path: it hands the file to sops, which
+  decrypts, and that still needs a touch.
 
 ## Non-goals
 

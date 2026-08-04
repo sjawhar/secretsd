@@ -9,11 +9,32 @@ fi
 if [ -n "${FAKE_SOPS_ARGS_LOG:-}" ]; then
   printf '%s\0' "$@" >> "$FAKE_SOPS_ARGS_LOG"
 fi
+if [ -n "${FAKE_SOPS_CWD_LOG:-}" ]; then
+  pwd >> "$FAKE_SOPS_CWD_LOG"
+fi
+if [ -n "${FAKE_SOPS_STDIN_MODE_LOG:-}" ]; then
+  stat -Lc '%a' /proc/self/fd/0 >> "$FAKE_SOPS_STDIN_MODE_LOG"
+fi
 
 input_type=''
 output_type=''
+filename_override=''
+operation="${1:-}"
+encrypt=false
+if [[ "$operation" == encrypt ]]; then
+  encrypt=true
+  shift
+fi
 while (($# > 0)); do
   case "$1" in
+    --filename-override)
+      if (($# < 2)); then
+        printf '%s\n' 'fake-sops-ok: missing --filename-override target' >&2
+        exit 64
+      fi
+      filename_override="$2"
+      shift 2
+      ;;
     --input-type)
       if (($# < 2)) || [[ "$2" != dotenv ]]; then
         printf '%s\n' 'fake-sops-ok: expected --input-type dotenv' >&2
@@ -30,6 +51,10 @@ while (($# > 0)); do
       output_type="$2"
       shift 2
       ;;
+    -e)
+      printf '%s\n' 'fake-sops-ok: expected encrypt subcommand, not -e' >&2
+      exit 64
+      ;;
     *)
       shift
       ;;
@@ -39,6 +64,16 @@ done
 if [[ "$input_type" != dotenv || "$output_type" != dotenv ]]; then
   printf '%s\n' 'fake-sops-ok: expected both --input-type dotenv and --output-type dotenv' >&2
   exit 64
+fi
+
+if [[ "$encrypt" == true ]]; then
+  if [[ -z "$filename_override" ]]; then
+    printf '%s\n' 'fake-sops-ok: encrypt requires --filename-override' >&2
+    exit 64
+  fi
+  printf '%s\n' '# fake-sops-ciphertext'
+  cat
+  exit 0
 fi
 
 if [ -n "${FAKE_SOPS_PASSTHROUGH:-}" ]; then

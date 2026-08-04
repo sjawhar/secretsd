@@ -10,6 +10,8 @@ use super::{CliError, HumanLocation, HumanNames};
 use crate::config::{ConfigError, SourceRoot, Sources};
 use crate::secret::SecretName;
 
+mod new;
+
 /// Edit an agent-tier file in the selected source root.
 pub(super) fn agent(
     sources: &Sources,
@@ -19,7 +21,11 @@ pub(super) fn agent(
     let flags = edit_arguments(arguments, 1, false)?;
     let [local_path, shared_path] = select_root(sources, flags.source)?.agent_files();
     let path = if local { local_path } else { shared_path };
-    edit(path)
+    if path.exists() {
+        edit(path)
+    } else {
+        new::agent(&path, local)
+    }
 }
 
 /// Edit an existing human-tier key or create its selected file path.
@@ -30,18 +36,20 @@ pub(super) fn human(
 ) -> Result<(), CliError> {
     let name = parse_name(argument_at(arguments, 1)?)?;
     let flags = edit_arguments(arguments, 2, true)?;
-    let path = match human.location(&name) {
-        Some(location) => existing_human_path(
+    if let Some(location) = human.location(&name) {
+        existing_human_path(
             sources,
             &ExistingHumanEdit {
                 name: &name,
                 location,
                 flags,
             },
-        )?,
-        None => new_human_path(sources, &name, flags)?,
-    };
-    edit(path)
+        )
+        .and_then(edit)
+    } else {
+        let path = new_human_path(sources, &name, flags)?;
+        new::human(&path, &name)
+    }
 }
 
 #[derive(Clone, Copy)]

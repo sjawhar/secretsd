@@ -15,6 +15,70 @@ use crate::audit::sanitize_audit_value;
 use crate::proto::ErrCode;
 use crate::secret::{HumanFileName, SecretName, parse_human_file_name};
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(
+    clippy::exhaustive_structs,
+    reason = "timestamp fields are deliberately limited to fstat identity comparisons"
+)]
+/// A modification or status-change timestamp captured from `fstat`.
+pub struct FileTimestamp {
+    seconds: nix::libc::time_t,
+    nanoseconds: nix::libc::c_long,
+}
+
+impl FileTimestamp {
+    /// Construct a timestamp from its seconds and nanoseconds components.
+    pub const fn new(seconds: nix::libc::time_t, nanoseconds: nix::libc::c_long) -> Self {
+        Self {
+            seconds,
+            nanoseconds,
+        }
+    }
+}
+
+/// Metadata from `fstat` on the exact ciphertext file selected for decryption.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(
+    clippy::exhaustive_structs,
+    reason = "file identity fields are deliberately limited to the stale-grant comparison contract"
+)]
+pub struct FileIdentity {
+    device: nix::libc::dev_t,
+    inode: nix::libc::ino_t,
+    size: nix::libc::off_t,
+    modified: FileTimestamp,
+    changed: FileTimestamp,
+}
+
+impl FileIdentity {
+    /// Construct the identity fields captured from a file descriptor's `fstat` result.
+    pub const fn new(
+        device: nix::libc::dev_t,
+        inode: nix::libc::ino_t,
+        size: nix::libc::off_t,
+        modified: FileTimestamp,
+        changed: FileTimestamp,
+    ) -> Self {
+        Self {
+            device,
+            inode,
+            size,
+            modified,
+            changed,
+        }
+    }
+
+    const fn from_stat(stat: &nix::sys::stat::FileStat) -> Self {
+        Self::new(
+            stat.st_dev,
+            stat.st_ino,
+            stat.st_size,
+            FileTimestamp::new(stat.st_mtime, stat.st_mtime_nsec),
+            FileTimestamp::new(stat.st_ctime, stat.st_ctime_nsec),
+        )
+    }
+}
+
 /// A named directory containing human-tier ciphertext files.
 #[derive(Debug, Clone)]
 #[allow(
@@ -43,6 +107,8 @@ pub struct HumanSource {
 pub struct OpenedHumanFile {
     /// Label identifying the configured root, with `.local` for local files.
     pub label: String,
+    /// `fstat` identity of the opened ciphertext descriptor.
+    pub identity: FileIdentity,
     /// Validated ciphertext file opened without following symlinks.
     pub file: std::fs::File,
 }
@@ -96,6 +162,11 @@ impl HumanStore {
         }
     }
 
+    /// Resolve and `fstat` the sole backing file without decrypting it.
+    pub fn identity(&self, name: &SecretName) -> Result<FileIdentity, ErrCode> {
+        self.open(name).map(|opened| opened.identity)
+    }
+
     /// Open a key's ciphertext file without following symlinks.
     pub fn open(&self, name: &SecretName) -> Result<OpenedHumanFile, ErrCode> {
         let candidates = self.candidates(name)?;
@@ -122,6 +193,7 @@ impl HumanStore {
         }
         Ok(OpenedHumanFile {
             label: candidate.label.clone(),
+            identity: FileIdentity::from_stat(&stat),
             file,
         })
     }

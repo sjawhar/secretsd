@@ -14,7 +14,7 @@ use zeroize::Zeroize;
 
 use crate::proto::ErrCode;
 use crate::secret::{SecretBytes, SecretName, parse_single_assignment};
-use crate::store::{HumanStore, OpenedHumanFile};
+use crate::store::{FileIdentity, HumanStore, OpenedHumanFile};
 
 /// Polling period while a sops child is active.
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -31,6 +31,9 @@ const SOPS_STDERR_SIGNATURES: &[(&str, &str)] = &[
         "yubikey-stanza-undecryptable",
     ),
     ("yubikey plugin", "yubikey-plugin-error"),
+    // The plugin's own transport failure, which reaches us unwrapped when sops
+    // surfaces the plugin's stderr verbatim. A stale pcscd tunnel produces this.
+    ("pc/sc error", "pcsc-communication-error"),
     ("no identity matched", "no-matching-identity"),
     ("sops metadata not found", "missing-sops-metadata"),
     ("no such file or directory", "input-unreadable"),
@@ -55,6 +58,34 @@ fn classify_sops_stderr(stderr: &[u8]) -> &'static str {
         .map_or("unclassified", |(_, label)| *label);
     lowered.zeroize();
     label
+}
+
+/// Labels that mean the hardware could not be reached, rather than a fault in
+/// the request or the ciphertext.
+///
+/// The reachability probe only sees whether the PC/SC socket exists, so a live
+/// socket whose far end is dead -- a stale pcscd tunnel is the common case --
+/// gets all the way to sops before failing. Reporting `Internal` there tells the
+/// caller to go read the daemon's log about spawning sops, when the actionable
+/// fact is that the key is unreachable.
+const UNREACHABLE_FAILURE_LABELS: &[&str] = &["yubikey-plugin-error", "pcsc-communication-error"];
+
+/// Labels that mean the key was reachable but nobody touched it.
+///
+/// The plugin gives a touch a window of its own, shorter than this daemon's
+/// request TTL, so a human who is slow to reach the key loses the race inside
+/// sops rather than at our deadline. Both mean the same thing to the caller --
+/// no approval happened -- so both must say so instead of blaming sops.
+const UNTOUCHED_FAILURE_LABELS: &[&str] = &["yubikey-stanza-undecryptable"];
+
+fn failure_code(label: &str) -> ErrCode {
+    if UNREACHABLE_FAILURE_LABELS.contains(&label) {
+        ErrCode::YubikeyUnreachable
+    } else if UNTOUCHED_FAILURE_LABELS.contains(&label) {
+        ErrCode::Timeout
+    } else {
+        ErrCode::Internal
+    }
 }
 
 fn duplicate_ciphertext_fd(validated_raw_fd: RawFd) -> Result<std::fs::File, ErrCode> {
@@ -165,6 +196,7 @@ pub struct Decryptor {
 
 pub(crate) struct DecryptedHumanFile {
     pub(crate) source: String,
+    pub(crate) identity: FileIdentity,
     pub(crate) value: SecretBytes,
 }
 
@@ -216,6 +248,7 @@ impl Decryptor {
         }
         let OpenedHumanFile {
             label: source,
+            identity,
             file: validated,
         } = store.open(key)?;
         let inherited = duplicate_ciphertext_fd(validated.as_raw_fd())?;
@@ -263,7 +296,7 @@ impl Decryptor {
                             sops_stderr_bytes = stderr_bytes,
                             "sops decrypt failed"
                         );
-                        return Err(ErrCode::Internal);
+                        return Err(failure_code(failure));
                     }
                     let mut stdout = Vec::new();
                     let mut stdout_pipe = child.stdout.take().ok_or(ErrCode::Internal)?;
@@ -273,7 +306,11 @@ impl Decryptor {
                     }
                     let result = parse_single_assignment(&stdout, key);
                     stdout.zeroize();
-                    return result.map(|value| DecryptedHumanFile { source, value });
+                    return result.map(|value| DecryptedHumanFile {
+                        source,
+                        identity,
+                        value,
+                    });
                 }
                 Ok(None) if Instant::now() >= deadline => {
                     let _ = killpg(Pid::from_raw(process_id), Signal::SIGKILL);

@@ -22,6 +22,7 @@ preference for one.
 | `../config.rs` | source-root loading and agent-file precedence shared with the daemon |
 | `agent.rs` | local sops decryption of `secrets.env` |
 | `human.rs` | broker transport; builds the scoped frame for `GET`/`REQUEST` |
+| `edit/new.rs` | creates edited agent or human files; validates human assignments, encrypts stdin with the target-path rule, and scrubs the plaintext temp file |
 | `response.rs` | parsing broker replies, including exact-length payloads |
 | `error.rs` | `CliError` and the agent-facing guidance strings |
 | `status.rs` | `get` flag parsing and the JSON status line |

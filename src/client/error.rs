@@ -1,4 +1,5 @@
 use std::fmt;
+use std::path::PathBuf;
 
 use super::ClientError;
 use crate::config::ConfigError;
@@ -58,6 +59,20 @@ pub enum CliError {
         /// Actual source label, including `.local` when applicable.
         actual: String,
     },
+    /// Creating or opening the private edit scratch file failed.
+    EditTemp,
+    /// Starting the selected editor failed.
+    EditorStart(std::io::Error),
+    /// The selected editor exited without producing an accepted edit.
+    EditorExited,
+    /// A newly created human secret did not retain its required one-key shape.
+    InvalidEditedHumanSecret(SecretName),
+    /// A newly created human secret retained an empty value.
+    EmptyEditedHumanSecret(SecretName),
+    /// Encrypting a newly created secret failed for its target file.
+    EncryptEditedSecret(PathBuf),
+    /// Atomically installing the new ciphertext failed.
+    InstallEditedSecret,
     /// The broker rejected the request with a stable protocol error code.
     Broker(ErrCode),
     /// Broker transport or framing failed before an error code was available.
@@ -127,6 +142,23 @@ impl fmt::Display for CliError {
                 "edit flags conflict with key '{}' stored in source {actual}",
                 name.as_str()
             ),
+            Self::EditTemp => formatter.write_str("could not prepare a private edit file"),
+            Self::EditorStart(error) => write!(formatter, "could not start editor: {error}"),
+            Self::EditorExited => formatter.write_str("editor exited without creating a secret"),
+            Self::InvalidEditedHumanSecret(name) => write!(
+                formatter,
+                "edited secret must contain exactly one assignment named '{}'",
+                name.as_str()
+            ),
+            Self::EmptyEditedHumanSecret(name) => {
+                write!(formatter, "edited secret '{}' value must not be empty", name.as_str())
+            }
+            Self::EncryptEditedSecret(target) => write!(
+                formatter,
+                "could not encrypt edited secret for '{}'; ensure .sops.yaml has a matching creation rule",
+                target.display()
+            ),
+            Self::InstallEditedSecret => formatter.write_str("could not install encrypted secret"),
             Self::Broker(code) => write!(formatter, "{AGENT_NOTICE} {}", broker_guidance(*code)),
             Self::BrokerTransport(error) => write!(formatter, "{AGENT_NOTICE} {error}"),
             Self::Exec(error) => write!(formatter, "could not execute command: {error}"),
@@ -142,7 +174,8 @@ impl std::error::Error for CliError {
             | Self::AgentKeySet(error)
             | Self::HumanDirectory(error)
             | Self::Exec(error)
-            | Self::Stdout(error) => Some(error),
+            | Self::Stdout(error)
+            | Self::EditorStart(error) => Some(error),
             Self::Config(error) => Some(error),
             Self::BrokerTransport(error) => Some(error),
             Self::Usage
@@ -156,6 +189,12 @@ impl std::error::Error for CliError {
             | Self::EditSourceRequired(_)
             | Self::UnknownEditSource { .. }
             | Self::EditConflict { .. }
+            | Self::EditTemp
+            | Self::EditorExited
+            | Self::InvalidEditedHumanSecret(_)
+            | Self::EmptyEditedHumanSecret(_)
+            | Self::EncryptEditedSecret(_)
+            | Self::InstallEditedSecret
             | Self::Broker(_) => None,
         }
     }

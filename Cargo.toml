@@ -39,10 +39,12 @@ subtle = "2"
 # so serde is acceptable here; the plaintext-path ban below still stands.
 toml = { version = "0.8", features = ["preserve_order"] }
 serde = { version = "1", features = ["derive"] }
+# Mode-0600 temp files for the new-secret creation flow: the editor needs a
+# plaintext file, and the ciphertext is staged before being renamed into place.
+tempfile = "3"
 
 [dev-dependencies]
 proptest = "1"
-tempfile = "3"
 
 # NOTE: deliberately NO serde / dotenv crate on the plaintext path. Secret
 # plaintext must never pass through a general-purpose (de)serializer's internal

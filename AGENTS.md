@@ -70,7 +70,7 @@ filenames in configured `secrets.human.d/` directories are brokered.
 | `src/server/approval.rs` | Access resolution and the approval wait lifecycle. |
 | `src/server/worker.rs` | The single approval worker: dequeue → decrypt → insert grant. |
 | `src/peer.rs` | `SO_PEERPIDFD` peer pinning and `/proc` ancestry walk. |
-| `src/store.rs` | Human-tier ciphertext files; opens by inode, not path. |
+| `src/store.rs` | Human-tier ciphertext discovery, descriptor opens, and `FileIdentity` snapshots used to invalidate stale grants. |
 | `src/client/` | The client half of the binary. See `src/client/AGENTS.md`. |
 
 ## Where to look
@@ -83,12 +83,14 @@ filenames in configured `secrets.human.d/` directories are brokered.
 | Change source-root configuration | `Sources::config_path`, `src/config.rs:54`; `Sources::load`, `src/config.rs:70` |
 | Change what the audit line records | `src/server.rs:294`, context built at `:167`; sanitization in `src/audit.rs:19` |
 | Change how sops is invoked | `src/decrypt.rs:223`; failure classes at `:28` |
-| Change how the runtime directory is resolved | `resolveRuntimeDir`, `opencode/plugins/secretsd.ts`; `SocketPath::resolve`, `src/client.rs:35` |
+| Change how the runtime directory is resolved | `resolveRuntimeDir`, `opencode/plugins/secretsd.ts`; `SocketPath::resolve` and `runtime_dir`, `src/client.rs:35` |
 | Change which socket either half connects to | `resolveSocketPath`, `opencode/plugins/secretsd.ts`; `BrokerClient::from_environment`, `src/client.rs:91` |
 | Change the session token file's lifetime | `restoreTokenFile`, `opencode/plugins/secretsd.ts`; `ensureState` beside it |
 | Change the approval lifecycle | `src/server/approval.rs:49`; `src/server/worker.rs:27` |
 | Change the CLI surface | `src/client/cli.rs:17` |
-| Change grant lifetime or revocation | `GrantTable`, `src/grants.rs:241` |
+| Change human-secret creation | `src/client/edit/new.rs`: `human`, `create`, and `encrypt` |
+| Change stale-grant invalidation | `resolve_access`, `src/server/approval.rs:30`; `HumanStore::identity`, `src/store.rs:145` |
+| Change grant lifetime or revocation | `GrantTable::revoke`, `src/grants.rs:293` |
 
 ## Non-negotiables
 
@@ -96,7 +98,12 @@ These are security properties, not style preferences. A change that breaks one
 of them is a bug even if tests pass:
 
 1. **No plaintext at rest.** Secret values live only in `SecretBytes` in this
-   process. Never write them to disk, logs, or error messages.
+   process. Never write them to disk, logs, or error messages. The one
+   deliberate exception is creating a *new* secret (`src/client/edit/new.rs`):
+   the operator's editor needs a plaintext file, so one is written `0600` in
+   the runtime directory, scrubbed and unlinked on every exit path, and never
+   at the target. That buys a creation flow needing no `YubiKey` touch, since
+   encryption is public-key only. Nothing else may write plaintext to disk.
 2. **No serde on the plaintext path.** See the note in `Cargo.toml`.
 3. **The physical touch authorizes.** A human-tier decrypt proceeds directly
    to the YubiKey: its blink is the unspoofable physical prompt and a touch is

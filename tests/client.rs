@@ -58,6 +58,10 @@ fn socket_path_is_lazy_and_has_the_documented_fallback() {
         "/tmp/runtime/secretsd.sock"
     );
     assert_eq!(
+        SocketPath::resolve(None, Some(""), 42).as_path(),
+        "/run/user/42/secretsd.sock"
+    );
+    assert_eq!(
         SocketPath::resolve(None, None, 42).as_path(),
         "/run/user/42/secretsd.sock"
     );

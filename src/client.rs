@@ -35,8 +35,10 @@ impl SocketPath {
     pub fn resolve(override_path: Option<&str>, runtime_dir: Option<&str>, uid: u32) -> Self {
         match (override_path, runtime_dir) {
             (Some(path), _) => Self(PathBuf::from(path)),
-            (None, Some(directory)) => Self(Path::new(directory).join("secretsd.sock")),
-            (None, None) => Self(PathBuf::from(format!("/run/user/{uid}/secretsd.sock"))),
+            (None, Some(directory)) if !directory.is_empty() => {
+                Self(Path::new(directory).join("secretsd.sock"))
+            }
+            (None, Some(_) | None) => Self(PathBuf::from(format!("/run/user/{uid}/secretsd.sock"))),
         }
     }
 
@@ -44,6 +46,16 @@ impl SocketPath {
     pub fn as_path(&self) -> &Path {
         &self.0
     }
+}
+
+/// Resolve the runtime directory shared by the broker socket and edit temps.
+pub(super) fn runtime_dir() -> PathBuf {
+    std::env::var_os("XDG_RUNTIME_DIR")
+        .filter(|directory| !directory.is_empty())
+        .map_or_else(
+            || PathBuf::from(format!("/run/user/{}", nix::unistd::getuid())),
+            PathBuf::from,
+        )
 }
 
 impl AsRef<Path> for SocketPath {

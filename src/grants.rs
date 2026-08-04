@@ -9,6 +9,7 @@ use subtle::ConstantTimeEq;
 
 use crate::proto::ErrCode;
 use crate::secret::{SecretBytes, SecretName};
+use crate::store::FileIdentity;
 
 /// Length of a session token in bytes.
 const TOKEN_LEN: usize = 32;
@@ -233,8 +234,14 @@ struct Grant {
     scope: Scope,
     key: SecretName,
     value: SecretBytes,
-    source: String,
+    origin: GrantOrigin,
     created: Instant,
+}
+
+#[derive(Debug)]
+pub(crate) struct GrantOrigin {
+    pub(crate) source: String,
+    pub(crate) identity: FileIdentity,
 }
 
 /// Live grants. Dropping a grant zeroizes its value.
@@ -245,21 +252,31 @@ pub struct GrantTable {
 
 impl GrantTable {
     /// Find a live grant.
-    pub fn lookup(&self, scope: &Scope, key: &SecretName) -> Option<(&SecretBytes, &str)> {
+    pub fn lookup(
+        &self,
+        scope: &Scope,
+        key: &SecretName,
+    ) -> Option<(&SecretBytes, &str, &FileIdentity)> {
         self.grants
             .iter()
             .find(|grant| grant.scope == *scope && grant.key == *key)
-            .map(|grant| (&grant.value, grant.source.as_str()))
+            .map(|grant| {
+                (
+                    &grant.value,
+                    grant.origin.source.as_str(),
+                    &grant.origin.identity,
+                )
+            })
     }
 
     /// Install a grant, replacing any existing one for the same scope and key.
-    pub fn insert(
+    pub(crate) fn insert(
         &mut self,
         scope: Scope,
         key: SecretName,
         value: SecretBytes,
         created: Instant,
-        source: String,
+        origin: GrantOrigin,
     ) {
         self.grants
             .retain(|grant| !(grant.scope == scope && grant.key == key));
@@ -267,9 +284,15 @@ impl GrantTable {
             scope,
             key,
             value,
-            source,
+            origin,
             created,
         });
+    }
+
+    /// Revoke one scope/key grant, zeroizing its cached plaintext.
+    pub fn revoke(&mut self, scope: &Scope, key: &SecretName) {
+        self.grants
+            .retain(|grant| !(grant.scope == *scope && grant.key == *key));
     }
 
     /// Revoke every grant belonging to a scope.
@@ -339,6 +362,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::*;
+    use crate::store::{FileIdentity, FileTimestamp};
 
     fn token(byte: u8) -> SessionToken {
         SessionToken::parse_hex(&format!("{byte:02x}").repeat(32)).unwrap()
@@ -352,6 +376,17 @@ mod tests {
         SecretBytes::from_vec(raw.as_bytes().to_vec())
     }
 
+    fn identity() -> FileIdentity {
+        FileIdentity::new(1, 2, 3, FileTimestamp::new(4, 5), FileTimestamp::new(6, 7))
+    }
+
+    fn origin(source: &str) -> GrantOrigin {
+        GrantOrigin {
+            source: source.to_owned(),
+            identity: identity(),
+        }
+    }
+
     #[test]
     fn lookup_returns_the_grant_source_label() {
         // Given: a grant associated with the source file that supplied its plaintext.
@@ -363,14 +398,48 @@ mod tests {
             key.clone(),
             secret("v"),
             Instant::now(),
-            "test.local".to_owned(),
+            origin("test.local"),
         );
 
         // When: the grant is looked up for a repeat request.
-        let (_, source) = table.lookup(&scope, &key).unwrap();
+        let (_, source, _) = table.lookup(&scope, &key).unwrap();
 
         // Then: the label identifies the file that supplied the cached plaintext.
         assert_eq!(source, "test.local");
+    }
+
+    #[test]
+    fn lookup_retains_the_backing_file_identity() {
+        // Given: a grant produced from one specific opened ciphertext file.
+        let mut table = GrantTable::default();
+        let scope = Scope::Session(token(0xaa));
+        let key = name("K");
+        let identity =
+            FileIdentity::new(1, 2, 3, FileTimestamp::new(4, 5), FileTimestamp::new(6, 7));
+        table.insert(
+            scope.clone(),
+            key.clone(),
+            secret("v"),
+            Instant::now(),
+            GrantOrigin {
+                source: "test".to_owned(),
+                identity: identity.clone(),
+            },
+        );
+
+        // When: a later access compares the stored identity with a resolved file.
+        let (_, _, stored) = table.lookup(&scope, &key).unwrap();
+
+        // Then: only the same device, inode, size, mtime, and ctime match.
+        assert_eq!(stored, &identity);
+        assert_ne!(
+            stored,
+            &FileIdentity::new(1, 2, 4, FileTimestamp::new(4, 5), FileTimestamp::new(6, 7),)
+        );
+        assert_ne!(
+            stored,
+            &FileIdentity::new(1, 2, 3, FileTimestamp::new(4, 5), FileTimestamp::new(6, 8),)
+        );
     }
 
     #[test]
@@ -384,7 +453,7 @@ mod tests {
             key.clone(),
             secret("first"),
             Instant::now(),
-            "test".to_owned(),
+            origin("test"),
         );
 
         // When: a fresh grant replaces it after decrypting a differently labeled source.
@@ -393,11 +462,11 @@ mod tests {
             key.clone(),
             secret("second"),
             Instant::now(),
-            "test.local".to_owned(),
+            origin("test.local"),
         );
 
         // Then: repeat access observes the replacement's source label.
-        let (_, source) = table.lookup(&scope, &key).unwrap();
+        let (_, source, _) = table.lookup(&scope, &key).unwrap();
         assert_eq!(source, "test.local");
     }
 
@@ -566,7 +635,7 @@ mod tests {
             name("K"),
             secret("v"),
             Instant::now(),
-            "test".to_owned(),
+            origin("test"),
         );
 
         // When: the same session identifier is registered with a new token.
@@ -608,7 +677,7 @@ mod tests {
             name("K"),
             secret("v"),
             Instant::now(),
-            "test".to_owned(),
+            origin("test"),
         );
 
         // When: the same session re-registers with the identical token.
@@ -709,18 +778,12 @@ mod tests {
         let now = Instant::now();
         let scope_a = Scope::Session(token(0xaa));
         let scope_b = Scope::Session(token(0xbb));
-        table.insert(
-            scope_a.clone(),
-            name("K"),
-            secret("v"),
-            now,
-            "test".to_owned(),
-        );
+        table.insert(scope_a.clone(), name("K"), secret("v"), now, origin("test"));
 
         assert_eq!(
             table
                 .lookup(&scope_a, &name("K"))
-                .map(|(value, _)| value.as_slice()),
+                .map(|(value, _, _)| value.as_slice()),
             Some(&b"v"[..])
         );
         assert!(
@@ -741,13 +804,7 @@ mod tests {
             tty: "/dev/pts/3".to_owned(),
             boot_id: "second-boot".to_owned(),
         };
-        table.insert(
-            first.clone(),
-            name("K"),
-            secret("v"),
-            now,
-            "test".to_owned(),
-        );
+        table.insert(first.clone(), name("K"), secret("v"), now, origin("test"));
 
         assert_ne!(first, second);
         assert!(table.lookup(&second, &name("K")).is_none());
@@ -762,7 +819,7 @@ mod tests {
             name("K"),
             secret("v"),
             now,
-            "test".to_owned(),
+            origin("test"),
         );
         table.revoke_tokens(&[token(0xaa)]);
         assert!(table.is_empty());
@@ -778,14 +835,14 @@ mod tests {
             name("OLD"),
             secret("v"),
             old,
-            "test".to_owned(),
+            origin("test"),
         );
         table.insert(
             Scope::Session(token(0xbb)),
             name("NEW"),
             secret("v"),
             now,
-            "test".to_owned(),
+            origin("test"),
         );
 
         let removed = table.revoke_expired(now, Duration::from_hours(12));
@@ -811,7 +868,7 @@ mod tests {
             name("K"),
             secret("v"),
             now,
-            "test".to_owned(),
+            origin("test"),
         );
         table.revoke_all();
         assert!(table.is_empty());
@@ -826,7 +883,7 @@ mod tests {
             name("K"),
             secret("super-secret"),
             now,
-            "test".to_owned(),
+            origin("test"),
         );
         let rendered = table.render(now);
         assert!(rendered.contains('K'));

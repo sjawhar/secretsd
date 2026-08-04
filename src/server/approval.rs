@@ -2,6 +2,7 @@ use std::time::Instant;
 
 use super::dispatch::{Decision, Outcome};
 use super::{Shared, lock_state, wait_state};
+use crate::audit::sanitize_audit_value;
 use crate::grants::{Scope, SessionToken};
 use crate::proto::ErrCode;
 use crate::requests::{RequestId, RequestState};
@@ -49,13 +50,28 @@ fn resolve_access(
 fn await_approval(shared: &Shared, scope: &Scope, key: &SecretName) -> Approval {
     let (mutex, condvar) = &**shared;
     let mut state = lock_state(mutex);
-    if let Some((_, source)) = state.grants.lookup(scope, key) {
+    if let Some((_, source, identity)) = state.grants.lookup(scope, key) {
         let source = source.to_owned();
-        drop(state);
-        return Approval::Granted {
-            source: Some(source),
-            request_id: None,
-        };
+        let identity = identity.clone();
+        if state
+            .store
+            .identity(key)
+            .is_ok_and(|current| current == identity)
+        {
+            drop(state);
+            return Approval::Granted {
+                source: Some(source),
+                request_id: None,
+            };
+        }
+        // Keep the lock while revoking and re-resolving: releasing it would permit
+        // a concurrent request to observe cached plaintext after its file changed.
+        state.grants.revoke(scope, key);
+        tracing::info!(
+            key = %key.as_str(),
+            source = %sanitize_audit_value(&source),
+            "grant invalidated after backing file changed"
+        );
     }
     let source = match state.store.locate(key) {
         Ok(source) => source,
@@ -161,7 +177,7 @@ pub(super) fn dispatch_access(
             let outcome = lock_state(mutex)
                 .grants
                 .lookup(&scope, &key)
-                .map(|(value, _)| value)
+                .map(|(value, _, _)| value)
                 .cloned()
                 .map_or(
                     Outcome::Failed(ErrCode::Internal, "grant disappeared"),
