@@ -1,7 +1,8 @@
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
+use std::time::Duration;
 
 use super::{ConfigError, SourceRoot, Sources};
 use crate::Config;
@@ -12,6 +13,7 @@ struct ConfigEnvironment {
     config: Option<OsString>,
     home: Option<OsString>,
     xdg_config_home: Option<OsString>,
+    yubikey_probe_timeout: Option<OsString>,
     _lock: MutexGuard<'static, ()>,
 }
 
@@ -21,6 +23,7 @@ impl ConfigEnvironment {
         let config = std::env::var_os("SECRETSD_CONFIG");
         let home = std::env::var_os("HOME");
         let xdg_config_home = std::env::var_os("XDG_CONFIG_HOME");
+        let yubikey_probe_timeout = std::env::var_os("SECRETSD_YUBIKEY_PROBE_TIMEOUT_SECS");
 
         // SAFETY: this test holds the process-wide environment lock and no daemon thread runs.
         unsafe { std::env::remove_var("SECRETSD_CONFIG") };
@@ -28,16 +31,19 @@ impl ConfigEnvironment {
         unsafe { std::env::remove_var("HOME") };
         // SAFETY: this test holds the process-wide environment lock and no daemon thread runs.
         unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
+        // SAFETY: this test holds the process-wide environment lock and no daemon thread runs.
+        unsafe { std::env::remove_var("SECRETSD_YUBIKEY_PROBE_TIMEOUT_SECS") };
 
         Self {
             config,
             home,
             xdg_config_home,
+            yubikey_probe_timeout,
             _lock: lock,
         }
     }
 
-    fn set(name: &str, value: &Path) {
+    fn set(name: &str, value: impl AsRef<OsStr>) {
         // SAFETY: this test retains the process-wide environment lock until restoration.
         unsafe { std::env::set_var(name, value) };
     }
@@ -49,6 +55,10 @@ impl Drop for ConfigEnvironment {
             ("SECRETSD_CONFIG", self.config.take()),
             ("HOME", self.home.take()),
             ("XDG_CONFIG_HOME", self.xdg_config_home.take()),
+            (
+                "SECRETSD_YUBIKEY_PROBE_TIMEOUT_SECS",
+                self.yubikey_probe_timeout.take(),
+            ),
         ] {
             match value {
                 Some(value) => {
@@ -417,4 +427,53 @@ fn load_rejects_a_root_that_is_not_a_directory() {
         Err(ConfigError::RootNotDirectory { name, path, config: declared })
             if name == "dotfiles" && path == root && declared == config
     ));
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn from_env_reads_the_probe_timeout_from_its_environment() {
+    // Given a valid source root and a probe timeout override in the daemon's environment.
+    let directory = tempfile::tempdir().unwrap();
+    let config_file = directory.path().join("config.toml");
+    std::fs::write(
+        &config_file,
+        format!("[source.test]\npath = \"{}\"\n", directory.path().display()),
+    )
+    .unwrap();
+
+    // When the daemon configuration is constructed.
+    let config = {
+        let _environment = ConfigEnvironment::clear();
+        ConfigEnvironment::set("HOME", Path::new("/home/u"));
+        ConfigEnvironment::set("SECRETSD_CONFIG", &config_file);
+        ConfigEnvironment::set("SECRETSD_YUBIKEY_PROBE_TIMEOUT_SECS", "7");
+        Config::from_env().unwrap()
+    };
+
+    // Then the probe timeout is the configured number of seconds.
+    assert_eq!(config.yubikey_probe_timeout, Duration::from_secs(7));
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn from_env_defaults_the_probe_timeout_to_two_seconds() {
+    // Given a valid source root and no probe timeout in the daemon's environment.
+    let directory = tempfile::tempdir().unwrap();
+    let config_file = directory.path().join("config.toml");
+    std::fs::write(
+        &config_file,
+        format!("[source.test]\npath = \"{}\"\n", directory.path().display()),
+    )
+    .unwrap();
+
+    // When the daemon configuration is constructed.
+    let config = {
+        let _environment = ConfigEnvironment::clear();
+        ConfigEnvironment::set("HOME", Path::new("/home/u"));
+        ConfigEnvironment::set("SECRETSD_CONFIG", &config_file);
+        Config::from_env().unwrap()
+    };
+
+    // Then the probe timeout keeps the direct-pcscd default.
+    assert_eq!(config.yubikey_probe_timeout, Duration::from_secs(2));
 }

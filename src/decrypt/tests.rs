@@ -231,6 +231,29 @@ fn is_unreachable_promptly_when_the_injected_probe_hangs() {
     assert!(started.elapsed() < Duration::from_secs(1));
 }
 
+#[test]
+fn from_argv_builds_a_probe_bounded_by_the_configured_timeout() {
+    // Given a probe argv that hangs and a configured sub-second timeout.
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("pcscd.comm");
+    let _listener = UnixListener::bind(&socket).unwrap();
+    let probe = YubikeyProbe::from_argv(
+        &["/bin/sleep".to_owned(), "30".to_owned()],
+        Duration::from_millis(10),
+    )
+    .unwrap();
+    let reachability = PcscReachability::new(Some(socket), Some(probe));
+    let decryptor = Decryptor::new(PathBuf::from("sops"), Duration::from_secs(1), reachability);
+
+    // When the pre-flight runs.
+    let started = std::time::Instant::now();
+    let reachable = decryptor.reachable();
+
+    // Then the configured timeout bounds the probe, not a built-in constant.
+    assert!(!reachable);
+    assert!(started.elapsed() < Duration::from_secs(1));
+}
+
 /// Captures emitted log lines so a test can assert on what was recorded.
 #[derive(Clone)]
 struct CapturedLogs(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);

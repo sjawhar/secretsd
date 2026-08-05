@@ -41,7 +41,7 @@ Both halves resolve the socket path by the same rule (`SocketPath::resolve`,
 plugin connect through `SECRETSD_SOCK` (`BrokerClient::from_environment`,
 `src/client.rs:91`; `resolveSocketPath`, `opencode/plugins/secretsd.ts`), while a
 standalone `secrets serve` listens on `SECRETSD_SOCKET` (`Config::from_env`,
-`src/lib.rs:98`). The split is deliberate — a test harness redirects the daemon's
+`src/lib.rs:105`). The split is deliberate — a test harness redirects the daemon's
 listener without silently redirecting every client on the machine — so
 redirecting one half never leaves the token registered with a daemon the other
 half is not talking to. Under socket activation systemd owns the listener and
@@ -82,7 +82,7 @@ filenames in configured `secrets.human.d/` directories are brokered.
 | Add or change a protocol op | `src/proto.rs:97` (requests), `src/proto/response.rs` |
 | Change source-root configuration | `Sources::config_path`, `src/config.rs:54`; `Sources::load`, `src/config.rs:70` |
 | Change what the audit line records | `src/server.rs:294`, context built at `:167`; sanitization in `src/audit.rs:19` |
-| Change how sops is invoked | `src/decrypt.rs:223`; failure classes at `:28` |
+| Change how sops is invoked | `src/decrypt.rs:251`; failure classes at `:27` |
 | Change how the runtime directory is resolved | `resolveRuntimeDir`, `opencode/plugins/secretsd.ts`; `SocketPath::resolve` and `runtime_dir`, `src/client.rs:35` |
 | Change which socket either half connects to | `resolveSocketPath`, `opencode/plugins/secretsd.ts`; `BrokerClient::from_environment`, `src/client.rs:91` |
 | Change the session token file's lifetime | `restoreTokenFile`, `opencode/plugins/secretsd.ts`; `ensureState` beside it |

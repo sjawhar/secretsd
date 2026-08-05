@@ -19,7 +19,6 @@ use crate::store::{FileIdentity, HumanStore, OpenedHumanFile};
 /// Polling period while a sops child is active.
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 const MAX_SOPS_STDERR_BYTES: u64 = 300;
-const YUBIKEY_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Known sops/age failure signatures, matched against lowercased stderr.
 ///
@@ -115,13 +114,9 @@ impl YubikeyProbe {
     }
 
     /// Build the configured probe, or no probe when its command is empty.
-    pub fn from_argv(command_argv: &[String]) -> Option<Self> {
+    pub fn from_argv(command_argv: &[String], timeout: Duration) -> Option<Self> {
         let (command, args) = command_argv.split_first()?;
-        Some(Self::new(
-            PathBuf::from(command),
-            args.to_vec(),
-            YUBIKEY_PROBE_TIMEOUT,
-        ))
+        Some(Self::new(PathBuf::from(command), args.to_vec(), timeout))
     }
 
     fn responds(&self) -> bool {

@@ -52,6 +52,9 @@ pub struct Config {
     pub pcsc_socket: Option<PathBuf>,
     /// argv for an optional bounded PC/SC far-end liveness probe.
     pub yubikey_probe_argv: Vec<String>,
+    /// Time budget for one probe run. Through a pcscd tunnel a healthy probe
+    /// can take over 3s, so the 2s direct-pcscd default needs raising there.
+    pub yubikey_probe_timeout: Duration,
     /// Backstop lifetime for a grant.
     pub max_grant: Duration,
     /// Gap enforced between decrypts; must exceed the PIV touch cache.
@@ -109,6 +112,7 @@ impl Config {
             sops_bin: var("SECRETSD_SOPS_BIN").map_or_else(|| PathBuf::from("sops"), PathBuf::from),
             pcsc_socket: var("PCSCLITE_CSOCK_NAME").map(PathBuf::from),
             yubikey_probe_argv: argv("SECRETSD_YUBIKEY_PROBE_CMD"),
+            yubikey_probe_timeout: secs("SECRETSD_YUBIKEY_PROBE_TIMEOUT_SECS", 2),
             max_grant: secs("SECRETSD_MAX_GRANT_SECS", 43200),
             cooldown: secs("SECRETSD_COOLDOWN_SECS", 16),
             request_ttl: secs("SECRETSD_REQUEST_TTL_SECS", 90),
@@ -125,7 +129,7 @@ impl Config {
             self.request_ttl,
             PcscReachability::new(
                 self.pcsc_socket.clone(),
-                YubikeyProbe::from_argv(&self.yubikey_probe_argv),
+                YubikeyProbe::from_argv(&self.yubikey_probe_argv, self.yubikey_probe_timeout),
             ),
         )
     }
@@ -203,6 +207,7 @@ mod tests {
             sops_bin: PathBuf::from("sops"),
             pcsc_socket: None,
             yubikey_probe_argv: Vec::new(),
+            yubikey_probe_timeout: Duration::from_secs(2),
             max_grant: Duration::from_secs(1),
             cooldown: Duration::from_secs(15),
             request_ttl: Duration::from_secs(1),
@@ -220,6 +225,7 @@ mod tests {
             sops_bin: PathBuf::from("sops"),
             pcsc_socket: None,
             yubikey_probe_argv: Vec::new(),
+            yubikey_probe_timeout: Duration::from_secs(2),
             max_grant: Duration::from_secs(1),
             cooldown: Duration::from_secs(16),
             request_ttl: Duration::from_secs(1),

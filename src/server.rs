@@ -528,6 +528,7 @@ mod tests {
             sops_bin: "/bin/false".into(),
             pcsc_socket: None,
             yubikey_probe_argv: Vec::new(),
+            yubikey_probe_timeout: Duration::from_secs(2),
             max_grant: Duration::from_secs(1),
             cooldown: Duration::from_secs(16),
             request_ttl: Duration::from_secs(1),
