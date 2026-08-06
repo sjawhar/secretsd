@@ -279,8 +279,14 @@ request → pending → decrypting → granted ──(session end | lock | 12h)�
 3. **One touch completes the grant**. `secrets deny <id>` or the 90s timeout
    rejects it.
 4. **Single-flight**: at most one YubiKey operation is in flight; the broker
-   waits out the 15s hardware touch cache before starting the next pending
-   decrypt, so one touch can never approve two requests.
+   waits out the hardware touch cache before starting the next pending
+   decrypt, so one touch can never approve two requests. With cached-touch
+   keys (the default assumption) that wait must exceed the 15s PIV cache;
+   an operator whose every human-tier key is touch-policy Always declares
+   `SECRETSD_TOUCH_POLICY=always`, which removes the floor because each
+   decrypt then demands its own physical touch. The declaration is trusted,
+   not probed: a false `always` on cached hardware reopens the
+   one-touch-two-grants window for queued requests.
    Per-scope pending-request limits with backoff after deny/timeout prevent
    one hostile or broken session from flooding the single-flight queue and
    locking out legitimate grants; `secrets deny` and `secrets lock` are

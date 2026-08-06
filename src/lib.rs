@@ -34,6 +34,24 @@ pub mod server;
 /// Human-tier ciphertext directory access.
 pub mod store;
 
+/// Declared touch policy of the hardware key backing the human tier.
+///
+/// This is an operator assertion, not a probed fact: the daemon cannot ask a
+/// ciphertext which slot will decrypt it. `Cached` is the fail-closed default;
+/// declare `Always` only when every human-tier recipient key demands a touch
+/// per decrypt, because that is what makes a sub-cache cooldown safe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(
+    clippy::exhaustive_enums,
+    reason = "the two hardware touch policies secretsd supports are an explicit configuration contract"
+)]
+pub enum TouchPolicy {
+    /// Touches open a ~15s window (the `YubiKey` PIV default cache).
+    Cached,
+    /// Every decrypt requires its own physical touch.
+    Always,
+}
+
 /// Daemon configuration. Sourced from the daemon's own environment only —
 /// never from a client request, because clients are untrusted.
 #[derive(Debug, Clone)]
@@ -55,6 +73,8 @@ pub struct Config {
     /// Time budget for one probe run. Through a pcscd tunnel a healthy probe
     /// can take over 3s, so the 2s direct-pcscd default needs raising there.
     pub yubikey_probe_timeout: Duration,
+    /// Declared hardware touch policy; controls the cooldown floor.
+    pub touch_policy: TouchPolicy,
     /// Backstop lifetime for a grant.
     pub max_grant: Duration,
     /// Gap enforced between decrypts; must exceed the PIV touch cache.
@@ -113,6 +133,16 @@ impl Config {
             pcsc_socket: var("PCSCLITE_CSOCK_NAME").map(PathBuf::from),
             yubikey_probe_argv: argv("SECRETSD_YUBIKEY_PROBE_CMD"),
             yubikey_probe_timeout: secs("SECRETSD_YUBIKEY_PROBE_TIMEOUT_SECS", 2),
+            touch_policy: match var("SECRETSD_TOUCH_POLICY").as_deref() {
+                None | Some("cached") => TouchPolicy::Cached,
+                Some("always") => TouchPolicy::Always,
+                Some(_) => {
+                    return Err(std::io::Error::new(
+                        ErrorKind::InvalidInput,
+                        "SECRETSD_TOUCH_POLICY must be cached (default) or always",
+                    ));
+                }
+            },
             max_grant: secs("SECRETSD_MAX_GRANT_SECS", 43200),
             cooldown: secs("SECRETSD_COOLDOWN_SECS", 16),
             request_ttl: secs("SECRETSD_REQUEST_TTL_SECS", 90),
@@ -136,10 +166,11 @@ impl Config {
 
     /// Reject settings that could allow one touch to authorize two decrypts.
     pub fn validate(&self) -> std::io::Result<()> {
-        if self.cooldown <= Duration::from_secs(15) {
+        if self.touch_policy == TouchPolicy::Cached && self.cooldown <= Duration::from_secs(15) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
-                "SECRETSD_COOLDOWN_SECS must exceed the 15s PIV touch cache",
+                "SECRETSD_COOLDOWN_SECS must exceed the 15s PIV touch cache; a shorter \
+                 cooldown is safe only with SECRETSD_TOUCH_POLICY=always hardware",
             ));
         }
         Ok(())
@@ -208,6 +239,7 @@ mod tests {
             pcsc_socket: None,
             yubikey_probe_argv: Vec::new(),
             yubikey_probe_timeout: Duration::from_secs(2),
+            touch_policy: TouchPolicy::Cached,
             max_grant: Duration::from_secs(1),
             cooldown: Duration::from_secs(15),
             request_ttl: Duration::from_secs(1),
@@ -226,6 +258,7 @@ mod tests {
             pcsc_socket: None,
             yubikey_probe_argv: Vec::new(),
             yubikey_probe_timeout: Duration::from_secs(2),
+            touch_policy: TouchPolicy::Cached,
             max_grant: Duration::from_secs(1),
             cooldown: Duration::from_secs(16),
             request_ttl: Duration::from_secs(1),
@@ -237,5 +270,53 @@ mod tests {
 
         // Then absence of human-tier files is not a configuration failure.
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn accepts_a_short_cooldown_when_the_touch_policy_is_always() {
+        // Given hardware declared as touch-policy Always, where no touch cache exists.
+        let config = Config {
+            socket_path: PathBuf::from("/tmp/secretsd-test.sock"),
+            human_sources: Vec::new(),
+            sops_bin: PathBuf::from("sops"),
+            pcsc_socket: None,
+            yubikey_probe_argv: Vec::new(),
+            yubikey_probe_timeout: Duration::from_secs(2),
+            touch_policy: TouchPolicy::Always,
+            max_grant: Duration::from_secs(1),
+            cooldown: Duration::from_secs(2),
+            request_ttl: Duration::from_secs(1),
+            max_pending_per_scope: 1,
+        };
+
+        // When startup validates the configuration.
+        let result = config.validate();
+
+        // Then the touch-cache cooldown floor does not apply.
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn rejects_a_short_cooldown_when_the_touch_policy_is_cached() {
+        // Given hardware left at the default Cached declaration and a sub-cache cooldown.
+        let config = Config {
+            socket_path: PathBuf::from("/tmp/secretsd-test.sock"),
+            human_sources: Vec::new(),
+            sops_bin: PathBuf::from("sops"),
+            pcsc_socket: None,
+            yubikey_probe_argv: Vec::new(),
+            yubikey_probe_timeout: Duration::from_secs(2),
+            touch_policy: TouchPolicy::Cached,
+            max_grant: Duration::from_secs(1),
+            cooldown: Duration::from_secs(2),
+            request_ttl: Duration::from_secs(1),
+            max_pending_per_scope: 1,
+        };
+
+        // When startup validates the configuration.
+        let result = config.validate();
+
+        // Then a cooldown inside the touch cache is refused.
+        assert!(result.is_err());
     }
 }

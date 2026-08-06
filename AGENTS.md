@@ -111,8 +111,10 @@ of them is a bug even if tests pass:
    gate. The human initiates requests; journald is the sole after-the-fact
    attribution record for a question such as "why did my key blink?".
 4. **Single-flight YubiKey.** At most one decrypt in flight, plus a cooldown
-   longer than the PIV touch cache, so one touch can never approve two
-   requests.
+   longer than the hardware's touch cache, so one touch can never approve two
+   requests. `SECRETSD_TOUCH_POLICY=always` declares hardware with no cache
+   (touch-policy Always keys), which is the only thing that makes a sub-15s
+   cooldown safe; the default assumes the cached policy and keeps the floor.
 5. **Fail closed.** Unknown token, unparseable request, missing scope, failed
    `mlockall`, ambiguous file: refuse. Never fall back to a weaker path.
 6. **Grants are never persisted.** Process restart loses grants by design, and

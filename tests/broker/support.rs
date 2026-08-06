@@ -79,6 +79,7 @@ impl Harness {
             pcsc_socket: None,
             yubikey_probe_argv: Vec::new(),
             yubikey_probe_timeout: Duration::from_secs(2),
+            touch_policy: secretsd::TouchPolicy::Cached,
             max_grant: Duration::from_hours(12),
             cooldown: Duration::from_secs(16),
             request_ttl: Duration::from_secs(20),

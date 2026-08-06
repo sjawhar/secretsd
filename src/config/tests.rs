@@ -5,7 +5,7 @@ use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 
 use super::{ConfigError, SourceRoot, Sources};
-use crate::Config;
+use crate::{Config, TouchPolicy};
 
 static CONFIG_ENVIRONMENT_LOCK: Mutex<()> = Mutex::new(());
 
@@ -14,6 +14,7 @@ struct ConfigEnvironment {
     home: Option<OsString>,
     xdg_config_home: Option<OsString>,
     yubikey_probe_timeout: Option<OsString>,
+    touch_policy: Option<OsString>,
     _lock: MutexGuard<'static, ()>,
 }
 
@@ -24,6 +25,7 @@ impl ConfigEnvironment {
         let home = std::env::var_os("HOME");
         let xdg_config_home = std::env::var_os("XDG_CONFIG_HOME");
         let yubikey_probe_timeout = std::env::var_os("SECRETSD_YUBIKEY_PROBE_TIMEOUT_SECS");
+        let touch_policy = std::env::var_os("SECRETSD_TOUCH_POLICY");
 
         // SAFETY: this test holds the process-wide environment lock and no daemon thread runs.
         unsafe { std::env::remove_var("SECRETSD_CONFIG") };
@@ -33,12 +35,15 @@ impl ConfigEnvironment {
         unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
         // SAFETY: this test holds the process-wide environment lock and no daemon thread runs.
         unsafe { std::env::remove_var("SECRETSD_YUBIKEY_PROBE_TIMEOUT_SECS") };
+        // SAFETY: this test holds the process-wide environment lock and no daemon thread runs.
+        unsafe { std::env::remove_var("SECRETSD_TOUCH_POLICY") };
 
         Self {
             config,
             home,
             xdg_config_home,
             yubikey_probe_timeout,
+            touch_policy,
             _lock: lock,
         }
     }
@@ -59,6 +64,7 @@ impl Drop for ConfigEnvironment {
                 "SECRETSD_YUBIKEY_PROBE_TIMEOUT_SECS",
                 self.yubikey_probe_timeout.take(),
             ),
+            ("SECRETSD_TOUCH_POLICY", self.touch_policy.take()),
         ] {
             match value {
                 Some(value) => {
@@ -476,4 +482,84 @@ fn from_env_defaults_the_probe_timeout_to_two_seconds() {
 
     // Then the probe timeout keeps the direct-pcscd default.
     assert_eq!(config.yubikey_probe_timeout, Duration::from_secs(2));
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn from_env_reads_an_always_touch_policy() {
+    // Given a valid source root and an Always touch-policy declaration.
+    let directory = tempfile::tempdir().unwrap();
+    let config_file = directory.path().join("config.toml");
+    std::fs::write(
+        &config_file,
+        format!("[source.test]\npath = \"{}\"\n", directory.path().display()),
+    )
+    .unwrap();
+
+    // When the daemon configuration is constructed.
+    let config = {
+        let _environment = ConfigEnvironment::clear();
+        ConfigEnvironment::set("HOME", Path::new("/home/u"));
+        ConfigEnvironment::set("SECRETSD_CONFIG", &config_file);
+        ConfigEnvironment::set("SECRETSD_TOUCH_POLICY", "always");
+        Config::from_env().unwrap()
+    };
+
+    // Then the declared hardware policy is carried into the configuration.
+    assert_eq!(config.touch_policy, TouchPolicy::Always);
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn from_env_defaults_the_touch_policy_to_cached() {
+    // Given a valid source root and no touch-policy declaration.
+    let directory = tempfile::tempdir().unwrap();
+    let config_file = directory.path().join("config.toml");
+    std::fs::write(
+        &config_file,
+        format!("[source.test]\npath = \"{}\"\n", directory.path().display()),
+    )
+    .unwrap();
+
+    // When the daemon configuration is constructed.
+    let config = {
+        let _environment = ConfigEnvironment::clear();
+        ConfigEnvironment::set("HOME", Path::new("/home/u"));
+        ConfigEnvironment::set("SECRETSD_CONFIG", &config_file);
+        Config::from_env().unwrap()
+    };
+
+    // Then the stricter Cached assumption holds, keeping the cooldown floor.
+    assert_eq!(config.touch_policy, TouchPolicy::Cached);
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn from_env_rejects_an_unknown_touch_policy() {
+    // Given a valid source root and an unsupported touch-policy value.
+    let directory = tempfile::tempdir().unwrap();
+    let config_file = directory.path().join("config.toml");
+    std::fs::write(
+        &config_file,
+        format!("[source.test]\npath = \"{}\"\n", directory.path().display()),
+    )
+    .unwrap();
+
+    // When the daemon configuration is constructed.
+    let error = {
+        let _environment = ConfigEnvironment::clear();
+        ConfigEnvironment::set("HOME", Path::new("/home/u"));
+        ConfigEnvironment::set("SECRETSD_CONFIG", &config_file);
+        ConfigEnvironment::set("SECRETSD_TOUCH_POLICY", "never");
+        Config::from_env().unwrap_err()
+    };
+
+    // Then startup refuses rather than guessing at the hardware's gate.
+    assert_eq!(error.kind(), ErrorKind::InvalidInput);
+    assert!(
+        error
+            .to_string()
+            .contains("SECRETSD_TOUCH_POLICY must be cached (default) or always"),
+        "{error}"
+    );
 }
