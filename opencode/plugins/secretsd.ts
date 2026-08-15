@@ -72,7 +72,7 @@ const DAEMON_ERROR_GUIDANCE = {
   INTERNAL: "error: secretsd failed while decrypting; inspect `journalctl --user -u secretsd` for the daemon's sops stderr.",
 } as const satisfies Record<DaemonErrorCode, string>;
 
-type RequestOutcome =
+export type RequestOutcome =
   | { readonly kind: "broker-unreachable" }
   | { readonly kind: "broker-unresponsive" }
   | { readonly kind: "daemon-error"; readonly code: DaemonErrorCode }
@@ -81,7 +81,7 @@ type RequestOutcome =
   | { readonly kind: "runtime-unavailable"; readonly reason: string }
   | { readonly kind: "unexpected-broker-response" }
   | { readonly kind: "unexpected-error" };
-type SecretRequest = {
+export type SecretRequest = {
   readonly state: SessionState;
   readonly sessionID: string;
   readonly pid: number;
@@ -341,7 +341,7 @@ function parseHandshake(reply: string): string {
   return instance;
 }
 
-class BrokerClient {
+export class BrokerClient {
   constructor(
     private readonly socketPath: string,
     private readonly onInstance: (instance: string) => void = () => {},
@@ -457,7 +457,7 @@ class BrokerClient {
   }
 }
 
-function guidance(outcome: RequestOutcome): string {
+export function guidance(outcome: RequestOutcome): string {
   switch (outcome.kind) {
     case "broker-unreachable":
       return "unavailable: could not reach the secretsd broker; check that secretsd is running and its socket is available.";
@@ -533,7 +533,7 @@ function responseOutcome(response: string): RequestOutcome {
   return { kind: "unexpected-broker-response" };
 }
 
-function failureOutcome(error: unknown): RequestOutcome {
+export function failureOutcome(error: unknown): RequestOutcome {
   if (error instanceof RuntimeUnavailableError) {
     return { kind: "runtime-unavailable", reason: error.reason };
   }
@@ -555,7 +555,7 @@ function failureOutcome(error: unknown): RequestOutcome {
   return { kind: "unexpected-error" };
 }
 
-async function requestSecret(broker: BrokerClient, request: SecretRequest): Promise<RequestOutcome> {
+export async function requestSecret(broker: BrokerClient, request: SecretRequest): Promise<RequestOutcome> {
   try {
     let response = await broker.request(request.key, request.state, request.signal);
     if (responseCode(response) === "UNKNOWN_TOKEN") {

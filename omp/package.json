@@ -1,0 +1,10 @@
+{
+	"name": "secretsd-omp",
+	"version": "0.1.0",
+	"type": "module",
+	"private": true,
+	"description": "oh-my-pi (omp) extension for secretsd: session token registration, bash env export, and the secrets_request approval tool. Reuses the protocol client from opencode/plugins/secretsd.ts.",
+	"omp": {
+		"extensions": ["./extensions/secretsd.ts"]
+	}
+}
