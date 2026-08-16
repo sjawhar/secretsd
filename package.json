@@ -9,6 +9,11 @@
     ".": "./opencode/plugins/secretsd.ts",
     "./server": "./opencode/plugins/secretsd.ts"
   },
+  "omp": {
+    "extensions": [
+      "./omp/extensions/secretsd.ts"
+    ]
+  },
   "files": [
     "opencode/plugins/secretsd.ts",
     "opencode/skills/"
