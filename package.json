@@ -12,6 +12,9 @@
   "omp": {
     "extensions": [
       "./omp/extensions/secretsd.ts"
+    ],
+    "skills": [
+      "./opencode/skills"
     ]
   },
   "files": [
