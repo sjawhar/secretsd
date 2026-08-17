@@ -109,8 +109,8 @@ jobs:
           mkdir -p "$staging/bin" "$staging/share/secretsd/opencode/plugins" "$staging/systemd"
           install -m 0755 target/release/secrets "$staging/bin/secrets"
           install -m 0644 opencode/plugins/secretsd.ts "$staging/share/secretsd/opencode/plugins/secretsd.ts"
-          mkdir -p "$staging/share/secretsd/opencode/skills/using-secrets"
-          install -m 0644 opencode/skills/using-secrets/SKILL.md "$staging/share/secretsd/opencode/skills/using-secrets/SKILL.md"
+          mkdir -p "$staging/share/secretsd/skills/using-secrets"
+          install -m 0644 skills/using-secrets/SKILL.md "$staging/share/secretsd/skills/using-secrets/SKILL.md"
           install -m 0644 systemd/secretsd.service "$staging/systemd/secretsd.service"
           install -m 0644 systemd/secretsd.socket "$staging/systemd/secretsd.socket"
           tar czf "${staging}.tar.gz" "$staging"
@@ -123,7 +123,7 @@ jobs:
           for artifact in \
             "$staging/bin/secrets" \
             "$staging/share/secretsd/opencode/plugins/secretsd.ts" \
-            "$staging/share/secretsd/opencode/skills/using-secrets/SKILL.md" \
+            "$staging/share/secretsd/skills/using-secrets/SKILL.md" \
             "$staging/systemd/secretsd.service" \
             "$staging/systemd/secretsd.socket"; do
             if ! tar --list --gzip --file="$archive" | grep --fixed-strings --line-regexp -- "$artifact" >/dev/null; then

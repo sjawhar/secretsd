@@ -12,14 +12,11 @@
   "omp": {
     "extensions": [
       "./omp/extensions/secretsd.ts"
-    ],
-    "skills": [
-      "./opencode/skills"
     ]
   },
   "files": [
     "opencode/plugins/secretsd.ts",
-    "opencode/skills/"
+    "skills/"
   ],
   "dependencies": {
     "@opencode-ai/plugin": "^1.3.0"

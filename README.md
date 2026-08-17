@@ -33,8 +33,8 @@ install -Dm644 systemd/secretsd.socket "$HOME/.config/systemd/user/secretsd.sock
 install -Dm644 systemd/secretsd.service "$HOME/.config/systemd/user/secretsd.service"
 install -Dm644 share/secretsd/opencode/plugins/secretsd.ts \
     "$HOME/.local/share/secretsd/opencode/plugins/secretsd.ts"
-install -Dm644 share/secretsd/opencode/skills/using-secrets/SKILL.md \
-    "$HOME/.local/share/secretsd/opencode/skills/using-secrets/SKILL.md"
+install -Dm644 share/secretsd/skills/using-secrets/SKILL.md \
+    "$HOME/.local/share/secretsd/skills/using-secrets/SKILL.md"
 systemctl --user daemon-reload
 systemctl --user enable --now secretsd.socket
 ```

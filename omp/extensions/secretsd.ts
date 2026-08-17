@@ -36,7 +36,7 @@ import {
 } from "../../opencode/plugins/secretsd.ts";
 
 const extensionDir = dirname(fileURLToPath(import.meta.url));
-const SKILLS_DIRECTORY = resolve(extensionDir, "../../opencode/skills");
+const SKILLS_DIRECTORY = resolve(extensionDir, "../../../skills");
 
 export default function secretsdOmpExtension(pi: ExtensionAPI) {
 	const z = pi.zod;

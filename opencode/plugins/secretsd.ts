@@ -19,7 +19,7 @@ type PluginOptions = {
 /// Skills shipped beside this plugin. Registering the directory through the
 /// config hook is how a plugin contributes skills; it needs no symlink and no
 /// edit to the user's config.
-const SKILLS_DIRECTORY = join(dirname(fileURLToPath(import.meta.url)), "..", "skills");
+const SKILLS_DIRECTORY = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "skills");
 
 type ConfigInput = {
   skills?: { paths?: string[] };
