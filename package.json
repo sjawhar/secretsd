@@ -16,6 +16,8 @@
   },
   "files": [
     "opencode/plugins/secretsd.ts",
+    "omp/package.json",
+    "omp/extensions/secretsd.ts",
     "skills/"
   ],
   "dependencies": {

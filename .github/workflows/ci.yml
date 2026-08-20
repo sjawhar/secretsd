@@ -45,6 +45,17 @@ jobs:
       - name: Test OpenCode secretsd plugin
         run: bun install --frozen-lockfile && bun run test:secretsd-plugin
 
+  omp-extension:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - name: Install root dependencies (extension imports the opencode protocol client)
+        run: bun install --frozen-lockfile
+      - name: Test omp secretsd extension
+        working-directory: omp
+        run: bun install --frozen-lockfile && bun run test:secretsd-omp-extension
+
   miri:
     runs-on: ubuntu-latest
     steps:

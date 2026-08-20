@@ -239,6 +239,18 @@ A grant is `(session_token, key)`, held in broker memory.
   accepted same-UID residual, a materially higher bar than claiming an ID
   string, and one that leaves no accidental trail in `env` dumps or
   transcripts.
+- **omp**: one omp OS process is one session tree, and the extension deliberately
+  anchors ONE token/scope for that whole tree — the root session registers it,
+  and every in-process subagent this extension loads into inherits the same
+  anchor rather than minting its own, per "the token-file path is inherited by
+  everything the session spawns" above. journald attribution is therefore
+  tree-granular for omp, not session-granular. The accepted residual: a
+  hypothetical multi-root omp process (ACP mode, or an SDK embedding several
+  top-level sessions in one process) would share that one scope across roots
+  that have no reason to trust each other. Accepted because the deployed use
+  is the single-root CLI/TUI, and any in-process code sharing that process is
+  inside the same trust domain anyway — the same reasoning that makes the
+  sibling-session bullet's "same-UID residual" acceptable.
 - **Tokenless requests** (the human at an interactive shell): keyed on
   `(tty, boot-id)` as the grant scope; same touch flow; revoked when the tty
   vanishes. They are rejected outright from PTYs registered as agent-session

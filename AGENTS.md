@@ -141,6 +141,7 @@ cargo nextest run --all-targets --all-features --workspace
 cargo +nightly miri nextest run --all-features -E 'test(/^(secret|grants|requests|proto|client|config)::tests::/)'
 cargo machete && cargo deny check all
 bun install --frozen-lockfile && bun run test:secretsd-plugin
+(cd omp && bun install --frozen-lockfile && bun run test:secretsd-omp-extension)
 ```
 
 Miri covers the pure `secret`, `grants`, `requests`, `proto`, `client`, and `config`
@@ -186,6 +187,14 @@ the token directory must be a real directory rather than a symlink. It never
 creates `<runtime>` itself — a missing `/run/user/<uid>` means there is no
 systemd user session, so writing tokens there would report a success the daemon
 cannot see.
+
+The omp extension (`omp/extensions/secretsd.ts`) anchors ONE token per omp OS
+process, not per session: the first session to start (the root) registers it,
+and every in-process subagent session this extension loads into adopts that
+same anchor instead of minting its own — so grants deliberately span the whole
+session tree, per `docs/design.md`'s "the token-file path is inherited by
+everything the session spawns." The owning (root) session's shutdown
+unregisters and removes the token file for the whole tree.
 
 The wire protocol is the contract between client and daemon: it carries a
 version in the handshake, and a mismatch must fail loudly rather than degrade.

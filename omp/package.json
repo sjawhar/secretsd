@@ -6,5 +6,12 @@
 	"description": "oh-my-pi (omp) extension for secretsd: session token registration, bash env export, and the secrets_request approval tool. Reuses the protocol client from opencode/plugins/secretsd.ts.",
 	"omp": {
 		"extensions": ["./extensions/secretsd.ts"]
+	},
+	"scripts": {
+		"test:secretsd-omp-extension": "bun test extensions/secretsd.test.ts"
+	},
+	"devDependencies": {
+		"@earendil-works/pi-coding-agent": "0.84.2",
+		"zod": "^4.4.3"
 	}
 }
