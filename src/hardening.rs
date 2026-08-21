@@ -1,5 +1,7 @@
-//! Process-level hardening applied before the daemon holds any plaintext or the
-//! client reads a non-interactive human-secret write from stdin.
+//! Process-level hardening applied before any plaintext is held.
+//!
+//! This covers the daemon before it holds decrypted secrets, and the client
+//! before it reads a non-interactive human-secret write from stdin.
 
 use std::fmt;
 
