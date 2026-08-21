@@ -1,7 +1,7 @@
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::process::{Output, Stdio};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use std::{fs, thread};
 
 use nix::fcntl::{Flock, FlockArg};
@@ -354,6 +354,69 @@ fn set_human_stdout_failure_never_stages_the_piped_value() {
     );
     assert!(!output.status.success());
     assert_value_is_not_rendered(&output, value);
+    assert!(!target.exists());
+    assert_eq!(fixture.sops_calls(), 1);
+}
+
+#[test]
+fn set_human_drains_sops_output_before_writing_large_stdin() {
+    const LARGE_INPUT_BYTES: usize = 2_097_152;
+
+    let fixture = Fixture::agent("");
+    fixture.use_sops_fixture("fake-sops-output-before-stdin");
+    let target = fixture
+        .dotfiles_dir()
+        .join("secrets.human.d/NEW_KEY.local.env");
+    let marker_directory = tempfile::tempdir().unwrap();
+    let process_marker = marker_directory.path().join("sops.pid");
+    let mut child = fixture
+        .command(["set-human", "NEW_KEY"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .env("FAKE_SOPS_OUTPUT_BEFORE_STDIN_MARKER", &process_marker)
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let writer = thread::spawn(move || {
+        let value = vec![b'x'; LARGE_INPUT_BYTES];
+        std::io::Write::write_all(&mut stdin, &value)
+    });
+
+    let sops_started = (0..100).any(|_| {
+        if process_marker.exists() {
+            true
+        } else {
+            thread::sleep(Duration::from_millis(10));
+            false
+        }
+    });
+    if !sops_started {
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = writer.join();
+        panic!("the output-before-stdin sops fixture did not start");
+    }
+
+    let deadline = Instant::now().checked_add(Duration::from_secs(2)).unwrap();
+    let completed = loop {
+        match child.try_wait().unwrap() {
+            Some(_) => break true,
+            None if Instant::now() >= deadline => break false,
+            None => thread::sleep(Duration::from_millis(10)),
+        }
+    };
+    if !completed {
+        let _ = child.kill();
+    }
+    let output = child.wait_with_output().unwrap();
+    let _ = writer.join();
+
+    assert!(
+        completed,
+        "set-human deadlocked while sops wrote output before reading stdin"
+    );
+    assert!(!output.status.success());
     assert!(!target.exists());
     assert_eq!(fixture.sops_calls(), 1);
 }

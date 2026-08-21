@@ -5,10 +5,11 @@ use std::fs::{File, OpenOptions};
 use std::io::{IsTerminal, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::{ChildStdout, Command, Stdio};
 
 use nix::fcntl::{Flock, FlockArg};
-use nix::unistd::Uid;
+use nix::sys::signal::{Signal, kill};
+use nix::unistd::{Pid, Uid};
 use tempfile::{Builder, TempPath};
 use zeroize::Zeroize;
 
@@ -176,32 +177,7 @@ fn sops_encrypt_command(directory: &Path, target: &Path) -> Command {
     command
 }
 
-fn encrypt_bytes(plaintext: &SecretBytes, target: &Path) -> Result<(), CliError> {
-    let directory = target.parent().ok_or(CliError::InstallEditedSecret)?;
-    let mut child = sops_encrypt_command(directory, target)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|_| CliError::EncryptEditedSecret(target.to_path_buf()))?;
-    let mut stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| CliError::EncryptEditedSecret(target.to_path_buf()))?;
-    stdin
-        .write_all(plaintext.as_slice())
-        .map_err(|_| CliError::EncryptEditedSecret(target.to_path_buf()))?;
-    drop(stdin);
-    let mut stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| CliError::EncryptEditedSecret(target.to_path_buf()))?;
-    let mut stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| CliError::EncryptEditedSecret(target.to_path_buf()))?;
-    let stderr_reader =
-        std::thread::spawn(move || std::io::copy(&mut stderr, &mut std::io::sink()));
+fn drain_sops_stdout(mut stdout: ChildStdout, process_id: Pid) -> Result<Vec<u8>, ()> {
     let mut output = Vec::new();
     let read_result = stdout
         .by_ref()
@@ -210,12 +186,49 @@ fn encrypt_bytes(plaintext: &SecretBytes, target: &Path) -> Result<(), CliError>
     let output_too_large =
         u64::try_from(output.len()).map_or(true, |length| length > MAX_SOPS_CIPHERTEXT_BYTES);
     if read_result.is_err() || output_too_large {
-        let _ = child.kill();
+        output.zeroize();
+        let _ = kill(process_id, Signal::SIGKILL);
+        Err(())
+    } else {
+        Ok(output)
     }
+}
+
+fn encrypt_bytes(plaintext: &SecretBytes, target: &Path) -> Result<(), CliError> {
+    let directory = target.parent().ok_or(CliError::InstallEditedSecret)?;
+    let mut child = sops_encrypt_command(directory, target)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|_| CliError::EncryptEditedSecret(target.to_path_buf()))?;
+    let process_id = i32::try_from(child.id())
+        .map(Pid::from_raw)
+        .map_err(|_| CliError::EncryptEditedSecret(target.to_path_buf()))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| CliError::EncryptEditedSecret(target.to_path_buf()))?;
+    let stdout_reader = std::thread::spawn(move || drain_sops_stdout(stdout, process_id));
+    let mut stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| CliError::EncryptEditedSecret(target.to_path_buf()))?;
+    let stderr_reader =
+        std::thread::spawn(move || std::io::copy(&mut stderr, &mut std::io::sink()));
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| CliError::EncryptEditedSecret(target.to_path_buf()))?;
+    let write_result = stdin.write_all(plaintext.as_slice());
+    drop(stdin);
     let status = child.wait();
+    let stdout_result = stdout_reader.join();
     let stderr_result = stderr_reader.join();
-    if read_result.is_err()
-        || output_too_large
+    let Ok(Ok(mut output)) = stdout_result else {
+        return Err(CliError::EncryptEditedSecret(target.to_path_buf()));
+    };
+    if write_result.is_err()
         || !matches!(status, Ok(status) if status.success())
         || !matches!(stderr_result, Ok(Ok(_)))
     {

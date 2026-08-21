@@ -1,0 +1,14 @@
+#!/bin/bash
+set -eu
+
+if [ -n "${FAKE_SOPS_LOG:-}" ]; then
+  printf '%s\n' "fake-sops-output-before-stdin $*" >> "$FAKE_SOPS_LOG"
+fi
+
+if [ -n "${FAKE_SOPS_OUTPUT_BEFORE_STDIN_MARKER:-}" ]; then
+  printf '%s\n' "$$" > "$FAKE_SOPS_OUTPUT_BEFORE_STDIN_MARKER"
+fi
+
+head -c 2097152 /dev/zero
+cat >/dev/null
+exit 1
