@@ -88,7 +88,7 @@ filenames in configured `secrets.human.d/` directories are brokered.
 | Change the session token file's lifetime | `restoreTokenFile`, `opencode/plugins/secretsd.ts`; `ensureState` beside it |
 | Change the approval lifecycle | `src/server/approval.rs:49`; `src/server/worker.rs:27` |
 | Change the CLI surface | `src/client/cli.rs:17` |
-| Change human-secret creation | `src/client/edit/new.rs`: `human`, `set_human`, `read_piped_assignment`, `encrypt`, and `encrypt_bytes` |
+| Change human-secret creation | `src/client/edit/new.rs`: `human`, `write_piped_human`, `read_piped_assignment`, `encrypt`, and `encrypt_bytes` |
 | Change stale-grant invalidation | `resolve_access`, `src/server/approval.rs:30`; `HumanStore::identity`, `src/store.rs:145` |
 | Change grant lifetime or revocation | `GrantTable::revoke`, `src/grants.rs:293` |
 

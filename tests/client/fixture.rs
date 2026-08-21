@@ -4,6 +4,7 @@ use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
+use nix::pty::openpty;
 use tempfile::TempDir;
 
 struct Fixture {
@@ -173,6 +174,16 @@ esac
         self.command(arguments).output().unwrap()
     }
 
+    fn run_in_tty(mut command: Command) -> Output {
+        let terminal = openpty(None, None).unwrap();
+        command
+            .stdin(Stdio::from(fs::File::from(terminal.slave)))
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .unwrap()
+    }
+
     fn run_with_stdin<I, S>(&self, arguments: I, stdin: &[u8]) -> Output
     where
         I: IntoIterator<Item = S>,
@@ -210,7 +221,7 @@ esac
         if let Some(key) = key {
             command.env("FAKE_EDITOR_KEY", key);
         }
-        command.output().unwrap()
+        Self::run_in_tty(command)
     }
 
     fn command<I, S>(&self, arguments: I) -> Command
@@ -305,3 +316,4 @@ esac
         &self.runtime_dir
     }
 }
+

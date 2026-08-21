@@ -9,13 +9,13 @@ readonly human_key='E2E_KEY'
 readonly local_human_key='LOCAL_KEY'
 readonly root2_human_key='ROOT2_KEY'
 readonly created_human_key='CREATED_KEY'
-readonly SET_HUMAN_KEY='SET_HUMAN_KEY'
+readonly piped_human_key='PIPED_HUMAN_KEY'
 readonly agent_key='AGENT_KEY'
 readonly human_value='value-for-e2e-client'
 readonly local_human_value='value-for-local-human'
 readonly root2_human_value='value-for-root2-human'
 readonly created_human_value='value-for-created-human'
-readonly set_human_value='value-for-set-human'
+readonly piped_human_value='value-for-piped-human'
 readonly agent_value='value-for-agent-client'
 readonly grants_pattern=$'^KEY\tSCOPE\tAGE\nE2E_KEY\tsession\t[0-9]+s\nLOCAL_KEY\tsession\t[0-9]+s\nROOT2_KEY\tsession\t[0-9]+s$'
 
@@ -155,6 +155,31 @@ run_client() {
   run_client_from "$scratch" "$@"
 }
 
+run_client_in_tty_from() {
+  local working_directory="$1"
+  shift
+  local command=''
+  local argument
+  for argument in "$client" "$@"; do
+    printf -v argument '%q' "$argument"
+    command+="${command:+ }$argument"
+  done
+  (
+    cd "$working_directory"
+    env -i \
+      PATH="$harness_bin:$PATH" \
+      HOME="$HOME" \
+      SECRETSD_CONFIG="$daemon_config" \
+      SECRETSD_SOCK="$socket" \
+      SECRETSD_SESSION_TOKEN_FILE="$token_file" \
+      SOPS_AGE_KEY_FILE="$age_key_file" \
+      REAL_SOPS_BIN="$real_sops" \
+      REAL_SOPS_LOG="$sops_log" \
+      EDITOR="$harness_bin/editor" \
+      /usr/bin/script --quiet --return --command "$command" /dev/null
+  )
+}
+
 run_client_from() {
   local working_directory="$1"
   shift
@@ -280,7 +305,7 @@ chmod 600 "$token_file"
 report '6/14 creating a human secret through the real client and real sops'
 # sops discovers `.sops.yaml` from its CWD, not `--filename-override`; this
 # config-less directory proves the client resets only its child CWD to the target.
-run_client_from "$operator_dir" edit-human "$created_human_key" --source dotfiles
+run_client_in_tty_from "$operator_dir" edit-human "$created_human_key" --source dotfiles
 readonly created_human_path="$human_dir/$created_human_key.env"
 [[ -f "$created_human_path" ]] || fail 'edit-human did not create the human ciphertext file'
 grep -F --quiet "$unavailable_human_recipient" "$created_human_path" || fail 'created human secret lacks the human-rule recipient'
@@ -293,26 +318,26 @@ fi
 assert_sops_counts 1 0 'human secret creation'
 report '6/14 created ciphertext under the human rule; the agent key could not decrypt it'
 
-report '7/14 storing and rotating a human secret from stdin through the real client and real sops'
-readonly set_human_path="$human_dir/$SET_HUMAN_KEY.local.env"
-set_human_create_output="$(printf '%s' "$set_human_value" | run_client_from "$operator_dir" set-human "$SET_HUMAN_KEY" --source dotfiles)"
-[[ "$set_human_create_output" == "created $set_human_path" ]] || fail 'set-human did not report its created ciphertext path'
-[[ -f "$set_human_path" ]] || fail 'set-human did not create the human ciphertext file'
-grep -F --quiet "$unavailable_human_recipient" "$set_human_path" || fail 'set-human secret lacks the human-rule recipient'
-if grep -F --quiet "$agent_recipient" "$set_human_path"; then
-  fail 'set-human secret selected the agent-rule recipient'
+report '7/14 writing and rotating a human secret from stdin through the real client and real sops'
+readonly piped_human_path="$human_dir/$piped_human_key.local.env"
+piped_human_create_output="$(printf '%s' "$piped_human_value" | run_client_from "$operator_dir" edit-human "$piped_human_key" --source dotfiles)"
+[[ "$piped_human_create_output" == "created $piped_human_path" ]] || fail 'stdin write did not report its created ciphertext path'
+[[ -f "$piped_human_path" ]] || fail 'stdin write did not create the human ciphertext file'
+grep -F --quiet "$unavailable_human_recipient" "$piped_human_path" || fail 'stdin write secret lacks the human-rule recipient'
+if grep -F --quiet "$agent_recipient" "$piped_human_path"; then
+  fail 'stdin write secret selected the agent-rule recipient'
 fi
-if env -i PATH="$PATH" HOME="$scratch" SOPS_AGE_KEY_FILE="$age_key_file" "$real_sops" -d "$set_human_path" >/dev/null 2>&1; then
-  fail 'agent age key decrypted the set-human secret'
+if env -i PATH="$PATH" HOME="$scratch" SOPS_AGE_KEY_FILE="$age_key_file" "$real_sops" -d "$piped_human_path" >/dev/null 2>&1; then
+  fail 'agent age key decrypted the stdin-write secret'
 fi
-assert_sops_counts 2 0 'set-human creation'
-cp "$set_human_path" "$scratch/set-human-before-rotation.env"
-set_human_rotate_output="$(printf '%s' 'rotated-value-for-set-human' | run_client_from "$operator_dir" set-human "$SET_HUMAN_KEY" --source dotfiles)"
-[[ "$set_human_rotate_output" == 'rotated '* ]] || fail 'set-human did not report rotation'
-if cmp -s "$scratch/set-human-before-rotation.env" "$set_human_path"; then
-  fail 'set-human rotation did not replace the ciphertext'
+assert_sops_counts 2 0 'stdin-write creation'
+cp "$piped_human_path" "$scratch/piped-human-before-rotation.env"
+piped_human_rotate_output="$(printf '%s' 'rotated-value-for-piped-human' | run_client_from "$operator_dir" edit-human "$piped_human_key" --source dotfiles)"
+[[ "$piped_human_rotate_output" == 'rotated '* ]] || fail 'stdin write did not report rotation'
+if cmp -s "$scratch/piped-human-before-rotation.env" "$piped_human_path"; then
+  fail 'stdin write rotation did not replace the ciphertext'
 fi
-assert_sops_counts 3 0 'set-human rotation'
+assert_sops_counts 3 0 'stdin-write rotation'
 report '7/14 stored and rotated ciphertext under the human rule; real-sops total=3 daemon=0'
 
 report '8/14 fetching the human value through the real client'
@@ -348,7 +373,7 @@ report '12/14 root2 human get returned the expected value [redacted]; real-sops 
 
 report '13/14 listing both tiers and active grants'
 listing="$(run_client list)"
-[[ "$listing" == $'AGENT_KEY\nCREATED_KEY  (human tier: dotfiles)\nE2E_KEY  (human tier: dotfiles)\nLOCAL_KEY  (human tier: dotfiles.local)\nROOT2_KEY  (human tier: private)\nSET_HUMAN_KEY  (human tier: dotfiles.local)' ]] || fail 'list returned unexpected tier names'
+[[ "$listing" == $'AGENT_KEY\nCREATED_KEY  (human tier: dotfiles)\nE2E_KEY  (human tier: dotfiles)\nLOCAL_KEY  (human tier: dotfiles.local)\nPIPED_HUMAN_KEY  (human tier: dotfiles.local)\nROOT2_KEY  (human tier: private)' ]] || fail 'list returned unexpected tier names'
 assert_sops_counts 12 3 'list'
 grants="$(run_client grants)"
 [[ "$grants" =~ $grants_pattern ]] || fail 'grants did not show every session grant'

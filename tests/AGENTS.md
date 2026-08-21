@@ -22,7 +22,7 @@ a `mod.rs` would change how every existing file resolves.
 | `client.rs` | CLI surface end to end against a fake broker |
 | `client/broker_transport.rs` | frame-level transport, scope frames, no-`GET` guarantees |
 | `client/edit.rs` | edit command flags, source selection, and local human-file paths |
-| `client/set_human.rs` | non-interactive human-secret writes from stdin, including leak, hardening, locking, and failed-encryption defenses |
+| `client/edit_human.rs` | non-interactive human-secret writes from stdin, including leak, hardening, locking, and failed-encryption defenses |
 | `client/multi_source.rs` | root precedence, human-key routing, and ambiguity coverage |
 | `client/sources.rs` | source inspection output and malformed-file reporting |
 | `hardening.rs` | `mlockall` / dumpability / `RLIMIT_CORE`, spawning the real binary |

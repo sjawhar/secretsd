@@ -41,9 +41,6 @@ pub fn run(arguments: impl IntoIterator<Item = OsString>) -> Result<(), CliError
         value if value == OsStr::new("edit-human") => {
             super::edit::human(&context.sources, &context.human, &arguments)
         }
-        value if value == OsStr::new("set-human") => {
-            super::edit::set_human(&context.sources, &context.human, &arguments)
-        }
         value if value == OsStr::new("grants") => Context::grants(),
         value if value == OsStr::new("deny") => Context::deny(argument_at(&arguments, 1)?),
         value if value == OsStr::new("lock") => Context::lock(),

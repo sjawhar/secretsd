@@ -73,10 +73,8 @@ pub enum CliError {
     EncryptEditedSecret(PathBuf),
     /// Atomically installing the new ciphertext failed.
     InstallEditedSecret,
-    /// `set-human` was invoked without piped standard input.
-    SetHumanTerminalStdin,
     /// Reading the piped secret value failed.
-    SetHumanRead(std::io::Error),
+    PipedHumanRead(std::io::Error),
     /// A piped human secret retained an empty value.
     EmptyPipedHumanSecret(SecretName),
     /// A piped human secret was not one assignment for its requested key.
@@ -112,7 +110,7 @@ impl fmt::Display for CliError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Usage => formatter.write_str(
-                "usage: secrets get KEY [--value|--no-request] | secrets list | secrets sources | secrets edit [--source NAME] | secrets edit-local [--source NAME] | secrets edit-human KEY [--source NAME] [--local] | secrets set-human KEY [--source NAME] | secrets grants | secrets deny ID | secrets lock | secrets KEY1 [KEY2 ...] -- command [args...]",
+                "usage: secrets get KEY [--value|--no-request] | secrets list | secrets sources | secrets edit [--source NAME] | secrets edit-local [--source NAME] | secrets edit-human KEY [--source NAME] [--local] | secrets grants | secrets deny ID | secrets lock | secrets KEY1 [KEY2 ...] -- command [args...]",
             ),
             Self::Config(error) => error.fmt(formatter),
             Self::InvalidSecretName => formatter.write_str("invalid secret key"),
@@ -169,10 +167,7 @@ impl fmt::Display for CliError {
                 target.display()
             ),
             Self::InstallEditedSecret => formatter.write_str("could not install encrypted secret"),
-            Self::SetHumanTerminalStdin => formatter.write_str(
-                "set-human reads the secret value from stdin; pipe it in — the value must never appear in argv",
-            ),
-            Self::SetHumanRead(error) => write!(formatter, "could not read piped secret: {error}"),
+            Self::PipedHumanRead(error) => write!(formatter, "could not read piped secret: {error}"),
             Self::EmptyPipedHumanSecret(name) => {
                 write!(formatter, "piped secret '{}' value must not be empty", name.as_str())
             }
@@ -199,7 +194,7 @@ impl std::error::Error for CliError {
             | Self::Exec(error)
             | Self::Stdout(error)
             | Self::EditorStart(error)
-            | Self::SetHumanRead(error) => Some(error),
+            | Self::PipedHumanRead(error) => Some(error),
             Self::Hardening(error) => Some(error),
             Self::Config(error) => Some(error),
             Self::BrokerTransport(error) => Some(error),
@@ -220,7 +215,6 @@ impl std::error::Error for CliError {
             | Self::EmptyEditedHumanSecret(_)
             | Self::EncryptEditedSecret(_)
             | Self::InstallEditedSecret
-            | Self::SetHumanTerminalStdin
             | Self::EmptyPipedHumanSecret(_)
             | Self::InvalidPipedHumanSecret(_)
             | Self::Broker(_) => None,

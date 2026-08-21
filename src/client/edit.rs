@@ -1,6 +1,7 @@
 //! Multi-source edit command parsing and path selection.
 
 use std::ffi::{OsStr, OsString};
+use std::io::IsTerminal;
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::Command;
@@ -28,7 +29,7 @@ pub(super) fn agent(
     }
 }
 
-/// Edit an existing human-tier key or create its selected file path.
+/// Edit a human-tier key or write it from a non-terminal standard input stream.
 pub(super) fn human(
     sources: &Sources,
     human: &HumanNames,
@@ -36,30 +37,7 @@ pub(super) fn human(
 ) -> Result<(), CliError> {
     let name = parse_name(argument_at(arguments, 1)?)?;
     let flags = edit_arguments(arguments, 2, true)?;
-    if let Some(location) = human.location(&name) {
-        existing_human_path(
-            sources,
-            &ExistingHumanEdit {
-                name: &name,
-                location,
-                flags,
-            },
-        )
-        .and_then(edit)
-    } else {
-        let path = new_human_path(sources, &name, flags)?;
-        new::human(&path, &name)
-    }
-}
-
-/// Store a human-tier key non-interactively from stdin, creating or rotating it.
-pub(super) fn set_human(
-    sources: &Sources,
-    human: &HumanNames,
-    arguments: &[OsString],
-) -> Result<(), CliError> {
-    let name = parse_name(argument_at(arguments, 1)?)?;
-    let flags = edit_arguments(arguments, 2, false)?;
+    let piped = !std::io::stdin().is_terminal();
     if let Some(location) = human.location(&name) {
         let path = existing_human_path(
             sources,
@@ -69,17 +47,29 @@ pub(super) fn set_human(
                 flags,
             },
         )?;
-        new::set_human(&path, &name)
+        if piped {
+            new::write_piped_human(&path, &name)
+        } else {
+            edit(path)
+        }
     } else {
         let path = new_human_path(
             sources,
             &name,
-            EditArguments {
-                source: flags.source,
-                local: true,
+            if piped {
+                EditArguments {
+                    source: flags.source,
+                    local: true,
+                }
+            } else {
+                flags
             },
         )?;
-        new::set_human(&path, &name)
+        if piped {
+            new::write_piped_human(&path, &name)
+        } else {
+            new::human(&path, &name)
+        }
     }
 }
 

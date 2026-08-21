@@ -189,7 +189,7 @@ fn edit_human_discovers_config_from_its_absolute_target_parent() {
         .env("FAKE_EDITOR_KEY", "NEW_KEY");
 
     // When the client creates the secret.
-    let output = command.output().unwrap();
+    let output = Fixture::run_in_tty(command);
 
     // Then sops starts in the target directory, not the operator's CWD.
     assert!(output.status.success());
@@ -300,7 +300,7 @@ fn edit_human_without_flags_uses_an_existing_keys_actual_root_and_file() {
         .root_dir("private")
         .join("secrets.human.d/EXISTING.env");
 
-    let output = fixture.run_minimal(["edit-human", "EXISTING"]);
+    let output = Fixture::run_in_tty(fixture.command(["edit-human", "EXISTING"]));
 
     assert_eq!(output.status.code(), Some(64));
     assert_sops_path(&fixture, &expected);
@@ -311,7 +311,7 @@ fn edit_human_rejects_local_when_an_existing_key_is_committed() {
     let fixture = Fixture::agent("");
     fixture.write_human_name("EXISTING");
 
-    let output = fixture.run_minimal(["edit-human", "EXISTING", "--local"]);
+    let output = Fixture::run_in_tty(fixture.command(["edit-human", "EXISTING", "--local"]));
     let stderr = String::from_utf8_lossy(&output.stderr);
 
     assert_ne!(output.status.code(), Some(0));
@@ -325,7 +325,8 @@ fn edit_human_rejects_a_source_other_than_an_existing_keys_actual_root() {
     fixture.add_root("private");
     fixture.write_human_name("EXISTING");
 
-    let output = fixture.run_minimal(["edit-human", "EXISTING", "--source", "private"]);
+    let output =
+        Fixture::run_in_tty(fixture.command(["edit-human", "EXISTING", "--source", "private"]));
     let stderr = String::from_utf8_lossy(&output.stderr);
 
     assert_ne!(output.status.code(), Some(0));
@@ -391,7 +392,13 @@ fn edit_human_accepts_correct_source_and_local_assertions_for_an_existing_key() 
         .root_dir("private")
         .join("secrets.human.d/EXISTING.local.env");
 
-    let output = fixture.run_minimal(["edit-human", "EXISTING", "--source", "private", "--local"]);
+    let output = Fixture::run_in_tty(fixture.command([
+        "edit-human",
+        "EXISTING",
+        "--source",
+        "private",
+        "--local",
+    ]));
 
     assert_eq!(output.status.code(), Some(64));
     assert_sops_path(&fixture, &expected);

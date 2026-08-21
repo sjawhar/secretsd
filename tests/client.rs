@@ -20,10 +20,10 @@ include!("client/fixture.rs");
 mod broker_transport;
 #[path = "client/edit.rs"]
 mod edit;
+#[path = "client/edit_human.rs"]
+mod edit_human;
 #[path = "client/multi_source.rs"]
 mod multi_source;
-#[path = "client/set_human.rs"]
-mod set_human;
 #[path = "client/sources.rs"]
 mod sources;
 

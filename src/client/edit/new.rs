@@ -2,7 +2,7 @@
 
 use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
-use std::io::{IsTerminal, Read, Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 use std::process::{ChildStdout, Command, Stdio};
@@ -33,12 +33,12 @@ pub(super) fn agent(path: &Path, local: bool) -> Result<(), CliError> {
 pub(super) fn human(path: &Path, name: &SecretName) -> Result<(), CliError> {
     create(path, &format!("{}=\n", name.as_str()), Some(name))
 }
-/// Store a human-tier key non-interactively from stdin.
+/// Store a human-tier key from a non-terminal standard input stream.
 ///
 /// Concurrent calls serialize on the target directory; the last writer wins,
 /// and each completed write is atomic. Rotation replaces the ciphertext inode,
 /// so `HumanStore` detects the changed `FileIdentity` and revokes stale grants.
-pub(super) fn set_human(path: &Path, name: &SecretName) -> Result<(), CliError> {
+pub(super) fn write_piped_human(path: &Path, name: &SecretName) -> Result<(), CliError> {
     crate::hardening::apply_no_core_dumps().map_err(CliError::Hardening)?;
     let assignment = read_piped_assignment(name)?;
     let directory = path.parent().ok_or(CliError::InstallEditedSecret)?;
@@ -90,15 +90,12 @@ fn validate_human(plaintext: &mut PlaintextTemp, name: &SecretName) -> Result<()
 }
 fn read_piped_assignment(name: &SecretName) -> Result<SecretBytes, CliError> {
     let stdin = std::io::stdin();
-    if stdin.is_terminal() {
-        return Err(CliError::SetHumanTerminalStdin);
-    }
 
     let mut value = Vec::new();
     let read_result = stdin.lock().read_to_end(&mut value);
     if let Err(error) = read_result {
         value.zeroize();
-        return Err(CliError::SetHumanRead(error));
+        return Err(CliError::PipedHumanRead(error));
     }
     if value.last() == Some(&b'\n') {
         let _ = value.pop();

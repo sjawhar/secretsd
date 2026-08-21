@@ -95,13 +95,13 @@ fn core_limit_is_zero(pid: u32) -> bool {
 }
 
 #[test]
-fn set_human_creates_a_local_file_for_a_new_key_from_stdin() {
+fn edit_human_creates_a_local_file_for_a_new_key_from_stdin() {
     let fixture = Fixture::agent("");
     let expected = fixture
         .dotfiles_dir()
         .join("secrets.human.d/NEW_KEY.local.env");
 
-    let output = fixture.run_with_stdin(["set-human", "NEW_KEY"], b"swordfish-0123");
+    let output = fixture.run_with_stdin(["edit-human", "NEW_KEY"], b"swordfish-0123");
 
     assert!(output.status.success());
     assert_eq!(
@@ -115,13 +115,13 @@ fn set_human_creates_a_local_file_for_a_new_key_from_stdin() {
 }
 
 #[test]
-fn set_human_rotates_an_existing_keys_actual_file_and_reports_it() {
+fn edit_human_rotates_an_existing_keys_actual_file_and_reports_it() {
     let fixture = Fixture::human("EXISTING_KEY");
     let expected = fixture
         .dotfiles_dir()
         .join("secrets.human.d/EXISTING_KEY.env");
 
-    let output = fixture.run_with_stdin(["set-human", "EXISTING_KEY"], b"rotated-value");
+    let output = fixture.run_with_stdin(["edit-human", "EXISTING_KEY"], b"rotated-value");
 
     assert!(output.status.success());
     assert_eq!(
@@ -141,12 +141,12 @@ fn set_human_rotates_an_existing_keys_actual_file_and_reports_it() {
 }
 
 #[test]
-fn set_human_rejects_a_source_other_than_an_existing_keys_actual_root() {
+fn edit_human_rejects_a_source_other_than_an_existing_keys_actual_root() {
     let fixture = Fixture::human("EXISTING_KEY");
     fixture.add_root("private");
 
     let output = fixture.run_with_stdin(
-        ["set-human", "EXISTING_KEY", "--source", "private"],
+        ["edit-human", "EXISTING_KEY", "--source", "private"],
         b"unwritten-value",
     );
 
@@ -156,14 +156,14 @@ fn set_human_rejects_a_source_other_than_an_existing_keys_actual_root() {
 }
 
 #[test]
-fn set_human_requires_a_source_when_multiple_roots_are_configured() {
+fn edit_human_requires_a_source_when_multiple_roots_are_configured() {
     let fixture = Fixture::agent("");
     fixture.add_root("private");
     let target = fixture
         .dotfiles_dir()
         .join("secrets.human.d/NEW_KEY.local.env");
 
-    let output = fixture.run_with_stdin(["set-human", "NEW_KEY"], b"unwritten-value");
+    let output = fixture.run_with_stdin(["edit-human", "NEW_KEY"], b"unwritten-value");
 
     assert_ne!(output.status.code(), Some(0));
     assert!(
@@ -175,13 +175,13 @@ fn set_human_requires_a_source_when_multiple_roots_are_configured() {
 }
 
 #[test]
-fn set_human_refuses_an_empty_stdin_value_and_creates_nothing() {
+fn edit_human_refuses_an_empty_stdin_value_and_creates_nothing() {
     let fixture = Fixture::agent("");
     let target = fixture
         .dotfiles_dir()
         .join("secrets.human.d/NEW_KEY.local.env");
 
-    let output = fixture.run_with_stdin(["set-human", "NEW_KEY"], b"");
+    let output = fixture.run_with_stdin(["edit-human", "NEW_KEY"], b"");
 
     assert_ne!(output.status.code(), Some(0));
     assert!(String::from_utf8_lossy(&output.stderr).contains("NEW_KEY"));
@@ -190,14 +190,14 @@ fn set_human_refuses_an_empty_stdin_value_and_creates_nothing() {
 }
 
 #[test]
-fn set_human_refuses_multiline_and_comment_smuggling_values() {
+fn edit_human_refuses_multiline_and_comment_smuggling_values() {
     for value in [b"a\nb".as_slice(), b"a\n#comment", b"a\n\n", b"a\r\nb"] {
         let fixture = Fixture::agent("");
         let target = fixture
             .dotfiles_dir()
             .join("secrets.human.d/NEW_KEY.local.env");
 
-        let output = fixture.run_with_stdin(["set-human", "NEW_KEY"], value);
+        let output = fixture.run_with_stdin(["edit-human", "NEW_KEY"], value);
 
         assert_ne!(output.status.code(), Some(0));
         assert!(!target.exists());
@@ -207,23 +207,36 @@ fn set_human_refuses_multiline_and_comment_smuggling_values() {
 }
 
 #[test]
-fn set_human_strips_exactly_one_trailing_newline() {
+fn edit_human_strips_exactly_one_trailing_newline() {
     let fixture = Fixture::agent("");
     let target = fixture
         .dotfiles_dir()
         .join("secrets.human.d/NEW_KEY.local.env");
 
-    let output = fixture.run_with_stdin(["set-human", "NEW_KEY"], b"value\n");
+    let output = fixture.run_with_stdin(["edit-human", "NEW_KEY"], b"value\n");
 
     assert!(output.status.success());
     assert_ciphertext_contains(&fs::read(target).unwrap(), b"NEW_KEY=value\n");
 }
 
 #[test]
-fn set_human_zeroes_the_core_limit_before_reading_stdin() {
+fn edit_human_strips_exactly_one_trailing_carriage_return_newline() {
+    let fixture = Fixture::agent("");
+    let target = fixture
+        .dotfiles_dir()
+        .join("secrets.human.d/NEW_KEY.local.env");
+
+    let output = fixture.run_with_stdin(["edit-human", "NEW_KEY"], b"value\r\n");
+
+    assert!(output.status.success());
+    assert_ciphertext_contains(&fs::read(target).unwrap(), b"NEW_KEY=value\n");
+}
+
+#[test]
+fn edit_human_zeroes_the_core_limit_before_reading_stdin() {
     let fixture = Fixture::agent("");
     let mut child = fixture
-        .command(["set-human", "NEW_KEY"])
+        .command(["edit-human", "NEW_KEY"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -253,7 +266,7 @@ fn set_human_zeroes_the_core_limit_before_reading_stdin() {
 }
 
 #[test]
-fn set_human_sops_failure_never_echoes_the_value_and_leaves_target_unchanged() {
+fn edit_human_sops_failure_never_echoes_the_value_and_leaves_target_unchanged() {
     let create_fixture = Fixture::agent("");
     let create_target = create_fixture
         .dotfiles_dir()
@@ -261,7 +274,7 @@ fn set_human_sops_failure_never_echoes_the_value_and_leaves_target_unchanged() {
     let create_value = b"create-failure-value";
     create_fixture.use_sops_fixture("fake-sops-stdin-fail");
 
-    let create_output = create_fixture.run_with_stdin(["set-human", "NEW_KEY"], create_value);
+    let create_output = create_fixture.run_with_stdin(["edit-human", "NEW_KEY"], create_value);
 
     assert_ne!(create_output.status.code(), Some(0));
     assert_value_is_not_rendered(&create_output, create_value);
@@ -277,7 +290,7 @@ fn set_human_sops_failure_never_echoes_the_value_and_leaves_target_unchanged() {
     let rotate_value = b"rotate-failure-value";
     rotate_fixture.use_sops_fixture("fake-sops-stdin-fail");
 
-    let rotate_output = rotate_fixture.run_with_stdin(["set-human", "EXISTING_KEY"], rotate_value);
+    let rotate_output = rotate_fixture.run_with_stdin(["edit-human", "EXISTING_KEY"], rotate_value);
 
     assert_ne!(rotate_output.status.code(), Some(0));
     assert_value_is_not_rendered(&rotate_output, rotate_value);
@@ -287,7 +300,7 @@ fn set_human_sops_failure_never_echoes_the_value_and_leaves_target_unchanged() {
 }
 
 #[test]
-fn set_human_stdout_failure_never_stages_the_piped_value() {
+fn edit_human_stdout_failure_never_stages_the_piped_value() {
     let fixture = Fixture::agent("");
     fixture.use_sops_fixture("fake-sops-stdout-hang");
     let target = fixture
@@ -298,7 +311,7 @@ fn set_human_stdout_failure_never_stages_the_piped_value() {
     let process_marker = marker_directory.path().join("sops.pid");
     let value = b"stdout-failure-value";
     let mut child = fixture
-        .command(["set-human", "NEW_KEY"])
+        .command(["edit-human", "NEW_KEY"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -346,7 +359,7 @@ fn set_human_stdout_failure_never_stages_the_piped_value() {
     signal_result.unwrap();
     assert!(
         client_was_blocked,
-        "set-human did not wait for the stdout-hanging sops fixture"
+        "edit-human did not wait for the stdout-hanging sops fixture"
     );
     assert!(
         !staged_plaintext_exists,
@@ -359,7 +372,7 @@ fn set_human_stdout_failure_never_stages_the_piped_value() {
 }
 
 #[test]
-fn set_human_drains_sops_output_before_writing_large_stdin() {
+fn edit_human_drains_sops_output_before_writing_large_stdin() {
     const LARGE_INPUT_BYTES: usize = 2_097_152;
 
     let fixture = Fixture::agent("");
@@ -370,7 +383,7 @@ fn set_human_drains_sops_output_before_writing_large_stdin() {
     let marker_directory = tempfile::tempdir().unwrap();
     let process_marker = marker_directory.path().join("sops.pid");
     let mut child = fixture
-        .command(["set-human", "NEW_KEY"])
+        .command(["edit-human", "NEW_KEY"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -414,7 +427,7 @@ fn set_human_drains_sops_output_before_writing_large_stdin() {
 
     assert!(
         completed,
-        "set-human deadlocked while sops wrote output before reading stdin"
+        "edit-human deadlocked while sops wrote output before reading stdin"
     );
     assert!(!output.status.success());
     assert!(!target.exists());
@@ -422,25 +435,25 @@ fn set_human_drains_sops_output_before_writing_large_stdin() {
 }
 
 #[test]
-fn set_human_never_echoes_the_value_to_stdout_or_stderr() {
+fn edit_human_never_echoes_the_value_to_stdout_or_stderr() {
     let fixture = Fixture::agent("");
     let value = b"success-path-value";
 
-    let output = fixture.run_with_stdin(["set-human", "NEW_KEY"], value);
+    let output = fixture.run_with_stdin(["edit-human", "NEW_KEY"], value);
 
     assert!(output.status.success());
     assert_value_is_not_rendered(&output, value);
 }
 
 #[test]
-fn set_human_leaves_the_runtime_dir_empty() {
+fn edit_human_leaves_the_runtime_dir_empty() {
     let fixture = Fixture::agent("");
     fixture.use_sops_fixture("fake-sops-hang");
     let marker_directory = tempfile::tempdir().unwrap();
     let process_marker = marker_directory.path().join("sops.pid");
     let stdin_path_marker = marker_directory.path().join("sops.stdin");
     let mut child = fixture
-        .command(["set-human", "NEW_KEY"])
+        .command(["edit-human", "NEW_KEY"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -490,27 +503,27 @@ fn set_human_leaves_the_runtime_dir_empty() {
     assert!(!output.status.success());
     assert!(
         client_was_blocked,
-        "set-human did not wait for sops encryption"
+        "edit-human did not wait for sops encryption"
     );
     assert!(
         runtime_was_empty,
-        "set-human created a plaintext runtime file while encryption was in progress"
+        "edit-human created a plaintext runtime file while encryption was in progress"
     );
     assert!(
         stdin_was_a_pipe,
-        "set-human passed sops a regular file instead of its in-memory pipe"
+        "edit-human passed sops a regular file instead of its in-memory pipe"
     );
     assert_eq!(fixture.sops_calls(), 1);
 }
 
 #[test]
-fn set_human_blocks_on_the_directory_lock() {
+fn edit_human_blocks_on_the_directory_lock() {
     let fixture = Fixture::human("EXISTING_KEY");
     let human_dir = fixture.dotfiles_dir().join("secrets.human.d");
     let target = human_dir.join("NEW_KEY.local.env");
     let lock = Flock::lock(fs::File::open(&human_dir).unwrap(), FlockArg::LockExclusive).unwrap();
     let mut child = fixture
-        .command(["set-human", "NEW_KEY"])
+        .command(["edit-human", "NEW_KEY"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -533,11 +546,11 @@ fn set_human_blocks_on_the_directory_lock() {
 }
 
 #[test]
-fn set_human_usage_error_names_the_subcommand() {
+fn edit_human_usage_error_names_the_subcommand() {
     let fixture = Fixture::agent("");
 
-    let output = fixture.run_minimal(["set-human"]);
+    let output = fixture.run_minimal(["edit-human"]);
 
     assert_ne!(output.status.code(), Some(0));
-    assert!(String::from_utf8_lossy(&output.stderr).contains("set-human"));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("edit-human"));
 }
