@@ -71,6 +71,11 @@ pub enum CliError {
     EmptyEditedHumanSecret(SecretName),
     /// Encrypting a newly created secret failed for its target file.
     EncryptEditedSecret(PathBuf),
+    /// The sops child produced more ciphertext than the accepted limit.
+    SopsCiphertextTooLarge {
+        /// The accepted ciphertext size in bytes.
+        limit: u64,
+    },
     /// Atomically installing the new ciphertext failed.
     InstallEditedSecret,
     /// Reading the piped secret value failed.
@@ -166,6 +171,10 @@ impl fmt::Display for CliError {
                 "could not encrypt edited secret for '{}'; ensure .sops.yaml has a matching creation rule",
                 target.display()
             ),
+            Self::SopsCiphertextTooLarge { limit } => write!(
+                formatter,
+                "sops produced more than {limit} bytes of ciphertext; refusing to stage it"
+            ),
             Self::InstallEditedSecret => formatter.write_str("could not install encrypted secret"),
             Self::PipedHumanRead(error) => write!(formatter, "could not read piped secret: {error}"),
             Self::EmptyPipedHumanSecret(name) => {
@@ -214,6 +223,7 @@ impl std::error::Error for CliError {
             | Self::InvalidEditedHumanSecret(_)
             | Self::EmptyEditedHumanSecret(_)
             | Self::EncryptEditedSecret(_)
+            | Self::SopsCiphertextTooLarge { .. }
             | Self::InstallEditedSecret
             | Self::EmptyPipedHumanSecret(_)
             | Self::InvalidPipedHumanSecret(_)

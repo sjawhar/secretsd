@@ -174,7 +174,15 @@ fn sops_encrypt_command(directory: &Path, target: &Path) -> Command {
     command
 }
 
-fn drain_sops_stdout(mut stdout: ChildStdout, process_id: Pid) -> Result<Vec<u8>, ()> {
+/// Why draining the sops child's stdout failed, so the caller can say which.
+enum DrainFailure {
+    /// Reading the pipe failed outright.
+    Read,
+    /// The child produced more than `MAX_SOPS_CIPHERTEXT_BYTES`.
+    TooLarge,
+}
+
+fn drain_sops_stdout(mut stdout: ChildStdout, process_id: Pid) -> Result<Vec<u8>, DrainFailure> {
     let mut output = Vec::new();
     let read_result = stdout
         .by_ref()
@@ -185,10 +193,13 @@ fn drain_sops_stdout(mut stdout: ChildStdout, process_id: Pid) -> Result<Vec<u8>
     if read_result.is_err() || output_too_large {
         output.zeroize();
         let _ = kill(process_id, Signal::SIGKILL);
-        Err(())
-    } else {
-        Ok(output)
+        return Err(if read_result.is_err() {
+            DrainFailure::Read
+        } else {
+            DrainFailure::TooLarge
+        });
     }
+    Ok(output)
 }
 
 fn encrypt_bytes(plaintext: &SecretBytes, target: &Path) -> Result<(), CliError> {
@@ -222,8 +233,16 @@ fn encrypt_bytes(plaintext: &SecretBytes, target: &Path) -> Result<(), CliError>
     let status = child.wait();
     let stdout_result = stdout_reader.join();
     let stderr_result = stderr_reader.join();
-    let Ok(Ok(mut output)) = stdout_result else {
-        return Err(CliError::EncryptEditedSecret(target.to_path_buf()));
+    let mut output = match stdout_result {
+        Ok(Ok(output)) => output,
+        Ok(Err(DrainFailure::TooLarge)) => {
+            return Err(CliError::SopsCiphertextTooLarge {
+                limit: MAX_SOPS_CIPHERTEXT_BYTES,
+            });
+        }
+        Ok(Err(DrainFailure::Read)) | Err(_) => {
+            return Err(CliError::EncryptEditedSecret(target.to_path_buf()));
+        }
     };
     if write_result.is_err()
         || !matches!(status, Ok(status) if status.success())
