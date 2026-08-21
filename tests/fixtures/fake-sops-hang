@@ -10,4 +10,7 @@ fi
 if [ -n "${FAKE_SOPS_HANG_MARKER:-}" ]; then
   echo "$$" > "$FAKE_SOPS_HANG_MARKER"
 fi
-sleep 300
+if [ -n "${FAKE_SOPS_STDIN_PATH_MARKER:-}" ]; then
+  readlink /proc/self/fd/0 > "$FAKE_SOPS_STDIN_PATH_MARKER"
+fi
+exec sleep 300

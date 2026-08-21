@@ -34,6 +34,7 @@ Nothing here may need a YubiKey. Point the daemon at a fixture instead:
 
 - `SECRETSD_SOPS_BIN=tests/fixtures/fake-sops-ok` — succeeds, emits dotenv
 - `…/fake-sops-fail` — non-zero, writes to stderr
+- `…/fake-sops-stdin-fail` — consumes stdin, returns it on stderr, and exits non-zero to test that client errors do not disclose piped values
 - `…/fake-sops-hang` — sleeps, for timeout and process-group kill
 
 Also set `SECRETSD_CONFIG` to a scratch source-root configuration and

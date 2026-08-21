@@ -1,0 +1,9 @@
+#!/bin/bash
+set -eu
+
+if [ -n "${FAKE_SOPS_LOG:-}" ]; then
+  printf '%s\n' "fake-sops-stdin-fail $*" >> "$FAKE_SOPS_LOG"
+fi
+
+cat >&2
+exit 1

@@ -5,6 +5,8 @@ use std::time::Duration;
 use std::{fs, thread};
 
 use nix::fcntl::{Flock, FlockArg};
+use nix::sys::signal::{Signal, kill};
+use nix::unistd::Pid;
 
 use super::Fixture;
 
@@ -40,14 +42,11 @@ fn assert_ciphertext_contains(ciphertext: &[u8], assignment: &[u8]) {
     );
 }
 
-fn assert_runtime_is_empty(fixture: &Fixture) {
-    assert!(
-        fs::read_dir(fixture.runtime_dir())
-            .unwrap()
-            .next()
-            .is_none(),
-        "a plaintext file survived in the runtime directory"
-    );
+fn runtime_is_empty(fixture: &Fixture) -> bool {
+    fs::read_dir(fixture.runtime_dir())
+        .unwrap()
+        .next()
+        .is_none()
 }
 
 fn assert_value_is_not_rendered(output: &Output, value: &[u8]) {
@@ -260,7 +259,7 @@ fn set_human_sops_failure_never_echoes_the_value_and_leaves_target_unchanged() {
         .dotfiles_dir()
         .join("secrets.human.d/NEW_KEY.local.env");
     let create_value = b"create-failure-value";
-    create_fixture.use_sops_fixture("fake-sops-fail");
+    create_fixture.use_sops_fixture("fake-sops-stdin-fail");
 
     let create_output = create_fixture.run_with_stdin(["set-human", "NEW_KEY"], create_value);
 
@@ -276,7 +275,7 @@ fn set_human_sops_failure_never_echoes_the_value_and_leaves_target_unchanged() {
         .join("secrets.human.d/EXISTING_KEY.env");
     let original_ciphertext = fs::read(&rotate_target).unwrap();
     let rotate_value = b"rotate-failure-value";
-    rotate_fixture.use_sops_fixture("fake-sops-fail");
+    rotate_fixture.use_sops_fixture("fake-sops-stdin-fail");
 
     let rotate_output = rotate_fixture.run_with_stdin(["set-human", "EXISTING_KEY"], rotate_value);
 
@@ -301,11 +300,72 @@ fn set_human_never_echoes_the_value_to_stdout_or_stderr() {
 #[test]
 fn set_human_leaves_the_runtime_dir_empty() {
     let fixture = Fixture::agent("");
+    fixture.use_sops_fixture("fake-sops-hang");
+    let marker_directory = tempfile::tempdir().unwrap();
+    let process_marker = marker_directory.path().join("sops.pid");
+    let stdin_path_marker = marker_directory.path().join("sops.stdin");
+    let mut child = fixture
+        .command(["set-human", "NEW_KEY"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .env("FAKE_SOPS_HANG_MARKER", &process_marker)
+        .env("FAKE_SOPS_STDIN_PATH_MARKER", &stdin_path_marker)
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    std::io::Write::write_all(&mut stdin, b"runtime-value").unwrap();
+    drop(stdin);
 
-    let output = fixture.run_with_stdin(["set-human", "NEW_KEY"], b"runtime-value");
+    let sops_started = (0..100).any(|_| {
+        if process_marker.exists() && stdin_path_marker.exists() {
+            true
+        } else {
+            thread::sleep(Duration::from_millis(10));
+            false
+        }
+    });
+    if !sops_started {
+        let _ = child.kill();
+        let _ = child.wait();
+        if let Ok(process_id) = fs::read_to_string(&process_marker) {
+            let _ = process_id
+                .trim()
+                .parse()
+                .map(Pid::from_raw)
+                .map(|pid| kill(pid, Signal::SIGKILL));
+        }
+        panic!("the hanging sops fixture did not start");
+    }
 
-    assert!(output.status.success());
-    assert_runtime_is_empty(&fixture);
+    let process_id: i32 = fs::read_to_string(&process_marker)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let runtime_was_empty = runtime_is_empty(&fixture);
+    let stdin_was_a_pipe = fs::read_to_string(&stdin_path_marker)
+        .unwrap()
+        .starts_with("pipe:[");
+    let client_was_blocked = child.try_wait().unwrap().is_none();
+    let signal_result = kill(Pid::from_raw(process_id), Signal::SIGTERM);
+    let output = child.wait_with_output().unwrap();
+
+    signal_result.unwrap();
+    assert!(!output.status.success());
+    assert!(
+        client_was_blocked,
+        "set-human did not wait for sops encryption"
+    );
+    assert!(
+        runtime_was_empty,
+        "set-human created a plaintext runtime file while encryption was in progress"
+    );
+    assert!(
+        stdin_was_a_pipe,
+        "set-human passed sops a regular file instead of its in-memory pipe"
+    );
+    assert_eq!(fixture.sops_calls(), 1);
 }
 
 #[test]
