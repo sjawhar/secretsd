@@ -52,6 +52,37 @@ pub(super) fn human(
     }
 }
 
+/// Store a human-tier key non-interactively from stdin, creating or rotating it.
+pub(super) fn set_human(
+    sources: &Sources,
+    human: &HumanNames,
+    arguments: &[OsString],
+) -> Result<(), CliError> {
+    let name = parse_name(argument_at(arguments, 1)?)?;
+    let flags = edit_arguments(arguments, 2, false)?;
+    if let Some(location) = human.location(&name) {
+        let path = existing_human_path(
+            sources,
+            &ExistingHumanEdit {
+                name: &name,
+                location,
+                flags,
+            },
+        )?;
+        new::set_human(&path, &name)
+    } else {
+        let path = new_human_path(
+            sources,
+            &name,
+            EditArguments {
+                source: flags.source,
+                local: true,
+            },
+        )?;
+        new::set_human(&path, &name)
+    }
+}
+
 #[derive(Clone, Copy)]
 struct EditArguments<'a> {
     source: Option<&'a OsString>,

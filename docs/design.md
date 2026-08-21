@@ -66,6 +66,13 @@ secrets keep working unattended with zero interaction, exactly as today.
   an *existing* secret never takes this path: it hands the file to sops, which
   decrypts, and that still needs a touch.
 
+For non-interactive creation, `secrets set-human KEY [--source NAME]` accepts
+the value only on standard input, never argv, and disables core dumps before
+reading it. It locks the human-secret directory while it encrypts directly to
+an atomically replaced ciphertext file, so the value never reaches a plaintext
+file at rest. Public age recipients make storing touch-free; later reads remain
+YubiKey-gated.
+
 ## Non-goals
 
 - Per-use approval (schema leaves room; explicitly not wanted now).
@@ -327,6 +334,8 @@ secrets edit [--source NAME]            edits an agent-tier source file
 secrets edit-local [--source NAME]      edits an agent-tier local source file
 secrets edit-human KEY [--source NAME] [--local]
                                         edits a human-tier key file
+secrets set-human KEY [--source NAME]  reads a human-tier value from stdin and
+                                        creates or rotates its local key file
 secrets grants                          active grants + pending requests
 secrets deny [id]                       reject a pending request
 secrets lock                            wipe all plaintext, revoke all grants
