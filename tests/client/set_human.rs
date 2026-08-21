@@ -287,6 +287,78 @@ fn set_human_sops_failure_never_echoes_the_value_and_leaves_target_unchanged() {
 }
 
 #[test]
+fn set_human_stdout_failure_never_stages_the_piped_value() {
+    let fixture = Fixture::agent("");
+    fixture.use_sops_fixture("fake-sops-stdout-hang");
+    let target = fixture
+        .dotfiles_dir()
+        .join("secrets.human.d/NEW_KEY.local.env");
+    let human_dir = target.parent().unwrap();
+    let marker_directory = tempfile::tempdir().unwrap();
+    let process_marker = marker_directory.path().join("sops.pid");
+    let value = b"stdout-failure-value";
+    let mut child = fixture
+        .command(["set-human", "NEW_KEY"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .env("FAKE_SOPS_STDOUT_HANG_MARKER", &process_marker)
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    std::io::Write::write_all(&mut stdin, value).unwrap();
+    drop(stdin);
+
+    let sops_started = (0..100).any(|_| {
+        if process_marker.exists() {
+            true
+        } else {
+            thread::sleep(Duration::from_millis(10));
+            false
+        }
+    });
+    if !sops_started {
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("the stdout-hanging sops fixture did not start");
+    }
+
+    let staged_plaintext_exists = fs::read_dir(human_dir).unwrap().any(|entry| {
+        let entry = entry.unwrap();
+        entry
+            .file_name()
+            .as_bytes()
+            .starts_with(b".secretsd-ciphertext-")
+            && fs::read(entry.path())
+                .unwrap()
+                .windows(value.len())
+                .any(|window| window == value)
+    });
+    let client_was_blocked = child.try_wait().unwrap().is_none();
+    let process_id: i32 = fs::read_to_string(&process_marker)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let signal_result = kill(Pid::from_raw(process_id), Signal::SIGTERM);
+    let output = child.wait_with_output().unwrap();
+
+    signal_result.unwrap();
+    assert!(
+        client_was_blocked,
+        "set-human did not wait for the stdout-hanging sops fixture"
+    );
+    assert!(
+        !staged_plaintext_exists,
+        "a staged ciphertext file contained the piped value while sops was still running"
+    );
+    assert!(!output.status.success());
+    assert_value_is_not_rendered(&output, value);
+    assert!(!target.exists());
+    assert_eq!(fixture.sops_calls(), 1);
+}
+
+#[test]
 fn set_human_never_echoes_the_value_to_stdout_or_stderr() {
     let fixture = Fixture::agent("");
     let value = b"success-path-value";

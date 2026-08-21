@@ -1,0 +1,14 @@
+#!/bin/bash
+set -eu
+
+if [ -n "${FAKE_SOPS_LOG:-}" ]; then
+  printf '%s\n' "fake-sops-stdout-hang $*" >> "$FAKE_SOPS_LOG"
+fi
+
+cat
+
+if [ -n "${FAKE_SOPS_STDOUT_HANG_MARKER:-}" ]; then
+  printf '%s\n' "$$" > "$FAKE_SOPS_STDOUT_HANG_MARKER"
+fi
+
+exec sleep 300

@@ -16,6 +16,8 @@ use super::super::{CliError, runtime_dir};
 use crate::secret::{SecretBytes, SecretName, parse_single_assignment};
 
 const SCRUB_BLOCK: [u8; 8192] = [0; 8192];
+const MAX_SOPS_CIPHERTEXT_BYTES: u64 = 1024 * 1024;
+
 const SCRUB_BLOCK_LEN: u64 = 8192;
 
 pub(super) fn agent(path: &Path, local: bool) -> Result<(), CliError> {
@@ -92,7 +94,8 @@ fn read_piped_assignment(name: &SecretName) -> Result<SecretBytes, CliError> {
     }
 
     let mut value = Vec::new();
-    if let Err(error) = stdin.lock().read_to_end(&mut value) {
+    let read_result = stdin.lock().read_to_end(&mut value);
+    if let Err(error) = read_result {
         value.zeroize();
         return Err(CliError::SetHumanRead(error));
     }
@@ -111,7 +114,7 @@ fn read_piped_assignment(name: &SecretName) -> Result<SecretBytes, CliError> {
         return Err(CliError::InvalidPipedHumanSecret(name.clone()));
     }
 
-    let mut assignment = Vec::with_capacity(name.as_str().len() + value.len() + 2);
+    let mut assignment = Vec::new();
     assignment.extend_from_slice(name.as_str().as_bytes());
     assignment.push(b'=');
     assignment.extend_from_slice(&value);
@@ -175,17 +178,9 @@ fn sops_encrypt_command(directory: &Path, target: &Path) -> Command {
 
 fn encrypt_bytes(plaintext: &SecretBytes, target: &Path) -> Result<(), CliError> {
     let directory = target.parent().ok_or(CliError::InstallEditedSecret)?;
-    let ciphertext = Builder::new()
-        .prefix(".secretsd-ciphertext-")
-        .tempfile_in(directory)
-        .map_err(|_| CliError::InstallEditedSecret)?;
-    let output = ciphertext
-        .as_file()
-        .try_clone()
-        .map_err(|_| CliError::InstallEditedSecret)?;
     let mut child = sops_encrypt_command(directory, target)
         .stdin(Stdio::piped())
-        .stdout(Stdio::from(output))
+        .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|_| CliError::EncryptEditedSecret(target.to_path_buf()))?;
@@ -197,21 +192,44 @@ fn encrypt_bytes(plaintext: &SecretBytes, target: &Path) -> Result<(), CliError>
         .write_all(plaintext.as_slice())
         .map_err(|_| CliError::EncryptEditedSecret(target.to_path_buf()))?;
     drop(stdin);
-    let stderr_result = child
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| CliError::EncryptEditedSecret(target.to_path_buf()))?;
+    let mut stderr = child
         .stderr
         .take()
-        .ok_or_else(|| CliError::EncryptEditedSecret(target.to_path_buf()))
-        .and_then(|mut stderr| {
-            std::io::copy(&mut stderr, &mut std::io::sink())
-                .map(|_| ())
-                .map_err(|_| CliError::EncryptEditedSecret(target.to_path_buf()))
-        });
-    let status = child
-        .wait()
-        .map_err(|_| CliError::EncryptEditedSecret(target.to_path_buf()))?;
-    if stderr_result.is_err() || !status.success() {
+        .ok_or_else(|| CliError::EncryptEditedSecret(target.to_path_buf()))?;
+    let stderr_reader =
+        std::thread::spawn(move || std::io::copy(&mut stderr, &mut std::io::sink()));
+    let mut output = Vec::new();
+    let read_result = stdout
+        .by_ref()
+        .take(MAX_SOPS_CIPHERTEXT_BYTES + 1)
+        .read_to_end(&mut output);
+    let output_too_large =
+        u64::try_from(output.len()).map_or(true, |length| length > MAX_SOPS_CIPHERTEXT_BYTES);
+    if read_result.is_err() || output_too_large {
+        let _ = child.kill();
+    }
+    let status = child.wait();
+    let stderr_result = stderr_reader.join();
+    if read_result.is_err()
+        || output_too_large
+        || !matches!(status, Ok(status) if status.success())
+        || !matches!(stderr_result, Ok(Ok(_)))
+    {
+        output.zeroize();
         return Err(CliError::EncryptEditedSecret(target.to_path_buf()));
     }
+
+    let mut ciphertext = Builder::new()
+        .prefix(".secretsd-ciphertext-")
+        .tempfile_in(directory)
+        .map_err(|_| CliError::InstallEditedSecret)?;
+    let write_result = ciphertext.as_file_mut().write_all(&output);
+    output.zeroize();
+    write_result.map_err(|_| CliError::InstallEditedSecret)?;
     ciphertext
         .persist(target)
         .map(|_| ())
