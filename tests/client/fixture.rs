@@ -2,7 +2,7 @@ use std::ffi::OsString;
 use std::fs;
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 
 use tempfile::TempDir;
 
@@ -173,6 +173,24 @@ esac
         self.command(arguments).output().unwrap()
     }
 
+    fn run_with_stdin<I, S>(&self, arguments: I, stdin: &[u8]) -> Output
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<std::ffi::OsStr>,
+    {
+        let mut child = self
+            .command(arguments)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut input = child.stdin.take().unwrap();
+        input.write_all(stdin).unwrap();
+        drop(input);
+        child.wait_with_output().unwrap()
+    }
+
     fn run_editor<I, S>(
         &self,
         arguments: I,
@@ -214,6 +232,18 @@ esac
             .env("FAKE_SOPS_STDIN_MODE_LOG", &self.sops_stdin_mode_log)
             .env("FAKE_SOPS_PASSTHROUGH", "1");
         command
+    }
+
+    fn use_sops_fixture(&self, name: &str) {
+        let sops = self.editor.parent().unwrap().join("sops");
+        fs::remove_file(&sops).unwrap();
+        symlink(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures")
+                .join(name),
+            sops,
+        )
+        .unwrap();
     }
 
     fn run_broker<I, S>(

@@ -22,6 +22,8 @@ mod broker_transport;
 mod edit;
 #[path = "client/multi_source.rs"]
 mod multi_source;
+#[path = "client/set_human.rs"]
+mod set_human;
 #[path = "client/sources.rs"]
 mod sources;
 
