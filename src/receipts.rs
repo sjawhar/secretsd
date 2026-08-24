@@ -18,11 +18,14 @@ pub const RECEIPT_LEN: usize = 32;
 /// A receipt is redeemed by the very next hop; a minute is generous.
 pub const RECEIPT_TTL: Duration = Duration::from_mins(1);
 /// Receipts are minted one per successful touch ceremony; this bound exists
-/// only so a pathological caller cannot grow the table.
+/// only so a pathological caller cannot grow the table. Minting fails rather
+/// than invalidating a live receipt when the bound is reached.
 const MAX_RECEIPTS: usize = 32;
 
 struct Entry {
-    id: Zeroizing<[u8; RECEIPT_LEN]>,
+    // The Vec moves this pointer, not credential bytes, during reallocation,
+    // removal, and retention.
+    id: Zeroizing<Box<[u8]>>,
     cap: Capability,
     minted: Instant,
 }
@@ -46,23 +49,26 @@ impl ReceiptTable {
     /// Mint a receipt for a completed authorization.
     pub fn mint(&mut self, cap: &Capability, now: Instant) -> std::io::Result<String> {
         self.sweep(now);
-        if self.entries.len() == MAX_RECEIPTS {
-            self.entries.remove(0);
+        if self.entries.len() >= MAX_RECEIPTS {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "too many outstanding receipts",
+            ));
         }
         let mut random = std::fs::File::open("/dev/urandom")?;
         loop {
-            let mut id = Zeroizing::new([0_u8; RECEIPT_LEN]);
-            random.read_exact(&mut *id)?;
-            let candidate: &[u8] = &*id;
+            let mut id = Zeroizing::new(vec![0_u8; RECEIPT_LEN].into_boxed_slice());
+            random.read_exact(id.as_mut())?;
+            let candidate: &[u8] = id.as_ref();
             let duplicate = self
                 .entries
                 .iter()
                 .fold(subtle::Choice::from(0), |found, entry| {
-                    let stored: &[u8] = &*entry.id;
+                    let stored: &[u8] = entry.id.as_ref();
                     found | stored.ct_eq(candidate)
                 });
             if !bool::from(duplicate) {
-                let receipt = hex(&id);
+                let receipt = hex(id.as_ref());
                 self.entries.push(Entry {
                     id,
                     cap: cap.clone(),
@@ -77,11 +83,11 @@ impl ReceiptTable {
     pub fn redeem(&mut self, receipt_hex: &str, now: Instant) -> Option<Capability> {
         self.sweep(now);
         let presented = parse_hex(receipt_hex)?;
-        let presented: &[u8] = &*presented;
+        let presented: &[u8] = presented.as_ref();
         let mut position = 0;
         let mut found = subtle::Choice::from(0);
         for (index, entry) in self.entries.iter().enumerate() {
-            let stored: &[u8] = &*entry.id;
+            let stored: &[u8] = entry.id.as_ref();
             let matches = stored.ct_eq(presented);
             let mask = 0_usize.wrapping_sub(usize::from((matches & !found).unwrap_u8()));
             position = (position & !mask) | (index & mask);
@@ -109,7 +115,7 @@ impl ReceiptTable {
     }
 }
 
-fn hex(bytes: &[u8; RECEIPT_LEN]) -> String {
+fn hex(bytes: &[u8]) -> String {
     use std::fmt::Write as _;
 
     bytes.iter().fold(
@@ -121,14 +127,13 @@ fn hex(bytes: &[u8; RECEIPT_LEN]) -> String {
     )
 }
 
-fn parse_hex(raw: &str) -> Option<Zeroizing<[u8; RECEIPT_LEN]>> {
+fn parse_hex(raw: &str) -> Option<Zeroizing<Box<[u8]>>> {
     if raw.len() != RECEIPT_LEN * 2 || !raw.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return None;
     }
-    let mut parsed = Zeroizing::new([0_u8; RECEIPT_LEN]);
-    for (index, chunk) in raw.as_bytes().chunks_exact(2).enumerate() {
-        let value = u8::from_str_radix(std::str::from_utf8(chunk).ok()?, 16).ok()?;
-        *parsed.get_mut(index)? = value;
+    let mut parsed = Zeroizing::new(vec![0_u8; RECEIPT_LEN].into_boxed_slice());
+    for (slot, chunk) in parsed.iter_mut().zip(raw.as_bytes().chunks_exact(2)) {
+        *slot = u8::from_str_radix(std::str::from_utf8(chunk).ok()?, 16).ok()?;
     }
     Some(parsed)
 }
@@ -139,6 +144,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn a_receipt_redeems_exactly_once_and_expires() {
         let mut table = ReceiptTable::default();
         let now = Instant::now();
@@ -167,6 +173,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn clear_forgets_every_outstanding_receipt() {
         let mut table = ReceiptTable::default();
         let cap = Capability::parse("browser").unwrap();
@@ -182,6 +189,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn sweep_removes_expired_receipts_without_redemption() {
         let mut table = ReceiptTable::default();
         let cap = Capability::parse("browser").unwrap();
@@ -192,5 +200,61 @@ mod tests {
 
         assert!(table.entries.is_empty());
         assert!(table.redeem(&receipt, now + RECEIPT_TTL).is_none());
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn mint_at_capacity_refuses_without_revoking_receipts() {
+        let mut table = ReceiptTable::default();
+        let cap = Capability::parse("browser").unwrap();
+        let now = Instant::now();
+        let mut receipts = Vec::with_capacity(MAX_RECEIPTS);
+        for _ in 0..MAX_RECEIPTS {
+            receipts.push(table.mint(&cap, now).unwrap());
+        }
+
+        let error = table.mint(&cap, now).unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+        for receipt in receipts {
+            let redeemed = table.redeem(&receipt, now);
+            assert_eq!(redeemed.as_ref().map(Capability::as_str), Some("browser"));
+        }
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn full_table_keeps_the_oldest_receipt() {
+        let mut table = ReceiptTable::default();
+        let cap = Capability::parse("browser").unwrap();
+        let now = Instant::now();
+        let oldest = table.mint(&cap, now).unwrap();
+        for _ in 1..MAX_RECEIPTS {
+            table.mint(&cap, now).unwrap();
+        }
+
+        assert!(table.mint(&cap, now).is_err());
+
+        let redeemed = table.redeem(&oldest, now);
+        assert_eq!(redeemed.as_ref().map(Capability::as_str), Some("browser"));
+    }
+
+    #[test]
+    fn mint_refuses_an_over_capacity_table_without_reducing_it() {
+        let mut table = ReceiptTable::default();
+        let cap = Capability::parse("browser").unwrap();
+        let now = Instant::now();
+        for _ in 0..=MAX_RECEIPTS {
+            table.entries.push(Entry {
+                id: Zeroizing::new(vec![0_u8; RECEIPT_LEN].into_boxed_slice()),
+                cap: cap.clone(),
+                minted: now,
+            });
+        }
+
+        let error = table.mint(&cap, now).unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+        assert_eq!(table.entries.len(), MAX_RECEIPTS + 1);
     }
 }
