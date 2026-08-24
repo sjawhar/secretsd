@@ -115,12 +115,17 @@ impl ReceiptTable {
     }
 }
 
-fn hex(bytes: &[u8]) -> Zeroizing<String> {
-    use std::fmt::Write as _;
+const HEX_DIGITS: &[u8; 16] = b"0123456789abcdef";
 
+#[allow(
+    clippy::indexing_slicing,
+    reason = "each masked nibble is in 0..16 before the static lookup"
+)]
+fn hex(bytes: &[u8]) -> Zeroizing<String> {
     let mut rendered = Zeroizing::new(String::with_capacity(RECEIPT_LEN * 2));
-    for byte in bytes {
-        let _ = write!(&mut *rendered, "{byte:02x}");
+    for &byte in bytes {
+        rendered.push(char::from(HEX_DIGITS[usize::from(byte >> 4)]));
+        rendered.push(char::from(HEX_DIGITS[usize::from(byte & 0x0f)]));
     }
     rendered
 }
@@ -170,6 +175,41 @@ mod tests {
         let mut table = ReceiptTable::default();
         assert!(table.redeem("zz", Instant::now()).is_none());
         assert!(table.redeem(&"a".repeat(63), Instant::now()).is_none());
+    }
+
+    #[test]
+    fn redeeming_seeded_receipt_scans_and_consumes_it() {
+        let now = Instant::now();
+        let browser = Capability::parse("browser").unwrap();
+        let admin = Capability::parse("admin").unwrap();
+        let mut table = ReceiptTable {
+            entries: vec![
+                Entry {
+                    id: Zeroizing::new(vec![0x42; RECEIPT_LEN].into_boxed_slice()),
+                    cap: browser,
+                    minted: now,
+                },
+                Entry {
+                    id: Zeroizing::new(vec![0x24; RECEIPT_LEN].into_boxed_slice()),
+                    cap: admin,
+                    minted: now,
+                },
+            ],
+        };
+        let browser_receipt = Zeroizing::new("42".repeat(RECEIPT_LEN));
+        let admin_receipt = Zeroizing::new("24".repeat(RECEIPT_LEN));
+
+        let redeemed = table.redeem(&browser_receipt, now);
+
+        assert_eq!(redeemed.as_ref().map(Capability::as_str), Some("browser"));
+        assert_eq!(
+            table
+                .redeem(&admin_receipt, now)
+                .as_ref()
+                .map(Capability::as_str),
+            Some("admin")
+        );
+        assert!(table.entries.is_empty());
     }
 
     #[test]
