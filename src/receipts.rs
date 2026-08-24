@@ -46,8 +46,8 @@ impl std::fmt::Debug for ReceiptTable {
 }
 
 impl ReceiptTable {
-    /// Mint a receipt for a completed authorization.
-    pub fn mint(&mut self, cap: &Capability, now: Instant) -> std::io::Result<String> {
+    /// Mint a zeroizing receipt for a completed authorization.
+    pub fn mint(&mut self, cap: &Capability, now: Instant) -> std::io::Result<Zeroizing<String>> {
         self.sweep(now);
         if self.entries.len() >= MAX_RECEIPTS {
             return Err(std::io::Error::new(
@@ -115,16 +115,14 @@ impl ReceiptTable {
     }
 }
 
-fn hex(bytes: &[u8]) -> String {
+fn hex(bytes: &[u8]) -> Zeroizing<String> {
     use std::fmt::Write as _;
 
-    bytes.iter().fold(
-        String::with_capacity(RECEIPT_LEN * 2),
-        |mut rendered, byte| {
-            let _ = write!(rendered, "{byte:02x}");
-            rendered
-        },
-    )
+    let mut rendered = Zeroizing::new(String::with_capacity(RECEIPT_LEN * 2));
+    for byte in bytes {
+        let _ = write!(&mut *rendered, "{byte:02x}");
+    }
+    rendered
 }
 
 fn parse_hex(raw: &str) -> Option<Zeroizing<Box<[u8]>>> {
@@ -140,6 +138,8 @@ fn parse_hex(raw: &str) -> Option<Zeroizing<Box<[u8]>>> {
 #[cfg(test)]
 mod tests {
     use std::time::Instant;
+
+    use zeroize::Zeroize as _;
 
     use super::*;
 
@@ -170,6 +170,15 @@ mod tests {
         let mut table = ReceiptTable::default();
         assert!(table.redeem("zz", Instant::now()).is_none());
         assert!(table.redeem(&"a".repeat(63), Instant::now()).is_none());
+    }
+
+    #[test]
+    fn rendered_receipt_is_a_zeroizing_string() {
+        let mut receipt: Zeroizing<String> = hex(&[0xab; RECEIPT_LEN]);
+
+        assert_eq!(receipt.len(), RECEIPT_LEN * 2);
+        receipt.zeroize();
+        assert!(receipt.is_empty());
     }
 
     #[test]
@@ -256,5 +265,18 @@ mod tests {
 
         assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
         assert_eq!(table.entries.len(), MAX_RECEIPTS + 1);
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn mint_returns_a_zeroizing_string() {
+        let mut table = ReceiptTable::default();
+        let cap = Capability::parse("browser").unwrap();
+        let now = Instant::now();
+        let mut receipt: Zeroizing<String> = table.mint(&cap, now).unwrap();
+
+        assert_eq!(receipt.len(), RECEIPT_LEN * 2);
+        receipt.zeroize();
+        assert!(receipt.is_empty());
     }
 }
