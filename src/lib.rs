@@ -14,6 +14,8 @@ use crate::store::HumanSource;
 
 #[doc(hidden)]
 pub mod audit;
+/// Capability names and their backing human-store key namespace.
+pub mod capability;
 /// Shared Unix-socket protocol client used by the `secrets` CLI.
 pub mod client;
 /// Shared source-root configuration carrying directory paths, never secret values.
@@ -25,6 +27,8 @@ pub mod grants;
 pub mod hardening;
 pub mod peer;
 pub mod proto;
+/// Single-use capability authorization receipts.
+pub mod receipts;
 /// Pending approval requests and the single-flight hardware queue.
 pub mod requests;
 /// Secret names and zeroizing plaintext bytes.

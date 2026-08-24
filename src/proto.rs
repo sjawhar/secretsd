@@ -132,6 +132,22 @@ pub enum Request {
         /// Caller's controlling tty, if any.
         tty: Option<String>,
     },
+    /// Run the grant ceremony for a named capability; returns no value, only
+    /// a single-use receipt attesting the authorization.
+    Authorize {
+        /// Capability name, `[a-z][a-z0-9_]*`; the daemon derives the backing
+        /// `CAP_<NAME>` key.
+        cap: String,
+        /// Hex-encoded session token, if the caller has one.
+        token_hex: Option<String>,
+        /// Caller's controlling tty, if any.
+        tty: Option<String>,
+    },
+    /// Consume a receipt minted by a successful AUTHORIZE.
+    Redeem {
+        /// Hex-encoded receipt.
+        receipt_hex: String,
+    },
     /// List active grants and pending requests.
     Grants,
     /// Reject a pending request.
@@ -200,6 +216,14 @@ pub fn parse_request(line: &[u8]) -> Result<Request, ErrCode> {
             key: required(&fields, "key")?.to_owned(),
             token_hex: owned("token"),
             tty: owned("tty"),
+        }),
+        "AUTHORIZE" => Ok(Request::Authorize {
+            cap: required(&fields, "cap")?.to_owned(),
+            token_hex: owned("token"),
+            tty: owned("tty"),
+        }),
+        "REDEEM" => Ok(Request::Redeem {
+            receipt_hex: required(&fields, "receipt")?.to_owned(),
         }),
         "GRANTS" => Ok(Request::Grants),
         "DENY" => Ok(Request::Deny {
@@ -300,6 +324,46 @@ mod tests {
     fn rejects_duplicate_field() {
         assert_eq!(
             parse_request(b"GET\tkey=A\tkey=B"),
+            Err(ErrCode::BadRequest)
+        );
+    }
+
+    #[test]
+    fn parses_authorize_with_token_and_redeem() {
+        let req = parse_request(b"AUTHORIZE\tcap=browser\ttoken=ab12").unwrap();
+        assert_eq!(
+            req,
+            Request::Authorize {
+                cap: "browser".to_owned(),
+                token_hex: Some("ab12".to_owned()),
+                tty: None,
+            }
+        );
+        let req = parse_request(b"REDEEM\treceipt=deadbeef").unwrap();
+        assert_eq!(
+            req,
+            Request::Redeem {
+                receipt_hex: "deadbeef".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn authorize_requires_a_cap_and_redeem_a_receipt() {
+        assert_eq!(
+            parse_request(b"AUTHORIZE\ttoken=ab"),
+            Err(ErrCode::BadRequest)
+        );
+        assert_eq!(
+            parse_request(b"REDEEM\tcap=browser"),
+            Err(ErrCode::BadRequest)
+        );
+    }
+
+    #[test]
+    fn rejects_duplicate_authorize_capability_fields() {
+        assert_eq!(
+            parse_request(b"AUTHORIZE\tcap=browser\tcap=admin\ttoken=ab12"),
             Err(ErrCode::BadRequest)
         );
     }

@@ -182,7 +182,9 @@ fn audit_context(request: &Request, shared: &Shared) -> AuditContext {
         | Request::Unregister { .. }
         | Request::Grants
         | Request::Deny { .. }
-        | Request::Lock => return audit,
+        | Request::Lock
+        | Request::Authorize { .. }
+        | Request::Redeem { .. } => return audit,
     };
     let Some(token) = token_hex
         .as_deref()
@@ -339,7 +341,9 @@ const fn request_lane(request: &Request) -> ConnectionLane {
         Request::Hello { .. }
         | Request::Register { .. }
         | Request::Unregister { .. }
-        | Request::Grants => ConnectionLane::Fast,
+        | Request::Grants
+        | Request::Authorize { .. }
+        | Request::Redeem { .. } => ConnectionLane::Fast,
         Request::Deny { .. } | Request::Lock => ConnectionLane::Control,
     }
 }

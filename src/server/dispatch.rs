@@ -208,6 +208,12 @@ pub(super) fn dispatch(
         Request::Grants => grants(shared),
         Request::Deny { id } => deny(shared, id),
         Request::Lock => lock(shared),
+        Request::Authorize { .. } | Request::Redeem { .. } => Decision {
+            outcome: Outcome::Failed(ErrCode::UnknownOp, "unsupported request"),
+            scope_kind: None,
+            source: None,
+            request_id: None,
+        },
     }
 }
 
@@ -219,6 +225,8 @@ pub(super) fn request_key(request: &Request) -> Option<&str> {
         | Request::Unregister { .. }
         | Request::Grants
         | Request::Deny { .. }
-        | Request::Lock => None,
+        | Request::Lock
+        | Request::Authorize { .. }
+        | Request::Redeem { .. } => None,
     }
 }
