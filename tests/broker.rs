@@ -10,6 +10,8 @@ use std::sync::mpsc;
 use nix::sys::signal::killpg;
 use nix::unistd::Pid;
 use secretsd::proto::PROTOCOL_VERSION;
+#[path = "broker/capability.rs"]
+mod capability;
 #[path = "broker/grants.rs"]
 mod grants;
 #[path = "broker/sources.rs"]

@@ -2,6 +2,7 @@
 
 use std::time::{Duration, Instant};
 
+use crate::capability::CAPABILITY_KEY_PREFIX;
 use crate::grants::Scope;
 use crate::proto::ErrCode;
 use crate::secret::SecretName;
@@ -99,14 +100,17 @@ impl Queue {
         key: SecretName,
         now: Instant,
     ) -> Result<RequestId, ErrCode> {
-        if let Some(existing) = self.requests.iter().find(|request| {
-            request.scope == scope
-                && request.key == key
-                && matches!(
-                    request.state,
-                    RequestState::Pending | RequestState::Decrypting
-                )
-        }) {
+        let capability = key.as_str().starts_with(CAPABILITY_KEY_PREFIX);
+        if !capability
+            && let Some(existing) = self.requests.iter().find(|request| {
+                request.scope == scope
+                    && request.key == key
+                    && matches!(
+                        request.state,
+                        RequestState::Pending | RequestState::Decrypting
+                    )
+            })
+        {
             return Ok(existing.id);
         }
         let active = self
@@ -114,13 +118,19 @@ impl Queue {
             .iter()
             .filter(|request| {
                 request.scope == scope
+                    && (!capability || request.key.as_str().starts_with(CAPABILITY_KEY_PREFIX))
                     && matches!(
                         request.state,
                         RequestState::Pending | RequestState::Decrypting
                     )
             })
             .count();
-        if active >= self.limits.max_pending_per_scope {
+        let limit = if capability {
+            1
+        } else {
+            self.limits.max_pending_per_scope
+        };
+        if active >= limit {
             return Err(ErrCode::TooManyPending);
         }
         let id = RequestId(self.next_id);
@@ -348,6 +358,20 @@ mod tests {
         let first = queue.enqueue(scope(0xaa), name("K"), now).unwrap();
         let second = queue.enqueue(scope(0xaa), name("K"), now).unwrap();
         assert_eq!(first, second);
+    }
+
+    #[test]
+    fn one_capability_request_per_scope_is_pending_at_a_time() {
+        let mut queue = Queue::new(limits());
+        let now = Instant::now();
+        queue
+            .enqueue(scope(0xaa), name("CAP_BROWSER"), now)
+            .unwrap();
+
+        assert_eq!(
+            queue.enqueue(scope(0xaa), name("CAP_BROWSER"), now),
+            Err(ErrCode::TooManyPending)
+        );
     }
 
     #[test]

@@ -1,6 +1,6 @@
 //! Unix-socket server coordination.
 
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -16,6 +16,7 @@ use nix::sys::socket::sockopt::{AcceptConn, PeerCredentials, SockType as SocketT
 use nix::sys::socket::{MsgFlags, SockType, UnixAddr, getsockname, getsockopt, recv, send};
 use nix::sys::stat::{SFlag, fstat};
 use nix::unistd::{Pid, geteuid};
+use zeroize::Zeroizing;
 
 use crate::Config;
 #[cfg(test)]
@@ -24,6 +25,7 @@ use crate::audit::sanitize_audit_value;
 use crate::decrypt::Decryptor;
 use crate::grants::{GrantTable, Registry, SessionToken};
 use crate::proto::{ErrCode, MAX_FRAME_BYTES, Request, Response, format_response, parse_request};
+use crate::receipts::ReceiptTable;
 use crate::requests::{Queue, QueueLimits, RequestId};
 use crate::store::HumanStore;
 
@@ -53,6 +55,7 @@ struct State {
     instance: String,
     registry: Registry,
     grants: GrantTable,
+    receipts: ReceiptTable,
     queue: Queue,
     store: HumanStore,
     decryptor: Decryptor,
@@ -78,6 +81,7 @@ impl State {
             instance,
             registry: Registry::new(boot_id),
             grants: GrantTable::default(),
+            receipts: ReceiptTable::default(),
             queue: Queue::new(QueueLimits {
                 cooldown: config.cooldown,
                 ttl: config.request_ttl,
@@ -166,12 +170,19 @@ struct AuditContext {
 
 fn audit_context(request: &Request, shared: &Shared) -> AuditContext {
     let mut audit = AuditContext {
-        key: request_key(request).map_or_else(|| "-".to_owned(), sanitize_audit_value),
+        key: match request {
+            Request::Authorize { cap, .. } => {
+                sanitize_audit_value(&format!("CAP_{}", cap.to_ascii_uppercase()))
+            }
+            _ => request_key(request).map_or_else(|| "-".to_owned(), sanitize_audit_value),
+        },
         untrusted_registered_session: None,
         registered_root_pid: None,
     };
     let token_hex = match request {
-        Request::Get { token_hex, .. } | Request::RequestGrant { token_hex, .. } => token_hex,
+        Request::Get { token_hex, .. }
+        | Request::RequestGrant { token_hex, .. }
+        | Request::Authorize { token_hex, .. } => token_hex,
         Request::Register { session, .. } => {
             // The pid on the wire is not recorded: `caller_pid` on the log line
             // carries the kernel's view of who actually registered.
@@ -183,12 +194,11 @@ fn audit_context(request: &Request, shared: &Shared) -> AuditContext {
         | Request::Grants
         | Request::Deny { .. }
         | Request::Lock
-        | Request::Authorize { .. }
         | Request::Redeem { .. } => return audit,
     };
     let Some(token) = token_hex
         .as_deref()
-        .and_then(|token_hex| SessionToken::parse_hex(token_hex).ok())
+        .and_then(|token_hex| SessionToken::parse_hex(token_hex.as_str()).ok())
     else {
         return audit;
     };
@@ -246,7 +256,37 @@ fn listener(config: &Config) -> std::io::Result<UnixListener> {
     Ok(listener)
 }
 
-fn handle(stream: UnixStream, shared: &Shared) -> std::io::Result<()> {
+fn read_frame(stream: &mut UnixStream) -> std::io::Result<Zeroizing<Vec<u8>>> {
+    let mut read_buffer = Zeroizing::new(vec![0_u8; MAX_FRAME_BYTES + 1]);
+    let mut frame = Zeroizing::new(Vec::with_capacity(MAX_FRAME_BYTES + 1));
+    loop {
+        let remaining = (MAX_FRAME_BYTES + 1).saturating_sub(frame.len());
+        if remaining == 0 {
+            break;
+        }
+        let writable = read_buffer
+            .get_mut(..remaining)
+            .ok_or_else(|| std::io::Error::other("frame buffer bounds invalid"))?;
+        let bytes = stream.read(writable)?;
+        if bytes == 0 {
+            break;
+        }
+        let chunk = read_buffer
+            .get(..bytes)
+            .ok_or_else(|| std::io::Error::other("frame read exceeded buffer"))?;
+        if let Some(newline) = chunk.iter().position(|byte| *byte == b'\n') {
+            let line = chunk
+                .get(..=newline)
+                .ok_or_else(|| std::io::Error::other("frame newline exceeded buffer"))?;
+            frame.extend_from_slice(line);
+            break;
+        }
+        frame.extend_from_slice(chunk);
+    }
+    Ok(frame)
+}
+
+fn handle(mut stream: UnixStream, shared: &Shared) -> std::io::Result<()> {
     stream.set_read_timeout(Some(CONNECTION_READ_TIMEOUT))?;
     let peer = getsockopt(&stream, PeerCredentials).map_err(std::io::Error::other)?;
     if !peer_uid_is_authorized(peer.uid(), geteuid().as_raw()) {
@@ -260,21 +300,18 @@ fn handle(stream: UnixStream, shared: &Shared) -> std::io::Result<()> {
     let caller = crate::peer::PeerIdentity::from_stream(&stream).map_err(|_| {
         std::io::Error::other("peer identity unavailable; refusing to authorize the connection")
     })?;
-    let mut reader = BufReader::new(stream);
-    let mut frame = Vec::new();
-    {
-        let mut bounded = reader.by_ref().take((MAX_FRAME_BYTES + 1) as u64);
-        bounded.read_until(b'\n', &mut frame)?;
-    }
-    let mut stream = reader.into_inner();
-    let request = frame
-        .strip_suffix(b"\n")
-        .filter(|line| line.len() <= MAX_FRAME_BYTES)
-        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid frame"));
-    let request = request.and_then(|line| {
-        parse_request(line)
-            .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "bad request"))
-    });
+    let request = {
+        let frame = read_frame(&mut stream)?;
+        frame
+            .strip_suffix(b"\n")
+            .filter(|line| line.len() <= MAX_FRAME_BYTES)
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid frame"))
+            .and_then(|line| {
+                parse_request(line).map_err(|_| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidData, "bad request")
+                })
+            })
+    };
     #[cfg(test)]
     if let Ok(request) = &request {
         tests::delay_register_handler(request);
@@ -322,6 +359,11 @@ fn handle(stream: UnixStream, shared: &Shared) -> std::io::Result<()> {
             stream.write_all(format_response(&Response::OkBytes(value.len())).as_bytes())?;
             stream.write_all(value.as_slice())
         }
+        Outcome::Receipt(receipt) => {
+            stream.write_all(b"OK\tstatus=authorized receipt=")?;
+            stream.write_all(receipt.as_bytes())?;
+            stream.write_all(b"\n")
+        }
         Outcome::Failed(code, message) => {
             stream.write_all(format_response(&Response::Failed(code, message)).as_bytes())
         }
@@ -337,22 +379,23 @@ enum ConnectionLane {
 
 const fn request_lane(request: &Request) -> ConnectionLane {
     match request {
-        Request::Get { .. } | Request::RequestGrant { .. } => ConnectionLane::Main,
+        Request::Get { .. } | Request::RequestGrant { .. } | Request::Authorize { .. } => {
+            ConnectionLane::Main
+        }
         Request::Hello { .. }
         | Request::Register { .. }
         | Request::Unregister { .. }
         | Request::Grants
-        | Request::Authorize { .. }
         | Request::Redeem { .. } => ConnectionLane::Fast,
         Request::Deny { .. } | Request::Lock => ConnectionLane::Control,
     }
 }
 
 fn ready_request_lane(stream: &UnixStream) -> std::io::Result<Option<ConnectionLane>> {
-    let mut buffer = [0_u8; MAX_FRAME_BYTES + 1];
+    let mut buffer = Zeroizing::new([0_u8; MAX_FRAME_BYTES + 1]);
     let bytes = match recv(
         stream.as_raw_fd(),
-        &mut buffer,
+        &mut buffer[..],
         MsgFlags::MSG_DONTWAIT | MsgFlags::MSG_PEEK,
     ) {
         Ok(length) => buffer
@@ -378,8 +421,8 @@ fn ready_request_lane(stream: &UnixStream) -> std::io::Result<Option<ConnectionL
 }
 
 fn reject_complete_connection(stream: &UnixStream) -> std::io::Result<()> {
-    let mut frame = [0_u8; MAX_FRAME_BYTES + 1];
-    match recv(stream.as_raw_fd(), &mut frame, MsgFlags::MSG_DONTWAIT) {
+    let mut frame = Zeroizing::new([0_u8; MAX_FRAME_BYTES + 1]);
+    match recv(stream.as_raw_fd(), &mut frame[..], MsgFlags::MSG_DONTWAIT) {
         Ok(_) | Err(Errno::EAGAIN) => {}
         Err(error) => return Err(std::io::Error::other(error)),
     }
@@ -539,6 +582,22 @@ mod tests {
             request_ttl: Duration::from_secs(1),
             max_pending_per_scope: 1,
         }
+    }
+
+    #[test]
+    fn authorize_waits_on_main_workers_while_redeem_uses_fast_workers() {
+        let authorize = Request::Authorize {
+            cap: "browser".to_owned(),
+            token_hex: None,
+            tty: None,
+        };
+        let redeem = Request::Redeem {
+            receipt_hex: Zeroizing::new("00".repeat(crate::receipts::RECEIPT_LEN)),
+            cap: "browser".to_owned(),
+        };
+
+        assert!(matches!(request_lane(&authorize), ConnectionLane::Main));
+        assert!(matches!(request_lane(&redeem), ConnectionLane::Fast));
     }
 
     #[test]
@@ -757,7 +816,7 @@ mod tests {
             .unwrap();
         let request = Request::Get {
             key: "DEEL_API_KEY".to_owned(),
-            token_hex: Some(token_hex),
+            token_hex: Some(Zeroizing::new(token_hex)),
             tty: None,
         };
 

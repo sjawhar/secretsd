@@ -1,4 +1,7 @@
+use std::fmt;
 use std::time::Instant;
+
+use zeroize::Zeroizing;
 
 use super::dispatch::{Decision, Outcome};
 use super::{Shared, lock_state, wait_state};
@@ -8,11 +11,21 @@ use crate::proto::ErrCode;
 use crate::requests::{RequestId, RequestState};
 use crate::secret::SecretName;
 
-#[derive(Debug)]
 pub(super) struct Access {
     pub(super) key: String,
-    pub(super) token_hex: Option<String>,
+    pub(super) token_hex: Option<Zeroizing<String>>,
     pub(super) tty: Option<String>,
+}
+
+impl fmt::Debug for Access {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Access")
+            .field("key", &self.key)
+            .field("token_present", &self.token_hex.is_some())
+            .field("tty", &self.tty)
+            .finish()
+    }
 }
 
 enum Approval {
@@ -36,7 +49,7 @@ fn resolve_access(
     let token = access
         .token_hex
         .as_deref()
-        .map(SessionToken::parse_hex)
+        .map(|token_hex| SessionToken::parse_hex(token_hex.as_str()))
         .transpose()?;
     let (mutex, _) = &**shared;
     let mut state = lock_state(mutex);
@@ -47,7 +60,7 @@ fn resolve_access(
     Ok((scope, key))
 }
 
-fn await_approval(shared: &Shared, scope: &Scope, key: &SecretName) -> Approval {
+fn await_approval(shared: &Shared, scope: &Scope, key: &SecretName, force_fresh: bool) -> Approval {
     let (mutex, condvar) = &**shared;
     let mut state = lock_state(mutex);
     if let Some((_, source, identity)) = state.grants.lookup(scope, key) {
@@ -58,20 +71,25 @@ fn await_approval(shared: &Shared, scope: &Scope, key: &SecretName) -> Approval 
             .identity(key)
             .is_ok_and(|current| current == identity)
         {
-            drop(state);
-            return Approval::Granted {
-                source: Some(source),
-                request_id: None,
-            };
+            if force_fresh {
+                state.grants.revoke(scope, key);
+            } else {
+                drop(state);
+                return Approval::Granted {
+                    source: Some(source),
+                    request_id: None,
+                };
+            }
+        } else {
+            // Keep the lock while revoking and re-resolving: releasing it would permit
+            // a concurrent request to observe cached plaintext after its file changed.
+            state.grants.revoke(scope, key);
+            tracing::info!(
+                key = %key.as_str(),
+                source = %sanitize_audit_value(&source),
+                "grant invalidated after backing file changed"
+            );
         }
-        // Keep the lock while revoking and re-resolving: releasing it would permit
-        // a concurrent request to observe cached plaintext after its file changed.
-        state.grants.revoke(scope, key);
-        tracing::info!(
-            key = %key.as_str(),
-            source = %sanitize_audit_value(&source),
-            "grant invalidated after backing file changed"
-        );
     }
     let source = match state.store.locate(key) {
         Ok(source) => source,
@@ -151,6 +169,7 @@ pub(super) fn dispatch_access(
     shared: &Shared,
     access: &Access,
     return_value: bool,
+    force_fresh: bool,
     caller: &crate::peer::PeerIdentity,
 ) -> Decision {
     let (scope, key) = match resolve_access(shared, access, caller) {
@@ -165,7 +184,7 @@ pub(super) fn dispatch_access(
         }
     };
     let scope_kind = Some(scope.kind());
-    let (outcome, source, request_id) = match await_approval(shared, &scope, &key) {
+    let (outcome, source, request_id) = match await_approval(shared, &scope, &key, force_fresh) {
         Approval::Refused(error) => (Outcome::Failed(error, "request refused"), None, None),
         Approval::Incomplete { error, request_id } => (
             Outcome::Failed(error, "approval did not complete"),

@@ -79,8 +79,13 @@ impl ReceiptTable {
         }
     }
 
-    /// Consume a receipt: returns its capability at most once, within TTL.
-    pub fn redeem(&mut self, receipt_hex: &str, now: Instant) -> Option<Capability> {
+    /// Consume a receipt for the expected capability at most once, within TTL.
+    pub fn redeem(
+        &mut self,
+        receipt_hex: &str,
+        expected_cap: &Capability,
+        now: Instant,
+    ) -> Option<Capability> {
         self.sweep(now);
         let presented = parse_hex(receipt_hex)?;
         let presented: &[u8] = presented.as_ref();
@@ -93,7 +98,12 @@ impl ReceiptTable {
             position = (position & !mask) | (index & mask);
             found |= matches;
         }
-        if bool::from(found) {
+        if bool::from(found)
+            && self
+                .entries
+                .get(position)
+                .is_some_and(|entry| entry.cap == *expected_cap)
+        {
             Some(self.entries.swap_remove(position).cap)
         } else {
             None
@@ -157,15 +167,18 @@ mod tests {
         let receipt = table.mint(&cap, now).unwrap();
         assert_eq!(receipt.len(), RECEIPT_LEN * 2);
 
-        assert_eq!(table.redeem(&receipt, now).unwrap().as_str(), "browser");
+        assert_eq!(
+            table.redeem(&receipt, &cap, now).unwrap().as_str(),
+            "browser"
+        );
         assert!(
-            table.redeem(&receipt, now).is_none(),
+            table.redeem(&receipt, &cap, now).is_none(),
             "second redeem must fail"
         );
 
         let stale = table.mint(&cap, now).unwrap();
         assert!(
-            table.redeem(&stale, now + RECEIPT_TTL).is_none(),
+            table.redeem(&stale, &cap, now + RECEIPT_TTL).is_none(),
             "expired redeem must fail"
         );
     }
@@ -173,8 +186,13 @@ mod tests {
     #[test]
     fn redeem_rejects_malformed_hex_without_panicking() {
         let mut table = ReceiptTable::default();
-        assert!(table.redeem("zz", Instant::now()).is_none());
-        assert!(table.redeem(&"a".repeat(63), Instant::now()).is_none());
+        let cap = Capability::parse("browser").unwrap();
+        assert!(table.redeem("zz", &cap, Instant::now()).is_none());
+        assert!(
+            table
+                .redeem(&"a".repeat(63), &cap, Instant::now())
+                .is_none()
+        );
     }
 
     #[test]
@@ -182,6 +200,8 @@ mod tests {
         let now = Instant::now();
         let browser = Capability::parse("browser").unwrap();
         let admin = Capability::parse("admin").unwrap();
+        let browser_expected = browser.clone();
+        let admin_expected = admin.clone();
         let mut table = ReceiptTable {
             entries: vec![
                 Entry {
@@ -199,17 +219,38 @@ mod tests {
         let browser_receipt = Zeroizing::new("42".repeat(RECEIPT_LEN));
         let admin_receipt = Zeroizing::new("24".repeat(RECEIPT_LEN));
 
-        let redeemed = table.redeem(&browser_receipt, now);
+        let redeemed = table.redeem(&browser_receipt, &browser_expected, now);
 
         assert_eq!(redeemed.as_ref().map(Capability::as_str), Some("browser"));
         assert_eq!(
             table
-                .redeem(&admin_receipt, now)
+                .redeem(&admin_receipt, &admin_expected, now)
                 .as_ref()
                 .map(Capability::as_str),
             Some("admin")
         );
         assert!(table.entries.is_empty());
+    }
+
+    #[test]
+    fn mismatched_capability_does_not_consume_a_receipt() {
+        let browser = Capability::parse("browser").unwrap();
+        let admin = Capability::parse("admin").unwrap();
+        let now = Instant::now();
+        let receipt = Zeroizing::new("42".repeat(RECEIPT_LEN));
+        let mut table = ReceiptTable {
+            entries: vec![Entry {
+                id: Zeroizing::new(vec![0x42; RECEIPT_LEN].into_boxed_slice()),
+                cap: browser.clone(),
+                minted: now,
+            }],
+        };
+
+        assert!(table.redeem(&receipt, &admin, now).is_none());
+        assert_eq!(
+            table.redeem(&receipt, &browser, now).unwrap().as_str(),
+            "browser"
+        );
     }
 
     #[test]
@@ -232,7 +273,7 @@ mod tests {
         table.clear();
 
         assert!(
-            table.redeem(&receipt, now).is_none(),
+            table.redeem(&receipt, &cap, now).is_none(),
             "a cleared receipt must be dead"
         );
     }
@@ -248,7 +289,7 @@ mod tests {
         table.sweep(now + RECEIPT_TTL);
 
         assert!(table.entries.is_empty());
-        assert!(table.redeem(&receipt, now + RECEIPT_TTL).is_none());
+        assert!(table.redeem(&receipt, &cap, now + RECEIPT_TTL).is_none());
     }
 
     #[test]
@@ -266,7 +307,7 @@ mod tests {
 
         assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
         for receipt in receipts {
-            let redeemed = table.redeem(&receipt, now);
+            let redeemed = table.redeem(&receipt, &cap, now);
             assert_eq!(redeemed.as_ref().map(Capability::as_str), Some("browser"));
         }
     }
@@ -284,7 +325,7 @@ mod tests {
 
         assert!(table.mint(&cap, now).is_err());
 
-        let redeemed = table.redeem(&oldest, now);
+        let redeemed = table.redeem(&oldest, &cap, now);
         assert_eq!(redeemed.as_ref().map(Capability::as_str), Some("browser"));
     }
 
