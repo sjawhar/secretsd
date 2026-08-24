@@ -287,6 +287,48 @@ request → pending → decrypting → granted ──(session end | lock | 12h)�
 - Plaintext lifetime = union of active grants for that key; zeroized when
   the last grant dies.
 
+### Capabilities
+
+A capability is a touch-gated yes/no authorization, not a secret. Its only
+content is the human's fresh decision. Its `CAP_<NAME>` file exists only as the
+YubiKey ceremony fixture that the broker decrypts to make that decision.
+
+The `CAP_` namespace is AUTHORIZE-only. `GET` and `REQUEST` for a
+`CAP_`-prefixed key fail with `NOT_HUMAN_KEY` before the broker locates or
+decrypts a file, and the capability plaintext never leaves the daemon.
+Capability files are human-tier files: recipients are the policy, so they use
+the same `.sops.yaml` creation rule as other human-tier keys — YubiKey plus
+recovery recipients only.
+
+Every `AUTHORIZE` runs a fresh ceremony (a real touch). It first revokes any
+cached grant for that capability and queues a new decrypt; capabilities are
+never served from the grant cache. Caching a yes/no decision would defeat the
+purpose of asking the human again. Ordinary human-secret grants retain their
+normal cache behavior.
+
+A successful authorization mints a 32-byte, 64-hex-character receipt. Receipts
+are single-use, expire after 60 seconds, use constant-time comparison, and are
+never logged. Each receipt is bound to its capability: a receipt for one
+capability cannot redeem as another, and a mismatched redemption leaves it
+available for its intended capability.
+
+`secrets lock` clears outstanding receipts along with grants, so a receipt
+minted before a lock cannot be redeemed afterward. AUTHORIZE is atomic with
+respect to LOCK: if the lock races the ceremony, no receipt survives it.
+
+The capability protocol is line-oriented and tab-delimited:
+
+```
+AUTHORIZE\tcap=<name>\ttoken=<64-hex>\n
+AUTHORIZE\tcap=<name>\ttty=<path>\n
+    → OK\tstatus=authorized receipt=<64-hex>\n
+REDEEM\treceipt=<64-hex>\tcap=<name>\n
+    → OK\tstatus=redeemed cap=<name>\n
+```
+
+The `token` and `tty` forms are alternative authorization scopes. The
+authorization reply is a receipt, never a capability value.
+
 ## Approval UX
 
 1. Agent or interactive shell requests a human-tier key.
@@ -342,6 +384,10 @@ secrets approve [id]                    reserved for explicit-approve mode
 MCP: secrets_request(key)               grant flow trigger; no values returned
 ```
 
+Capabilities have no `secrets` subcommand; consumers such as `forward` speak
+`AUTHORIZE` and `REDEEM` directly to the broker.
+
+
 ## Migration status
 
 The per-key human-secret migration is complete. Deployments configure all
@@ -371,6 +417,13 @@ resolved by precedence.
 - Broker restart mid-session → clear re-approval message, no hang.
 - Recovery path unchanged: `SOPS_AGE_KEY=$(op ...) sops -d
   secrets.human.d/<KEY>.env` on the laptop only.
+- Capability grant: a registered session sends
+  `AUTHORIZE\tcap=browser\ttoken=<session-token>`; the YubiKey blinks and one
+  touch returns a receipt. A fresh AUTHORIZE runs a fresh ceremony.
+- Capability namespace: `GET\tkey=CAP_BROWSER\t...` refuses with
+  `NOT_HUMAN_KEY` without a decrypt.
+- Receipt replay: redeem a receipt for `browser` once, then redeem the same
+  receipt again; the second redemption is denied.
 
 ## Future extensions (explicitly deferred)
 
